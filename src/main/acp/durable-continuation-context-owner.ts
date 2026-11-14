@@ -1,0 +1,589 @@
+import { randomUUID } from 'node:crypto'
+import { isDeepStrictEqual } from 'node:util'
+
+import type { AcpPromptRequest } from '../../shared/acp'
+import {
+  getActiveConversationContext,
+  resolveActiveConversationActivities,
+  resolveMessageBranchPath,
+  type PersistedConversationGraph
+} from '../../shared/conversation-graph'
+import type { ElicitationAnswer, PendingElicitationRequest } from '../../shared/elicitation'
+import type { HistoryReplayDescriptor } from '../../shared/history-replay-contract'
+import {
+  buildSessionHistoryReplay,
+  type SessionHistoryReplay
+} from '../../shared/session-history-replay'
+import {
+  rearmUnacceptedElicitationContinuations,
+  sanitizeSessionReferences,
+  type PersistedChatSession
+} from '../../shared/session-persistence'
+import type { SessionCatalog, SessionMutation } from '../session-persistence/coordinator'
+import {
+  validateElicitationAnswers,
+  agentUserChoiceOutcomes,
+  USER_CHOICE_SKIP_GUIDANCE
+} from './elicitation-owner'
+
+type DurableContinuationSessions = Pick<SessionCatalog, 'loadSessionForContinuation'> &
+  Partial<SessionMutation>
+
+type DurableContinuationPreparation = Readonly<{
+  provenanceContext: NonNullable<AcpPromptRequest['provenanceContext']>
+  memoryEnabled: boolean
+  referencedSessions?: AcpPromptRequest['referencedSessions']
+  parts?: AcpPromptRequest['parts']
+  historyReplay?: SessionHistoryReplay
+}>
+
+type DurableElicitationContinuationPreparation = Readonly<{
+  request: PendingElicitationRequest
+  provenanceContext?: DurableContinuationPreparation['provenanceContext']
+  memoryEnabled?: boolean
+  referencedSessions?: DurableContinuationPreparation['referencedSessions']
+  parts?: DurableContinuationPreparation['parts']
+  historyReplay?: SessionHistoryReplay
+}>
+
+type DurableContinuationReplay = {
+  descriptor: HistoryReplayDescriptor
+  supportsImageInput: boolean
+}
+
+type PublishDurableContinuationSession = (session: PersistedChatSession) => Promise<void> | void
+
+const isActivityVisibleOnBranch = (
+  graph: PersistedConversationGraph,
+  frameId: string,
+  branchId: string,
+  activityId: string
+): boolean => {
+  const candidate = structuredClone(graph)
+  const frame = candidate.frames.find((item) => item.id === frameId)
+  if (!frame) return false
+  candidate.activeFrameId = frame.id
+  frame.activeBranchId = branchId
+  try {
+    return resolveActiveConversationActivities(candidate).activities.some(
+      (activity) => activity.id === activityId
+    )
+  } catch {
+    return false
+  }
+}
+
+class AcpDurableContinuationContextOwner {
+  constructor(
+    private readonly sessions?: DurableContinuationSessions,
+    private readonly publishSessionUpdated?: PublishDurableContinuationSession
+  ) {}
+
+  async prepare(input: {
+    projectId: string
+    sessionId: string
+    promptMessageId: string
+    replay?: DurableContinuationReplay
+  }): Promise<DurableContinuationPreparation> {
+    const session = await this.loadSession(input.projectId, input.sessionId)
+    return this.prepareFromSession(session, input.promptMessageId, input.replay)
+  }
+
+  async prepareElicitation(input: {
+    projectId: string
+    sessionId: string
+    requestId: string
+    toolCallId: string
+    action: 'accept' | 'decline' | 'cancel'
+    answers?: ElicitationAnswer[]
+    replacePreviousAnswer?: boolean
+    retryContinuation?: boolean
+    continuePrepared?: boolean
+    recovery?: { error: string }
+    replay?: DurableContinuationReplay
+  }): Promise<DurableElicitationContinuationPreparation> {
+    const session = await this.loadSession(input.projectId, input.sessionId).catch(
+      (error: unknown) => {
+        if (!input.continuePrepared) throw error
+        // No mutation or provider delivery has started; retry only this authority read once.
+        return this.loadSession(input.projectId, input.sessionId)
+      }
+    )
+    if (input.replacePreviousAnswer) {
+      return this.prepareElicitationRevision(session, input)
+    }
+    if (input.action === 'cancel') {
+      return this.endElicitation(session, input)
+    }
+    const saved = input.retryContinuation || input.continuePrepared
+    if (saved) this.assertRetry(session, input)
+    const authority = this.resolvePendingElicitation(session, input, saved)
+    const continuation = this.prepareFromSession(session, authority.promptMessageId, input.replay)
+    const request = this.canonicalRequest(session.id, authority)
+    // Commit the decision and adopt legacy transcript ownership in the same Main mutation.
+    if (!this.sessions?.mutateRuntimeSession) {
+      throw new Error('Durable elicitation response authority is not available.')
+    }
+    const answers =
+      input.action === 'accept' ? validateElicitationAnswers(request, input.answers) : undefined
+    const commit = this.sessions.mutateRuntimeSession(input, (latest) => {
+      if (saved) this.assertRetry(latest, input)
+      const current = this.resolvePendingElicitation(latest, input, saved)
+      if (!isDeepStrictEqual(current, authority)) {
+        throw new Error('Durable elicitation changed before its answer was committed.')
+      }
+      const previous = latest.conversationGraph!.activities.find(
+        ({ id }) => id === input.toolCallId
+      )!.elicitation!
+      const projection = {
+        ...previous,
+        continuationRecovery: input.recovery,
+        state: input.action === 'accept' ? ('answered' as const) : ('declined' as const),
+        ...(answers ? { answers } : {}),
+        respondedAt: saved ? previous.respondedAt : Date.now(),
+        continuationPending: true as const
+      }
+      return {
+        ...latest,
+        activities: latest.activities?.map((activity) =>
+          activity.id === input.toolCallId ? { ...activity, elicitation: projection } : activity
+        ),
+        conversationGraph: {
+          ...latest.conversationGraph!,
+          activities: latest.conversationGraph!.activities.map((activity) =>
+            activity.id === input.toolCallId ? { ...activity, elicitation: projection } : activity
+          )
+        }
+      }
+    })
+    const committed = await commit.catch(async (error: unknown) => {
+      if (input.continuePrepared && this.publishSessionUpdated) {
+        try {
+          // The answer is already durable. A failed continuation mutation must still expose an
+          // exit, without claiming a commit or granting another provider delivery.
+          const latest = await this.loadSession(input.projectId, input.sessionId)
+          this.assertRetry(latest, input)
+          const current = this.resolvePendingElicitation(latest, input, true)
+          const respondedAt = (candidate: PersistedChatSession): number | undefined =>
+            candidate.conversationGraph?.activities.find(({ id }) => id === input.toolCallId)
+              ?.elicitation?.respondedAt
+          if (
+            isDeepStrictEqual(current, authority) &&
+            respondedAt(latest) === respondedAt(session)
+          ) {
+            const detail = error instanceof Error ? error.message : String(error)
+            const recovery =
+              input.recovery ?? (detail.trim() ? { error: detail.slice(0, 4_000) } : undefined)
+            await this.publishSessionUpdated(
+              rearmUnacceptedElicitationContinuations(
+                latest,
+                authority.promptMessageId,
+                input,
+                recovery
+              )
+            )
+          }
+        } catch {
+          // A stale decision or unavailable observer cannot replace the original write failure.
+        }
+      }
+      throw error
+    })
+    await this.publishSessionUpdated?.(structuredClone(committed))
+
+    return {
+      ...continuation,
+      request: this.canonicalRequest(session.id, authority)
+    }
+  }
+
+  async rearmElicitation(input: {
+    projectId: string
+    sessionId: string
+    promptMessageId: string
+    requestId: string
+    toolCallId: string
+    recovery?: { error: string; retryable?: true }
+  }): Promise<void> {
+    if (!this.sessions?.mutateRuntimeSession) return
+    const session = await this.sessions.mutateRuntimeSession(input, (latest) =>
+      rearmUnacceptedElicitationContinuations(latest, input.promptMessageId, input, input.recovery)
+    )
+    await this.publishSessionUpdated?.(structuredClone(session))
+  }
+
+  private assertRetry(
+    session: PersistedChatSession,
+    input: Parameters<AcpDurableContinuationContextOwner['prepareElicitation']>[0]
+  ): void {
+    const projection = session.conversationGraph?.activities.find(
+      ({ id }) => id === input.toolCallId
+    )?.elicitation
+    if (
+      session.status !== 'waiting-for-user' ||
+      session.activeRun ||
+      !projection?.continuationPending ||
+      (!input.continuePrepared && !projection.continuationRecovery?.retryable) ||
+      (projection.state !== 'answered' && projection.state !== 'declined') ||
+      input.action !== (projection.state === 'answered' ? 'accept' : 'decline') ||
+      !isDeepStrictEqual(input.answers, projection.answers)
+    ) {
+      throw new Error('This question continuation cannot be retried safely.')
+    }
+  }
+
+  private async endElicitation(
+    session: PersistedChatSession,
+    input: Parameters<AcpDurableContinuationContextOwner['prepareElicitation']>[0]
+  ): Promise<DurableElicitationContinuationPreparation> {
+    if (!this.sessions?.mutateRuntimeSession) {
+      throw new Error('Durable elicitation response authority is not available.')
+    }
+    const authority = this.resolvePendingElicitation(session, input, true)
+    const ended = await this.sessions.mutateRuntimeSession(input, (latest) => {
+      const current = this.resolvePendingElicitation(latest, input, true)
+      if (!isDeepStrictEqual(current, authority)) {
+        throw new Error('Durable elicitation changed before its wait was ended.')
+      }
+      const activity = latest.conversationGraph!.activities.find(
+        ({ id }) => id === input.toolCallId
+      )!
+      const projection = activity.elicitation!
+      // Repeated cancellation is a no-op, including after the conversation has moved on.
+      if (
+        projection.state !== 'pending' &&
+        !projection.continuationPending &&
+        !projection.continuationRecovery
+      ) {
+        return latest
+      }
+      if (latest.activeRun || latest.status !== 'waiting-for-user') {
+        throw new Error('Wait for the current Agent run to finish before ending this wait.')
+      }
+      this.prepareFromSession(latest, current.promptMessageId)
+      const settle = <T extends NonNullable<PersistedChatSession['activities']>[number]>(
+        item: T
+      ): T => {
+        if (item.id !== input.toolCallId || !item.elicitation) return item
+        const {
+          continuationPending: _pending,
+          continuationRecovery: _recovery,
+          ...decision
+        } = item.elicitation
+        void _pending
+        void _recovery
+        return {
+          ...item,
+          status: 'completed',
+          elicitation: {
+            ...decision,
+            ...(decision.state === 'pending'
+              ? { state: 'cancelled' as const, respondedAt: Date.now() }
+              : {})
+          }
+        }
+      }
+      const graph = {
+        ...latest.conversationGraph!,
+        activities: latest.conversationGraph!.activities.map(settle)
+      }
+      const activities = resolveActiveConversationActivities(graph).activities
+      const stillWaiting = activities.some(
+        ({ elicitation }) => elicitation?.state === 'pending' || elicitation?.continuationRecovery
+      )
+      return {
+        ...latest,
+        conversationGraph: graph,
+        activities,
+        status: stillWaiting ? 'waiting-for-user' : 'idle',
+        error: undefined,
+        failure: undefined,
+        resumeRecovery: undefined
+      }
+    })
+    await this.publishSessionUpdated?.(structuredClone(ended))
+    return { request: this.canonicalRequest(session.id, authority) }
+  }
+
+  private resolvePendingElicitation(
+    session: PersistedChatSession,
+    input: Pick<
+      Parameters<AcpDurableContinuationContextOwner['prepareElicitation']>[0],
+      'requestId' | 'toolCallId'
+    >,
+    allowResolved = false
+  ): {
+    activityId: string
+    message: string
+    fields: PendingElicitationRequest['fields']
+    durable: NonNullable<PendingElicitationRequest['durable']>
+    promptMessageId: string
+  } {
+    const graph = session.conversationGraph
+    if (!graph || (!allowResolved && session.status !== 'waiting-for-user')) {
+      throw new Error('Durable elicitation no longer matches the pending Session activity.')
+    }
+    const visible = resolveActiveConversationActivities(graph).activities.filter(
+      (activity) =>
+        (allowResolved || activity.elicitation?.state === 'pending') &&
+        activity.elicitation?.durable?.kind === 'agent-user-choice' &&
+        activity.elicitation.durable.requestId === input.requestId
+    )
+    const activity =
+      visible.length === 1 && visible[0].id === input.toolCallId ? visible[0] : undefined
+    const graphActivity = activity
+      ? graph.activities.find((candidate) => candidate.id === activity.id)
+      : undefined
+    const flatMatches = activity
+      ? (session.activities ?? []).filter((candidate) => candidate.id === activity.id)
+      : []
+    const flatActivity = flatMatches.length === 1 ? flatMatches[0] : undefined
+    if (
+      !activity ||
+      !graphActivity ||
+      !flatActivity ||
+      !isDeepStrictEqual(flatActivity.elicitation, activity.elicitation) ||
+      (flatActivity.promptMessageId !== undefined &&
+        flatActivity.promptMessageId !== graphActivity.promptMessageId) ||
+      flatActivity.title !== activity.title ||
+      flatActivity.status !== activity.status ||
+      flatActivity.sortIndex !== activity.sortIndex
+    ) {
+      throw new Error('Durable elicitation no longer matches the pending Session activity.')
+    }
+    const projection = graphActivity.elicitation!
+    const durable = projection.durable!
+    const promptMessageId = graphActivity.promptMessageId
+    if (durable.promptMessageId && durable.promptMessageId !== promptMessageId) {
+      throw new Error('Durable elicitation has inconsistent prompt authority.')
+    }
+    return {
+      activityId: graphActivity.id,
+      message: projection.message,
+      fields: projection.fields,
+      durable,
+      promptMessageId
+    }
+  }
+
+  private async prepareElicitationRevision(
+    session: PersistedChatSession,
+    input: Parameters<AcpDurableContinuationContextOwner['prepareElicitation']>[0]
+  ): Promise<DurableElicitationContinuationPreparation> {
+    const authority = this.resolveElicitationRevision(session, input.requestId)
+    const toolCallId = `ask-user-question-revision-${randomUUID()}`
+    const originalRequest = this.canonicalRequest(session.id, {
+      ...authority,
+      activityId: toolCallId
+    })
+    if (input.action === 'cancel') return { request: originalRequest }
+    const answers =
+      input.action === 'accept'
+        ? validateElicitationAnswers(originalRequest, input.answers)
+        : undefined
+    if (!this.sessions?.appendUserMessageToInteraction) {
+      throw new Error('Durable elicitation revision authority is not available.')
+    }
+    const message = await this.sessions.appendUserMessageToInteraction({
+      projectId: input.projectId,
+      sessionId: input.sessionId,
+      interactionId: authority.interactionId,
+      content: this.revisionPromptContent(originalRequest, input.action, answers),
+      beforePersist: (latest) => {
+        const current = this.resolveElicitationRevision(latest, input.requestId)
+        if (!isDeepStrictEqual(current, authority)) {
+          throw new Error('Durable elicitation revision authority changed before commit.')
+        }
+      }
+    })
+    const continuedSession = await this.loadSession(input.projectId, input.sessionId)
+    const continuation = this.prepareFromSession(continuedSession, message.id, input.replay)
+    await this.publishSessionUpdated?.(structuredClone(continuedSession))
+    return {
+      ...continuation,
+      request: {
+        ...originalRequest,
+        durable: { ...originalRequest.durable!, promptMessageId: message.id }
+      }
+    }
+  }
+
+  private resolveElicitationRevision(
+    session: PersistedChatSession,
+    requestId: string
+  ): {
+    activityId: string
+    branchId: string
+    interactionId: string
+    message: string
+    fields: PendingElicitationRequest['fields']
+    durable: NonNullable<PendingElicitationRequest['durable']>
+    promptMessageId: string
+  } {
+    const graph = session.conversationGraph
+    const frame = graph?.frames.find((candidate) => candidate.id === graph.activeFrameId)
+    const branch = graph?.branches.find((candidate) => candidate.id === frame?.activeBranchId)
+    const parentBranch = graph?.branches.find(
+      (candidate) => candidate.id === branch?.parentBranchId
+    )
+    const activity = branch?.forkActivityId
+      ? graph?.activities.find((candidate) => candidate.id === branch.forkActivityId)
+      : undefined
+    const projection = activity?.elicitation
+    const durable = projection?.durable
+    const parentPath = graph && parentBranch ? resolveMessageBranchPath(graph, parentBranch.id) : []
+    const prompt = activity
+      ? parentPath.find((candidate) => candidate.id === activity.promptMessageId)
+      : undefined
+    const runtimeSegment = activity
+      ? graph?.runtimeSegments.find((candidate) => candidate.id === activity.runtimeSegmentId)
+      : undefined
+    const activityVisibleOnParent =
+      graph && frame && parentBranch && activity
+        ? isActivityVisibleOnBranch(graph, frame.id, parentBranch.id, activity.id)
+        : false
+    if (
+      !graph ||
+      session.status !== 'idle' ||
+      !frame ||
+      !branch?.forkActivityId ||
+      !branch.forkMessageId ||
+      branch.headMessageId !== branch.forkMessageId ||
+      !parentBranch ||
+      parentBranch.agentFrameId !== frame.id ||
+      !activity ||
+      activity.agentFrameId !== frame.id ||
+      !activityVisibleOnParent ||
+      !prompt ||
+      prompt.role !== 'user' ||
+      prompt.status !== 'complete' ||
+      prompt.agentFrameId !== frame.id ||
+      prompt.runtimeSegmentId !== activity.runtimeSegmentId ||
+      !runtimeSegment ||
+      runtimeSegment.agentFrameId !== frame.id ||
+      projection?.state !== 'answered' ||
+      durable?.kind !== 'agent-user-choice' ||
+      durable.requestId !== requestId ||
+      durable.promptMessageId !== activity.promptMessageId ||
+      (session.activities ?? []).some((candidate) => candidate.id === activity.id)
+    ) {
+      throw new Error('Durable elicitation revision no longer matches the active Session Branch.')
+    }
+    return {
+      activityId: activity.id,
+      branchId: branch.id,
+      interactionId: branch.forkMessageId,
+      message: projection.message,
+      fields: projection.fields,
+      durable,
+      promptMessageId: activity.promptMessageId
+    }
+  }
+
+  private canonicalRequest(
+    sessionId: string,
+    authority: {
+      activityId: string
+      message: string
+      fields: PendingElicitationRequest['fields']
+      durable: NonNullable<PendingElicitationRequest['durable']>
+      promptMessageId: string
+    }
+  ): PendingElicitationRequest {
+    return {
+      requestId: authority.durable.requestId,
+      sessionId,
+      toolCallId: authority.activityId,
+      message: authority.message,
+      fields: structuredClone(authority.fields),
+      durable: { ...structuredClone(authority.durable), promptMessageId: authority.promptMessageId }
+    }
+  }
+
+  private revisionPromptContent(
+    request: PendingElicitationRequest,
+    action: 'accept' | 'decline',
+    answers?: ElicitationAnswer[]
+  ): string {
+    const outcomes = agentUserChoiceOutcomes(request, { action, answers })
+    if (outcomes.some((outcome) => outcome.status === 'skipped')) {
+      return [
+        'The user revised the previous structured answer:',
+        JSON.stringify(outcomes),
+        USER_CHOICE_SKIP_GUIDANCE
+      ].join('\n')
+    }
+    if (action === 'decline')
+      return 'The user revised the previous structured answer by declining it.'
+    const fields = new Map(request.fields.map((field) => [field.id, field]))
+    const lines = (answers ?? []).map((answer) => {
+      const value = Array.isArray(answer.value)
+        ? JSON.stringify(answer.value)
+        : String(answer.value)
+      return `${fields.get(answer.fieldId)?.label ?? answer.fieldId}: ${value}`
+    })
+    return ['The user revised the previous structured answer:', ...lines].join('\n')
+  }
+
+  private async loadSession(projectId: string, sessionId: string): Promise<PersistedChatSession> {
+    if (!this.sessions) throw new Error('Durable continuation Session authority is not available.')
+    const session = await this.sessions.loadSessionForContinuation(projectId, sessionId)
+    if (session.id !== sessionId || session.projectId !== projectId) {
+      throw new Error('Durable continuation Session identity does not match its authority.')
+    }
+    return session
+  }
+
+  private prepareFromSession(
+    session: PersistedChatSession,
+    promptMessageId: string,
+    replay?: DurableContinuationReplay
+  ): DurableContinuationPreparation {
+    const graph = session.conversationGraph
+    const activeFrame = graph?.frames.find((frame) => frame.id === graph.activeFrameId)
+    const activeBranch = graph?.branches.find((branch) => branch.id === activeFrame?.activeBranchId)
+    const prompt =
+      graph && activeFrame
+        ? resolveMessageBranchPath(graph, activeFrame.activeBranchId).find(
+            (message) => message.id === promptMessageId
+          )
+        : undefined
+    if (
+      !graph ||
+      !activeFrame ||
+      !activeBranch ||
+      prompt?.role !== 'user' ||
+      prompt.status !== 'complete' ||
+      prompt.agentFrameId !== activeFrame.id ||
+      prompt.introducedOnBranchId !== activeBranch.id ||
+      !prompt.runtimeSegmentId
+    ) {
+      throw new Error('Durable continuation no longer matches the active Message Branch.')
+    }
+
+    const referencedSessions = sanitizeSessionReferences(prompt.parts)
+    return {
+      provenanceContext: getActiveConversationContext(graph, promptMessageId),
+      memoryEnabled: session.memoryEnabled !== false,
+      ...(referencedSessions.length > 0 ? { referencedSessions } : {}),
+      ...(prompt.parts?.length ? { parts: prompt.parts } : {}),
+      ...(replay
+        ? {
+            historyReplay: buildSessionHistoryReplay(
+              session.messages,
+              replay.descriptor,
+              session.projectId,
+              replay.supportsImageInput
+            )
+          }
+        : {})
+    }
+  }
+}
+
+export { AcpDurableContinuationContextOwner }
+export type {
+  DurableContinuationPreparation,
+  DurableContinuationSessions,
+  DurableElicitationContinuationPreparation
+}

@@ -1,0 +1,111 @@
+import { expect } from '@playwright/test'
+import type { Page } from 'playwright'
+import { createProjectViaUi } from '../fixtures/project'
+import { submitPromptViaUi } from '../fixtures/conversation'
+
+const createProject = async (page: Page, name: string): Promise<string> => {
+  const existingProjectIds = await page.evaluate(async () => {
+    const bridge = globalThis as unknown as {
+      api: { projects: { list: () => Promise<Array<{ id: string }>> } }
+    }
+    return (await bridge.api.projects.list()).map((project) => project.id)
+  })
+  await createProjectViaUi(page, name)
+  await expect(page.getByRole('heading', { name: 'New conversation' })).toBeVisible()
+
+  let projectId: string | undefined
+  await expect
+    .poll(
+      async () => {
+        projectId = await page.evaluate(async (existingIds) => {
+          const bridge = globalThis as unknown as {
+            api: { projects: { list: () => Promise<Array<{ id: string }>> } }
+          }
+          return (await bridge.api.projects.list()).find(
+            (project) => !existingIds.includes(project.id)
+          )?.id
+        }, existingProjectIds)
+        return projectId
+      },
+      { timeout: 30_000 }
+    )
+    .toEqual(expect.any(String))
+  return projectId!
+}
+
+const sendPrompt = async (
+  page: Page,
+  prompt: string,
+  reply: string,
+  timeout = 30_000
+): Promise<void> => {
+  const expectedReply = page.getByText(reply, { exact: false })
+  const fixtureFailure = page.getByText(/^E2E fixture failure:/)
+  const existingReplyCount = await expectedReply.count()
+  const existingFailureCount = await fixtureFailure.count()
+  await submitPromptViaUi(page, prompt)
+  await expect(
+    expectedReply.nth(existingReplyCount).or(fixtureFailure.nth(existingFailureCount))
+  ).toBeVisible({ timeout })
+  if ((await fixtureFailure.count()) > existingFailureCount) {
+    throw new Error(await fixtureFailure.last().innerText())
+  }
+}
+
+const openRecentSession = async (page: Page, prompt: string): Promise<void> => {
+  const promptPrefix = prompt.slice(0, 36)
+  const session = page
+    .getByRole('region', { name: 'Recent sessions' })
+    .getByRole('button', { name: new RegExp(promptPrefix, 'u') })
+  await expect(session).toBeVisible({ timeout: 60_000 })
+  await session.click()
+}
+
+const openProjectSession = async (
+  page: Page,
+  projectName: string,
+  prompt: string
+): Promise<void> => {
+  const project = page
+    .getByRole('region', { name: 'Projects' })
+    .getByRole('button', { name: projectName, exact: true })
+  await expect(project).toBeVisible({ timeout: 60_000 })
+  await project.click()
+  const promptPrefix = prompt.slice(0, 36)
+  const heading = page.getByRole('heading', { name: new RegExp(promptPrefix, 'u') })
+  if (await heading.isVisible()) return
+  const session = page
+    .getByRole('navigation', { name: 'Sessions' })
+    .locator('button[data-slot="session-open-button"]')
+    .filter({ hasText: promptPrefix })
+  await expect(session).toBeVisible({ timeout: 60_000 })
+  await session.click()
+}
+
+const sendReviewedPrompt = async (
+  page: Page,
+  prompt: string,
+  reply: string,
+  commands: string[],
+  timeout: number
+): Promise<void> => {
+  await Promise.all([
+    sendPrompt(page, prompt, reply, timeout),
+    (async () => {
+      const review = page.getByRole('group', {
+        name: 'Permission request: Review potentially destructive code',
+        exact: true
+      })
+      let previousCode: string | undefined
+      for (const command of commands) {
+        const code = review.getByTestId('tool-code-block')
+        await expect(code).toContainText(command, { timeout })
+        if (previousCode) await expect(code).not.toHaveText(previousCode, { timeout })
+        previousCode = await code.innerText()
+        await review.getByRole('button', { name: 'Allow', exact: true }).click()
+      }
+    })()
+  ])
+}
+
+export { createProject, openProjectSession, openRecentSession, sendPrompt, sendReviewedPrompt }

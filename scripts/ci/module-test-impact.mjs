@@ -1,0 +1,762 @@
+/* eslint-disable @typescript-eslint/explicit-function-return-type */
+
+import { execFileSync, spawnSync } from 'node:child_process'
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+import {
+  classifyChanges,
+  fixtureTestPatterns,
+  matchesPath,
+  parseNameStatus,
+  playwrightReaderTests
+} from './classify-pr-changes.mjs'
+import { loadModuleImpactManifest } from './load-module-impact.mjs'
+import { validateModuleImpactManifest } from './validate-module-impact.mjs'
+import { packageTestSelectedRoots, createPackageTestPlan } from './package-test-impact.mjs'
+import { resolveModuleImpactInputs } from './module-impact-inputs.mjs'
+import { isModuleRoutableOwnerPath } from './module-ownership-paths.mjs'
+import {
+  derivedConsumersPath,
+  loadDerivedConsumers,
+  withDerivedConsumers,
+  usesReviewedBoundary
+} from './module-graph/policy.mjs'
+
+const GIT_OUTPUT_MAX_BUFFER = 128 * 1024 * 1024
+
+// When the committed index is absent (runtime-generated), generate it lazily so preflight
+// (git-archived code without node_modules) never imports the typescript dependency.
+async function loadOrGenerateDerivedConsumers(
+  manifest = loadModuleImpactManifest(),
+  cwd = process.cwd(),
+  revision
+) {
+  // A generated local index describes the checkout, not the requested revision; only an index
+  // committed at that revision is authoritative for it.
+  const committedAtRevision =
+    revision &&
+    execFileSync('git', ['ls-tree', '--name-only', revision, '--', derivedConsumersPath], {
+      cwd,
+      encoding: 'utf8',
+      maxBuffer: GIT_OUTPUT_MAX_BUFFER
+    }).trim() === derivedConsumersPath
+  if (!revision || committedAtRevision) {
+    const loaded = loadDerivedConsumers()
+    if (Object.keys(loaded.modules).length > 0) return loaded
+  }
+  // Generate from the requested revision or checkout. Failures propagate; an empty index
+  // would silently narrow selection to explicit tests only.
+  const { consumerDependencyGraph, generateDerivedConsumers, sourceSnapshot, workingTreeSource } =
+    await import('./module-graph/index.mjs')
+  // A revision range is planned from its immutable head, never a possibly dirty checkout.
+  const source = revision ? sourceSnapshot(revision, cwd) : workingTreeSource(cwd)
+  const runtimeEdges = Object.entries(
+    JSON.parse(source.read('scripts/ci/module-runtime-consumers.json') ?? '{}')
+  )
+  return generateDerivedConsumers(manifest, consumerDependencyGraph(source, runtimeEdges).reverse)
+}
+
+// Synchronous planners cannot generate the index (module load must stay free of the TypeScript
+// parser for trusted preflight). Every production caller passes an effective manifest; the
+// default only carries a committed index, if any.
+const defaultManifest = withDerivedConsumers(loadModuleImpactManifest(), loadDerivedConsumers())
+const packageRegistryPath = new URL('./package-test-boundaries.json', import.meta.url)
+// Older trusted extraction bundles have no registry: retain all tests rather than guess.
+const packageRegistry = existsSync(packageRegistryPath)
+  ? JSON.parse(readFileSync(packageRegistryPath, 'utf8'))
+  : undefined
+function applyPackageBoundary(plan, paths) {
+  if (!packageRegistry) return plan
+  // Regression fixtures already map to their exact reader suites. Applying the independent
+  // package boundary to the fixture path would erase those package-owned readers merely because
+  // the data file itself is outside a package root.
+  const boundaryPaths = paths.filter((path) => !path.startsWith('test/fixtures/'))
+  if (boundaryPaths.length === 0) return plan
+  const packages = createPackageTestPlan(boundaryPaths, packageRegistry)
+  const fixturePatterns = paths.flatMap((path) => fixtureTestPatterns(path))
+  const fixtureTests = new Set(
+    plan.testFiles.filter((test) =>
+      fixturePatterns.some((pattern) =>
+        pattern.includes('*') ? matchesPath(test, pattern) : test === pattern
+      )
+    )
+  )
+  const omitted = plan.testFiles.filter(
+    (path) =>
+      packages.excluded.some((root) => path.startsWith(root + '/')) && !fixtureTests.has(path)
+  )
+  if (omitted.length) {
+    plan.testFiles = plan.testFiles.filter((path) => !omitted.includes(path))
+    plan.reasonChains = sorted([...plan.reasonChains, ...packages.reasons])
+  }
+  return plan
+}
+const testKinds = ['owner', 'contract', 'consumer']
+
+function sorted(values) {
+  return [...new Set(values)].sort()
+}
+
+function declaredTests(module) {
+  return testKinds.flatMap((kind) => module.testFiles[kind] ?? [])
+}
+
+export function modulesForPath(manifest, path) {
+  const owners = Object.entries(manifest.modules)
+    .filter(([, module]) => isModuleRoutableOwnerPath(path) && module.ownerPaths.includes(path))
+    .map(([moduleId]) => moduleId)
+  if (owners.length > 0) return owners
+  const explicit = Object.entries(manifest.modules)
+    .filter(([, module]) =>
+      [
+        ...module.ownerPaths.filter(isModuleRoutableOwnerPath),
+        ...module.interfacePaths,
+        ...declaredTests(module)
+      ].includes(path)
+    )
+    .map(([moduleId]) => moduleId)
+  if (explicit.length > 0 || /\.(test|spec)\.[cm]?[jt]sx?$/.test(path)) return explicit
+  // A declared owner test also identifies its colocated implementation. Consumer tests
+  // cannot establish ownership; unmatched implementations still fall back to full.
+  const ownerTest = path.replace(/(\.[cm]?[jt]sx?)$/, '.test$1')
+  return Object.entries(manifest.modules)
+    .filter(([, module]) => (module.testFiles.owner ?? []).includes(ownerTest))
+    .map(([moduleId]) => moduleId)
+}
+
+function expandConsumers(manifest, seeds, testsOnly = false) {
+  const selected = new Set()
+  const visit = (moduleId) => {
+    if (selected.has(moduleId)) return
+    selected.add(moduleId)
+    if (testsOnly && usesReviewedBoundary(moduleId, manifest.modules[moduleId])) return
+    for (const consumer of manifest.modules[moduleId].consumerModules ?? []) visit(consumer)
+  }
+  for (const seed of seeds) visit(seed)
+  return Object.keys(manifest.modules).filter((moduleId) => selected.has(moduleId))
+}
+
+function selectivePlan(manifest, moduleIds, reasonChains, graph) {
+  const modules = Object.keys(manifest.modules).filter((moduleId) => moduleIds.includes(moduleId))
+  return {
+    mode: 'selective',
+    modules,
+    testFiles: sorted([
+      ...modules.flatMap((moduleId) => declaredTests(manifest.modules[moduleId])),
+      ...graph.testFiles
+    ]),
+    capabilityOverlays: sorted(
+      modules.flatMap((moduleId) => manifest.modules[moduleId].capabilityOverlays)
+    ),
+    fallbackCapabilities: sorted(
+      modules.map((moduleId) => manifest.modules[moduleId].fallbackCapability)
+    ),
+    graphStatus: graph.status,
+    graphReason: graph.reason,
+    reasonChains: sorted(reasonChains)
+  }
+}
+
+function explainDerivedTests(plan, manifest) {
+  const selected = new Set(plan.testFiles)
+  plan.reasonChains = sorted([
+    ...plan.reasonChains,
+    ...plan.modules.flatMap((id) =>
+      (manifest.modules[id].derivedConsumerTests ?? [])
+        .filter((test) => selected.has(test))
+        .map((test) => `${id} -> derived dependency evidence -> ${test}`)
+    )
+  ])
+  return plan
+}
+
+function fullPlan(reason) {
+  return {
+    mode: 'full',
+    modules: [],
+    testFiles: [],
+    capabilityOverlays: [],
+    fallbackCapabilities: [],
+    graphStatus: 'not-used',
+    graphReason: undefined,
+    reasonChains: [reason]
+  }
+}
+
+export function createModuleTestPlan(moduleId, manifest = defaultManifest) {
+  validateModuleImpactManifest(manifest)
+  if (!manifest.modules[moduleId]) throw new Error(`Unknown module: ${moduleId}`)
+  if (manifest.modules[moduleId].fullTestReason) {
+    return fullPlan(`${moduleId} -> ${manifest.modules[moduleId].fullTestReason} -> full`)
+  }
+  const plan = selectivePlan(manifest, [moduleId], [`module ${moduleId} -> declared tests`], {
+    status: 'not-requested',
+    testFiles: []
+  })
+  return explainDerivedTests(
+    applyPackageBoundary(
+      plan,
+      manifest.modules[moduleId].ownerPaths.filter((path) => path.startsWith('packages/'))
+    ),
+    manifest
+  )
+}
+
+export function createAffectedTestPlan(
+  changes,
+  graph,
+  manifest = defaultManifest,
+  registrationModules = [],
+  registrationOnly = false
+) {
+  validateModuleImpactManifest(manifest)
+  if (registrationOnly)
+    return {
+      ...selectivePlan(manifest, [], [], graph),
+      reasonChains: ['registration-only revision -> policy and manifest contracts in Static checks']
+    }
+  const classification = { moduleManifest: manifest, registrationModules }
+  const changePlan = classifyChanges(changes, undefined, classification)
+  if (changePlan.mode === 'full') {
+    const decisiveReasons = changePlan.reasonChains.filter((reason) => reason.endsWith('-> full'))
+    return fullPlan(
+      `change-impact classifier -> ${(decisiveReasons.length > 0 ? decisiveReasons : changePlan.reasonChains).join('; ')}`
+    )
+  }
+
+  const seeds = new Set(registrationModules)
+  const directTests = new Set()
+  const testModules = new Set()
+  const reasons = registrationModules.map(
+    (id) => `${id} -> validated additive registration -> declared tests`
+  )
+  for (const change of changes) {
+    const pathPlan = classifyChanges([change], undefined, classification)
+    if (pathPlan.roots.includes('module_registration')) continue
+    if (pathPlan.roots.includes('ci_workflow_contract_test')) {
+      directTests.add(change.path)
+      reasons.push(`${change.path} -> workflow contract -> direct execution`)
+      continue
+    }
+    if (pathPlan.lanes.includes('docs') && !pathPlan.bundles.includes('unit')) {
+      reasons.push(`${change.path} -> documentation lane -> no module tests`)
+      continue
+    }
+    // Playwright specs and fixtures execute in their E2E lanes, not Vitest. Only declared
+    // readers run here; unattributed E2E files still fall back to full through the classifier.
+    const readerTests = playwrightReaderTests(change.path)
+    if (pathPlan.mode === 'selective' && readerTests) {
+      for (const test of readerTests) directTests.add(test)
+      reasons.push(
+        readerTests.length > 0
+          ? `${change.path} -> Playwright E2E input -> declared readers ${readerTests.join(', ')}`
+          : `${change.path} -> Playwright E2E lane -> no module tests`
+      )
+      continue
+    }
+    for (const path of [change.path, change.previousPath].filter(Boolean)) {
+      const fixturePatterns = fixtureTestPatterns(path)
+      if (fixturePatterns.length > 0) {
+        const tests = Object.values(manifest.modules).flatMap(declaredTests)
+        for (const pattern of fixturePatterns) {
+          const matches = pattern.includes('*')
+            ? tests.filter((test) => matchesPath(test, pattern))
+            : [pattern]
+          if (matches.length === 0) return fullPlan(`${path} -> empty fixture test suite -> full`)
+          for (const test of matches) directTests.add(test)
+        }
+        reasons.push(`${path} -> regression fixture -> direct test suites`)
+        continue
+      }
+      const matchedModules = modulesForPath(manifest, path)
+      if (matchedModules.length === 0) return fullPlan(`${path} -> unknown module owner -> full`)
+      // Some test files also export shared certification helpers. Their explicit interface
+      // registration keeps downstream test consumers in the plan.
+      const sharedTest = matchedModules.some((moduleId) =>
+        manifest.modules[moduleId].interfacePaths.includes(path)
+      )
+      // Some owned tests use another runner (e.g. native node:test). Only portable
+      // tests declared as evidence can take the direct-Vitest shortcut.
+      const declaredTest = matchedModules.some((moduleId) =>
+        declaredTests(manifest.modules[moduleId]).includes(path)
+      )
+      if (/\.(test|spec)\.[cm]?[jt]sx?$/.test(path) && !sharedTest && declaredTest) {
+        directTests.add(path)
+        for (const moduleId of matchedModules) testModules.add(moduleId)
+        reasons.push(`${path} -> registered test -> direct execution`)
+        continue
+      }
+      for (const moduleId of matchedModules) {
+        seeds.add(moduleId)
+        reasons.push(`${path} -> ${moduleId}`)
+      }
+    }
+  }
+
+  const capabilityModules = expandConsumers(manifest, [...seeds])
+  const modules = expandConsumers(manifest, [...seeds], true)
+  // A consumer's full marker describes edits to its own contract, not selecting
+  // its tests as evidence for another owner. Retain the entire consumer closure.
+  const fullModule = [...seeds, ...testModules].find(
+    (moduleId) => manifest.modules[moduleId].fullTestReason
+  )
+  if (fullModule) {
+    return fullPlan(`${fullModule} -> ${manifest.modules[fullModule].fullTestReason} -> full`)
+  }
+  for (const moduleId of seeds) {
+    const visit = (consumer, chain) => {
+      reasons.push(
+        [
+          ...chain,
+          consumer,
+          ...(!modules.includes(consumer) ? ['capability routing only'] : [])
+        ].join(' -> ')
+      )
+      for (const next of manifest.modules[consumer].consumerModules ?? []) {
+        visit(next, [...chain, consumer])
+      }
+    }
+    for (const consumer of manifest.modules[moduleId].consumerModules ?? []) {
+      visit(consumer, [moduleId])
+    }
+  }
+  const plan = selectivePlan(manifest, [...modules, ...testModules], reasons, graph)
+  const capabilityPlan = selectivePlan(manifest, [...capabilityModules, ...testModules], [], graph)
+  plan.capabilityOverlays = capabilityPlan.capabilityOverlays
+  plan.fallbackCapabilities = capabilityPlan.fallbackCapabilities
+  // Editing a registered test runs that test; changing implementations or shared fixtures
+  // still runs every declared owner, contract and transitive consumer test.
+  plan.testFiles = sorted([
+    ...modules.flatMap((moduleId) => declaredTests(manifest.modules[moduleId])),
+    ...directTests,
+    ...graph.testFiles
+  ])
+  return explainDerivedTests(
+    applyPackageBoundary(
+      plan,
+      changes.flatMap((change) => [change.path, change.previousPath].filter(Boolean))
+    ),
+    manifest
+  )
+}
+
+function isCurrentGraph(status) {
+  const pending = status.pendingChanges ?? {}
+  return (
+    status.initialized === true &&
+    status.worktreeMismatch == null &&
+    status.index?.state === 'complete' &&
+    status.index?.reindexRecommended !== true &&
+    ['added', 'modified', 'removed'].every((kind) => (pending[kind] ?? 0) === 0)
+  )
+}
+
+function isPortableVitestFile(path) {
+  return (
+    !path.startsWith('/') &&
+    !path.includes('\\') &&
+    !/^[A-Za-z]:/.test(path) &&
+    !path.split('/').includes('..') &&
+    !path.startsWith('e2e/') &&
+    /\.(?:test|spec)\.[cm]?[jt]sx?$/.test(path)
+  )
+}
+
+function hasC8FileIgnore(path, cwd = process.cwd()) {
+  try {
+    return /^\s*\/\*\s*c8 ignore file\s*\*\//u.test(readFileSync(resolve(cwd, path), 'utf8'))
+  } catch {
+    return false
+  }
+}
+
+// PR and queue full plans defer the complete portable suite to scheduled acceptance. They still
+// run the declared closure of each owned change, so a full marker or a global input cannot remove
+// its owner, contract and consumer tests before merge. Deleted paths and paths that only resolve
+// to full validation remain covered by the deferred suite. The floor uses declared evidence only:
+// graph candidates are collected for every changed path, including those the floor excludes, and
+// trusted preflight has no graph, so both sides must select the same files.
+const declaredFloorGraph = Object.freeze({
+  status: 'not-used',
+  reason: 'full-plan floor uses declared module evidence only',
+  testFiles: []
+})
+
+export function createFullPlanFloor(changes, manifest = defaultManifest, registrationModules = []) {
+  const graph = declaredFloorGraph
+  const modules = Object.fromEntries(
+    Object.entries(manifest.modules).map(([moduleId, module]) => {
+      const floorModule = { ...module }
+      delete floorModule.fullTestReason
+      return [moduleId, floorModule]
+    })
+  )
+  const floorManifest = { ...manifest, modules }
+  // Each change joins the floor only when it has its own bounded selection, so one unowned or
+  // global path cannot remove the floor of the owned changes beside it. A rename joins only when
+  // both its source and destination are bounded, and selects both owners. Deleted, type-changed,
+  // unmerged and unknown changes add no floor.
+  const bounded = (path) =>
+    createAffectedTestPlan(
+      [{ path, status: 'modified' }],
+      graph,
+      floorManifest,
+      registrationModules
+    ).mode === 'selective'
+  const floorChanges = changes.flatMap((change) => {
+    if (['added', 'modified', 'copied'].includes(change.status)) {
+      return bounded(change.path) ? [{ path: change.path, status: 'modified' }] : []
+    }
+    if (change.status === 'renamed' && bounded(change.path) && bounded(change.previousPath)) {
+      return [change.previousPath, change.path].map((path) => ({ path, status: 'modified' }))
+    }
+    return []
+  })
+  const plan = createAffectedTestPlan(floorChanges, graph, floorManifest, registrationModules)
+  if (plan.mode !== 'selective' || plan.testFiles.length === 0) return undefined
+  return {
+    ...plan,
+    floorPaths: sorted(floorChanges.map(({ path }) => path)),
+    reasonChains: sorted([
+      ...plan.reasonChains,
+      'full plan -> declared module test floor; complete portable suite deferred to scheduled acceptance'
+    ])
+  }
+}
+
+export function collectCodeGraphTests(
+  paths,
+  { cwd = process.cwd(), execute = execFileSync, pathExists = existsSync } = {}
+) {
+  try {
+    const status = JSON.parse(
+      execute('codegraph', ['status', '--json', cwd], { cwd, encoding: 'utf8' })
+    )
+    if (!isCurrentGraph(status)) {
+      const reason = status.worktreeMismatch
+        ? 'worktree index mismatch'
+        : 'index is missing, stale, incomplete, or has pending changes'
+      return { status: 'unavailable-manifest-only', reason, testFiles: [] }
+    }
+    if (paths.length === 0) return { status: 'current', testFiles: [] }
+
+    const result = JSON.parse(
+      execute('codegraph', ['affected', '--json', '--depth', '2', ...paths], {
+        cwd,
+        encoding: 'utf8'
+      })
+    )
+    const testFiles = sorted(
+      (result.affectedTests ?? []).filter(
+        (path) => isPortableVitestFile(path) && pathExists(resolve(cwd, path))
+      )
+    )
+    return { status: 'current', testFiles }
+  } catch (error) {
+    return {
+      status: 'unavailable-manifest-only',
+      reason: error instanceof Error ? error.message.split('\n', 1)[0] : String(error),
+      testFiles: []
+    }
+  }
+}
+
+function changesFromGit(base, head, { cwd = process.cwd(), execute = execFileSync } = {}) {
+  const mergeBase = execute('git', ['merge-base', base, head], {
+    cwd,
+    encoding: 'utf8',
+    maxBuffer: GIT_OUTPUT_MAX_BUFFER
+  }).trim()
+  const diff = execute('git', ['diff', '--name-status', '-z', mergeBase, head], {
+    cwd,
+    maxBuffer: GIT_OUTPUT_MAX_BUFFER
+  })
+  return parseNameStatus(diff.toString('utf8'))
+}
+
+export function formatModuleTestPlan(plan) {
+  const list = (values) => (values.length === 0 ? '_none_' : values.join(', '))
+  const tests =
+    plan.mode === 'full'
+      ? '- _complete Vitest suite (no path filter)_'
+      : plan.testFiles.map((path) => `- ${path}`).join('\n')
+  const reasons = plan.reasonChains.map((reason) => `- ${reason}`).join('\n')
+  return `Module test-impact plan\n\nMode: ${plan.mode}\nModules: ${list(plan.modules)}\nCodeGraph: ${plan.graphStatus}${plan.graphReason ? ` (${plan.graphReason})` : ''}\nCapability overlays: ${list(plan.capabilityOverlays)}\nFallback capabilities: ${list(plan.fallbackCapabilities)}\n\nReason chains:\n${reasons}\n\nVitest files:\n${tests}\n`
+}
+
+export function executeModuleTestPlan(
+  plan,
+  {
+    cwd = process.cwd(),
+    spawn = spawnSync,
+    environment = process.env,
+    platform = process.platform,
+    nodeExecutable = process.execPath,
+    testArguments = []
+  } = {}
+) {
+  process.stdout.write(formatModuleTestPlan(plan))
+  const mergeReports = testArguments.some(
+    (argument) => argument === '--merge-reports' || argument.startsWith('--merge-reports=')
+  )
+  const shard = testArguments.some(
+    (argument) => argument === '--shard' || argument.startsWith('--shard=')
+  )
+  const deferredPackageRoots = plan.mode === 'selective' ? (plan.deferredPackageRoots ?? []) : []
+  const testFilters = sorted([...plan.testFiles, ...packageTestSelectedRoots(environment)]).filter(
+    (path) => !deferredPackageRoots.some((root) => path === root || path.startsWith(root + '/'))
+  )
+  if (!mergeReports && !shard && plan.mode === 'selective' && testFilters.length === 0) return 0
+  // Report merging executes no tests and needs no generated Prisma client from npm's pretest.
+  const npmArguments = mergeReports
+    ? ['exec', '--', 'vitest', 'run', ...testArguments]
+    : [
+        'test',
+        '--',
+        ...testArguments,
+        ...deferredPackageRoots.map((root) => `--exclude=${root}/**`),
+        // An empty shard must emit its blob without falling back to unfiltered discovery.
+        ...(plan.mode === 'full'
+          ? []
+          : testFilters.length
+            ? testFilters
+            : ['__no_selected_module_tests__'])
+      ]
+  // Windows environment snapshots (including test workers) have case-sensitive JS keys.
+  const npmExecPath =
+    environment.npm_execpath ??
+    (platform === 'win32'
+      ? Object.entries(environment).find(([key]) => key.toLowerCase() === 'npm_execpath')?.[1]
+      : undefined)
+  if (platform === 'win32' && !npmExecPath) {
+    throw new Error(
+      'npm_execpath is unavailable on Windows; run this command through npm run test:module or npm run test:affected'
+    )
+  }
+  const command = npmExecPath ? nodeExecutable : 'npm'
+  let arguments_ = npmExecPath ? [npmExecPath, ...npmArguments] : npmArguments
+  let argumentDirectory
+  try {
+    // npm also crosses cmd.exe on Windows (8,191 characters). Leave room for its wrapper.
+    if (!mergeReports && JSON.stringify([command, ...arguments_]).length > 6000) {
+      argumentDirectory = mkdtempSync(resolve(tmpdir(), 'open-science-vitest-'))
+      const argumentFile = resolve(argumentDirectory, 'arguments.json')
+      writeFileSync(argumentFile, JSON.stringify(['run', ...npmArguments.slice(2)]), {
+        mode: 0o600
+      })
+      const fileArguments = ['run', 'test:module:arguments', '--', argumentFile]
+      arguments_ = npmExecPath ? [npmExecPath, ...fileArguments] : fileArguments
+    }
+    const result = spawn(command, arguments_, { cwd, env: environment, stdio: 'inherit' })
+    if (result.error) throw result.error
+    return result.status ?? 1
+  } finally {
+    if (argumentDirectory) rmSync(argumentDirectory, { recursive: true, force: true })
+  }
+}
+
+function argumentValue(arguments_, name) {
+  const index = arguments_.indexOf(name)
+  return index === -1 ? undefined : arguments_[index + 1]
+}
+
+export async function runModuleTestCli(arguments_ = process.argv.slice(2), options = {}) {
+  const separator = arguments_.indexOf('--')
+  const forwardedArguments = separator === -1 ? [] : arguments_.slice(separator + 1)
+  if (separator !== -1) arguments_ = arguments_.slice(0, separator)
+  const testArguments = [...(options.testArguments ?? []), ...forwardedArguments]
+  const [command] = arguments_
+  if (command === 'module') {
+    const moduleId = arguments_[1]
+    if (!moduleId || moduleId.startsWith('--')) throw new Error('Module id is required')
+    const manifest = loadModuleImpactManifest()
+    const derived =
+      options.derivedConsumers ??
+      (await loadOrGenerateDerivedConsumers(manifest, options.cwd ?? process.cwd()))
+    const plan = createModuleTestPlan(moduleId, withDerivedConsumers(manifest, derived))
+    return executeModuleTestPlan(plan, { ...options, testArguments })
+  }
+  if (command !== 'affected') throw new Error(`Unknown module test-impact command: ${command}`)
+
+  const base = argumentValue(arguments_, '--base')
+  const head = argumentValue(arguments_, '--head')
+  if (!base || !head) throw new Error('--base and --head are required')
+  const tier = argumentValue(arguments_, '--tier') ?? 'queue'
+  if (
+    !['pr', 'queue'].includes(tier) ||
+    (arguments_.includes('--tier') && !argumentValue(arguments_, '--tier'))
+  )
+    throw new Error('--tier must be pr or queue')
+  const coverageChanged = argumentValue(arguments_, '--coverage-changed')
+  if (arguments_.includes('--coverage-changed') && !coverageChanged) {
+    throw new Error('--coverage-changed requires a Git revision')
+  }
+  const { plan, changes } = await resolveAffectedTestPlan(base, head, {
+    tier,
+    fullFloor: arguments_.includes('--full-floor'),
+    ...options
+  })
+  if (arguments_.includes('--require-selective') && plan.mode !== 'selective') {
+    throw new Error(
+      `Selective test plan required; refusing full execution.\n${formatModuleTestPlan(plan)}`
+    )
+  }
+  if (arguments_.includes('--explain')) {
+    process.stdout.write(formatModuleTestPlan(plan))
+    return 0
+  }
+  const environment = coverageChanged
+    ? {
+        ...(options.environment ?? process.env),
+        VITEST_CHANGED_COVERAGE_THRESHOLDS: '1'
+      }
+    : options.environment
+  // CI checks out a synthetic merge commit. Vitest's coverage.changed compares against
+  // checkout HEAD, which also includes newer base-branch changes outside this PR's test plan.
+  const coverageChanges = coverageChanged
+    ? coverageChanged === base
+      ? changes
+      : changesFromGit(coverageChanged, head, options)
+    : []
+  const coveragePaths = sorted(
+    coverageChanges
+      .filter(
+        ({ path, status }) =>
+          status !== 'deleted' &&
+          /^src\/.*\.tsx?$/.test(path) &&
+          !hasC8FileIgnore(path, options.cwd ?? process.cwd())
+      )
+      .map(({ path }) => path)
+  )
+  const collectChangedCoverage = coverageChanged && coveragePaths.length > 0
+  return executeModuleTestPlan(plan, {
+    ...options,
+    environment: collectChangedCoverage ? environment : options.environment,
+    testArguments: collectChangedCoverage
+      ? [
+          '--coverage',
+          ...(coveragePaths.length > 0 ? coveragePaths : ['__no_changed_sources__']).map(
+            (path) => `--coverage.include=${path}`
+          ),
+          ...testArguments
+        ]
+      : testArguments
+  })
+}
+
+// The plan `affected` executes for a revision range, including CodeGraph and host/package
+// refinement. Shadow reports compare against this, not the unrefined registered plan.
+export async function resolveAffectedTestPlan(
+  base,
+  head,
+  { tier = 'queue', fullFloor = false, ...options } = {}
+) {
+  const derivedConsumers =
+    options.derivedConsumers ??
+    (await loadOrGenerateDerivedConsumers(
+      loadModuleImpactManifest(),
+      options.cwd ?? process.cwd(),
+      // Tests run against the checked-out commit (a merge commit in pull_request jobs), so the
+      // evidence is that commit's immutable snapshot, not --head and not the mutable worktree.
+      'HEAD'
+    ))
+  const { manifest, registrationModules, registrationOnly, changes } = resolveModuleImpactInputs(
+    changesFromGit(base, head, options),
+    { base, head, ...options, derivedConsumers }
+  )
+  const paths = sorted(
+    changes.flatMap(({ path, previousPath }) => [path, previousPath].filter(Boolean))
+  )
+  const graph = collectCodeGraphTests(paths, options)
+  let plan = createAffectedTestPlan(changes, graph, manifest, registrationModules, registrationOnly)
+  // Trusted preflight selected the floor for a full plan. Run it as declared, without narrowing
+  // refinements, which evaluate the complete change set the floor excludes. Changed-source
+  // coverage is limited to the floor's changes; the deferred suite covers the remainder.
+  if (fullFloor && plan.mode === 'full') {
+    const floor = createFullPlanFloor(changes, manifest, registrationModules)
+    if (floor) {
+      const floorChanges = changes.filter(({ path }) => floor.floorPaths.includes(path))
+      return { plan: floor, changes: floorChanges, manifest, registrationModules, registrationOnly }
+    }
+  }
+  // Documentation and trusted additive records do not turn a source boundary into a
+  // mixed product change. Keep their plan evidence and capability selection intact.
+  const sourceChanges = changes.filter((change) => {
+    const pathPlan = classifyChanges([change], undefined, {
+      moduleManifest: manifest,
+      registrationModules
+    })
+    return (
+      !pathPlan.roots.includes('module_registration') &&
+      !(pathPlan.lanes.includes('docs') && !pathPlan.bundles.includes('unit'))
+    )
+  })
+  if (
+    plan.mode === 'selective' &&
+    sourceChanges.some(({ path }) => path.startsWith('src/')) &&
+    sourceChanges.some(({ path }) => path.startsWith('packages/'))
+  )
+    plan.reasonChains.push(
+      'mixed host/package product boundaries -> retain complete declared selection'
+    )
+  // Keep preflight dependency-free; refinement runs only in the installed test runner.
+  if (
+    plan.mode === 'selective' &&
+    sourceChanges.length &&
+    sourceChanges.every(({ path }) => path.startsWith('packages/')) &&
+    !packageTestSelectedRoots(options.environment ?? process.env).includes('packages')
+  ) {
+    try {
+      const { refinePackageHostTests } = await import('./package-host-test-impact.mjs')
+      plan = refinePackageHostTests(plan, sourceChanges, manifest, {
+        registrationModules,
+        base,
+        head,
+        graphTests: graph.testFiles,
+        tier,
+        ...options
+      })
+    } catch {
+      plan.reasonChains.push(
+        'package host evidence unavailable -> retain complete declared selection'
+      )
+    }
+  }
+  if (
+    plan.mode === 'selective' &&
+    sourceChanges.length &&
+    sourceChanges.every(({ path }) => path.startsWith('src/'))
+  ) {
+    try {
+      const { refineHostTests } = await import('./package-host-test-impact.mjs')
+      plan = refineHostTests(plan, sourceChanges, manifest, {
+        registrationModules,
+        base,
+        head,
+        graphTests: graph.testFiles,
+        tier,
+        ...options
+      })
+    } catch {
+      plan.reasonChains.push(
+        'host consumer evidence unavailable -> retain complete declared selection'
+      )
+    }
+  }
+  return { plan, changes, manifest, registrationModules, registrationOnly }
+}
+
+const isDirectExecution =
+  process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)
+
+if (isDirectExecution) {
+  try {
+    process.exitCode = await runModuleTestCli()
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : error)
+    process.exitCode = 1
+  }
+}

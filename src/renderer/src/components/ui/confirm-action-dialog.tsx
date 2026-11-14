@@ -1,0 +1,121 @@
+import { LoaderCircle } from 'lucide-react'
+import * as AlertDialog from '@/components/ui/alert-dialog'
+
+import { Button } from '@/components/ui/button'
+import {
+  dialogBodyClassName,
+  dialogCancelButtonClassName,
+  dialogDescriptionClassName,
+  dialogFooterClassName,
+  dialogHeaderClassName,
+  dialogOverlayClassName,
+  dialogPanelClassName,
+  dialogTitleClassName
+} from '@/components/ui/dialog-chrome'
+
+type ConfirmActionDialogProps = {
+  open: boolean
+  title: string
+  description: string
+  children?: React.ReactNode
+  cancelLabel: string
+  confirmLabel: string
+  loadingLabel?: string
+  loading?: boolean
+  destructive?: boolean
+  dismissOnOutside?: boolean
+  testId?: string
+  onCancel: () => void
+  onConfirm: () => void
+  onCloseAutoFocus?: React.ComponentProps<typeof AlertDialog.Content>['onCloseAutoFocus']
+}
+
+const ConfirmActionDialog = ({
+  open,
+  title,
+  description,
+  children,
+  cancelLabel,
+  confirmLabel,
+  loadingLabel,
+  loading = false,
+  destructive = false,
+  dismissOnOutside = false,
+  testId,
+  onCancel,
+  onConfirm,
+  onCloseAutoFocus
+}: ConfirmActionDialogProps): React.JSX.Element => (
+  <AlertDialog.Root
+    open={open}
+    onOpenChange={(nextOpen) => {
+      if (!nextOpen && !loading) onCancel()
+    }}
+  >
+    <AlertDialog.Portal>
+      <AlertDialog.Overlay
+        className={`${dialogOverlayClassName} z-[70]`}
+        onPointerDown={(event) => {
+          if (dismissOnOutside && !loading && event.target === event.currentTarget) onCancel()
+        }}
+      />
+      <AlertDialog.Content
+        className={dialogPanelClassName(
+          'z-[70] flex w-[min(420px,calc(100vw-2rem))] flex-col overflow-hidden p-0'
+        )}
+        data-testid={testId}
+        data-preview-escape-boundary
+        onCloseAutoFocus={onCloseAutoFocus}
+        onEscapeKeyDown={(event) => {
+          if (loading || event.isComposing) event.preventDefault()
+        }}
+      >
+        <div className={dialogHeaderClassName}>
+          <AlertDialog.Title className={dialogTitleClassName}>{title}</AlertDialog.Title>
+        </div>
+        <div className={`${dialogBodyClassName} min-h-0 overflow-y-auto`}>
+          <AlertDialog.Description className={dialogDescriptionClassName}>
+            {description}
+          </AlertDialog.Description>
+          {children}
+        </div>
+        <div className={dialogFooterClassName}>
+          <AlertDialog.Cancel asChild>
+            <Button
+              type="button"
+              variant="ghost"
+              className={dialogCancelButtonClassName}
+              disabled={loading}
+            >
+              {cancelLabel}
+            </Button>
+          </AlertDialog.Cancel>
+          <AlertDialog.Action asChild>
+            <Button
+              type="button"
+              variant={destructive ? 'destructive' : 'default'}
+              disabled={loading}
+              onClick={(event) => {
+                event.preventDefault()
+                onConfirm()
+              }}
+              aria-busy={Boolean(loading)}
+            >
+              <span key={String(loading)} className="button-feedback">
+                {loading ? (
+                  <LoaderCircle
+                    className="size-4 animate-spin motion-reduce:animate-none"
+                    aria-hidden="true"
+                  />
+                ) : null}
+                {loading ? (loadingLabel ?? confirmLabel) : confirmLabel}
+              </span>
+            </Button>
+          </AlertDialog.Action>
+        </div>
+      </AlertDialog.Content>
+    </AlertDialog.Portal>
+  </AlertDialog.Root>
+)
+
+export { ConfirmActionDialog }

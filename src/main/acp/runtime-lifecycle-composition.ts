@@ -1,0 +1,255 @@
+import { classifyFailure } from '../../shared/failure/classify'
+import type { ClientConnection } from '@agentclientprotocol/sdk'
+
+import { createLogger, errorLogFields } from '@aipoch/diagnostics/node'
+import {
+  ACP_PROMPT_FAILED_EVENT_TITLE,
+  type AcpConnectRequest,
+  type AcpRuntimeEvent
+} from '../../shared/acp'
+import type { AgentFramework } from '../agent-framework/types'
+import type { AcpAgentConnectionCandidate } from './agent-connection-adapter'
+import { AcpConnectionCloseWorkflow, type CloseState } from './connection-close-workflow'
+import { AcpConnectionLifecycleWorkflow } from './connection-lifecycle-workflow'
+import type { AcpConnectionResourceAttempt } from './connection-resource-owner'
+import { AcpModelChangeWorkflow } from './model-change-workflow'
+import type { AcpRuntimeBaseOwners } from './runtime-base-composition'
+import type { AcpRuntimeOptions } from './runtime-contract'
+import type { AcpRuntimeSessionOwners } from './runtime-session-composition'
+import type { AcpSessionInteractionOwner } from './session-interaction-owner'
+import { AcpSessionCleanupAdmission } from './session-cleanup-admission'
+
+const log = createLogger('acp')
+
+const safeLogError = (message: string, error: unknown): void => {
+  try {
+    log.error(message, error)
+  } catch {
+    // Lifecycle recovery and the original failure take precedence over diagnostic sinks.
+  }
+}
+
+type AcpRuntimeLifecycleHost = Readonly<{
+  connect: (request: AcpConnectRequest) => ReturnType<AcpConnectionLifecycleWorkflow['connect']>
+  disconnect: (emitClosedStatus?: boolean) => ReturnType<AcpConnectionCloseWorkflow['disconnect']>
+  openAgentConnection: (
+    attempt: AcpConnectionResourceAttempt,
+    onFrameworkResolved: (framework: AgentFramework['id']) => void
+  ) => Promise<AcpAgentConnectionCandidate>
+  clearPromptResources?: () => void
+  releasePromptTurns?: () => void
+}>
+
+// Composes the model/connection lifecycle cycle around authoritative base and Session owners.
+// Host callbacks retain only structural facade operations and are never invoked during construction.
+/* eslint-disable @typescript-eslint/explicit-function-return-type */
+const composeAcpRuntimeLifecycleOwners = (
+  options: Pick<
+    AcpRuntimeOptions,
+    | 'appVersion'
+    | 'defaultCwd'
+    | 'hasReplayableImageHistory'
+    | 'runtimeSessions'
+    | 'callbacks'
+    | 'separateProviderNotices'
+  >,
+  base: AcpRuntimeBaseOwners,
+  session: AcpRuntimeSessionOwners,
+  host: AcpRuntimeLifecycleHost
+) => {
+  const currentConnection = (): ClientConnection | undefined => base.connectionResources.connection
+  const currentFramework = (): AgentFramework => base.backendGeneration.current.framework
+  const diagnosticContext = (
+    framework: AgentFramework['id'] = currentFramework().id,
+    generation = base.connectionResources.epoch
+  ) => ({ framework, generation, status: base.snapshotOwner.status })
+  const setStatus = (status: Parameters<typeof base.snapshotOwner.transitionStatus>[0]): void => {
+    base.snapshotOwner.transitionStatus(status)
+    session.publication.emitState()
+  }
+  const invalidatePendingSessionStartups = (): void => {
+    base.generationActivity.invalidateStartups()
+    session.sessionRegistry.invalidatePending()
+    session.reviewerSessions.invalidatePending()
+  }
+  const activeSessionIds = (): string[] =>
+    session.sessionRegistry.entries(true).map(({ appSessionId }) => appSessionId)
+  const closeState: CloseState = {
+    invalidatePendingSessionStartups,
+    disposePermissionContext: () => session.permissionContext.dispose(),
+    disposeElicitationOwner: () => session.elicitationOwner.dispose(),
+    clearPendingAppContinuations: () => session.appContinuations.clear(),
+    clearReviewerState: () => session.reviewerSessions.clear(),
+    clearPlanInteractions: () =>
+      base.planInteractions.clearAll('The Session Plan interaction was disconnected.'),
+    settleActivePrompts: () => base.sessionInteractions.settleActivePrompts(),
+    supersedeInteractions: () => {
+      base.sessionInteractions.supersedeAll()
+      host.releasePromptTurns?.()
+    },
+    clearContextUsage: () => base.contextUsageTracker.clear(),
+    clearAppliedSessionModels: () => session.sessionRegistry.clearAppliedModels(),
+    activeSessionIds,
+    disposeSessionCapabilities: (sessionIds) => base.sessionCapabilities.dispose(sessionIds),
+    disposeActiveSessions: (recordFailure) => {
+      for (const { attachment } of session.sessionRegistry.entries(true)) {
+        if (!attachment) continue
+        try {
+          attachment.session.dispose()
+        } catch (error) {
+          recordFailure('primary-session', error)
+        }
+      }
+    },
+    detachSessionConnections: (clearPermissionProfile) => {
+      for (const entry of session.sessionRegistry.entries()) {
+        if (entry.attachment) session.sessionRegistry.detach(entry.attachment, 'connection')
+        else entry.aggregate.detachConnection()
+        if (clearPermissionProfile) entry.aggregate.setPermissionProfile(undefined)
+      }
+    },
+    clearPromptContent: (connectionGeneration) => {
+      host.clearPromptResources?.()
+      if (connectionGeneration === undefined) base.promptContentOwner.clear()
+      else base.promptContentOwner.clearGeneration(connectionGeneration)
+    },
+    clearHandoffContinuity: () => base.handoffContinuity.clearGeneration(),
+    clearSessionProjection: () => session.sessionUpdateProjector.clearGeneration(),
+    disposeSessionProjection: () => session.sessionUpdateProjector.dispose(),
+    clearHttpRoutes: () => base.sessionCapabilities.clearHttpRoutes(),
+    selectSession: () => session.sessionRegistry.select(undefined),
+    publishInterruptedPromptFailures: (prompts, cause = 'connection-lost') => {
+      for (const { scope, terminal } of prompts as ReturnType<
+        AcpSessionInteractionOwner['settleActivePrompts']
+      >) {
+        try {
+          const event: AcpRuntimeEvent = {
+            id: session.publication.nextEventId(),
+            kind: 'error',
+            level: 'error',
+            interruptionCause: cause,
+            failure: classifyFailure({ origin: 'session' }),
+            sessionId: scope.sessionId,
+            promptExecutionId: scope.turnToken,
+            ...(scope.promptMessageId ? { promptMessageId: scope.promptMessageId } : {}),
+            timestamp: terminal.timestamp,
+            title: ACP_PROMPT_FAILED_EVENT_TITLE,
+            text:
+              cause === 'app-restart'
+                ? 'Session was interrupted before the app closed.'
+                : 'ACP connection closed'
+          }
+          if (options.runtimeSessions) {
+            void options.runtimeSessions
+              .commitTerminal(event, (published) => session.publication.pushEvent(published))
+              .then(() => options.runtimeSessions!.retryTerminalCommits(scope.sessionId))
+              .catch((error) => safeLogError('connection-close terminal commit failed', error))
+          } else session.publication.pushEvent(event)
+        } catch (error) {
+          safeLogError('connection-close prompt event failed', errorLogFields(error))
+        }
+      }
+    },
+    cancelPendingStatePublication: () => session.publication.cancelPendingStatePublication(),
+    setStatus,
+    transitionStatus: (status) => base.snapshotOwner.transitionStatus(status),
+    emitState: () => session.publication.emitState(),
+    hasContextUsage: () => base.contextUsageTracker.hasUsage()
+  }
+
+  const modelChanges = new AcpModelChangeWorkflow({
+    backendGeneration: base.backendGeneration,
+    connectionResources: base.connectionResources,
+    registry: session.sessionRegistry,
+    configurator: base.sessionConfigurator,
+    contextUsage: base.contextUsageTracker,
+    currentStatus: () => base.snapshotOwner.status,
+    providerReconnectPending: () => base.connectionTransitions.providerReconnectPending,
+    isGenerationBusy: () => base.generationActivity.blockers().retirement,
+    contextEstimateInput: (sessionId) =>
+      session.contextUsagePolicy.resolve(sessionId).estimateInput,
+    hasReplayableImageHistory: options.hasReplayableImageHistory,
+    emitState: () => session.publication.emitState(),
+    requestReconnect: () => base.connectionTransitions.requestProviderReconnect(),
+    recoverFailedReconnect: (disconnectedGeneration) =>
+      connectionClose.recoverFailedDeferredDisconnect(disconnectedGeneration),
+    reportReconnectFailure: (error) =>
+      safeLogError('model-change reconnect failed', errorLogFields(error)),
+    diagnosticContext
+  })
+  const connectionClose: AcpConnectionCloseWorkflow = new AcpConnectionCloseWorkflow({
+    currentGeneration: () => base.connectionResources.epoch,
+    currentStatus: () => base.snapshotOwner.status,
+    getSnapshot: () => session.publication.getSnapshot(),
+    transitions: base.connectionTransitions,
+    resources: base.connectionResources,
+    backendGeneration: base.backendGeneration,
+    modelChanges,
+    state: closeState,
+    reportFailure: (message, error) => safeLogError(message, errorLogFields(error))
+  })
+
+  base.bindGenerationConnectionEffects({
+    reviewerSessions: session.reviewerSessions,
+    modelChanges,
+    connectionClose: {
+      disconnect: (emitClosedStatus) => host.disconnect(emitClosedStatus),
+      recoverFailedDeferredDisconnect: (disconnectedGeneration) =>
+        connectionClose.recoverFailedDeferredDisconnect(disconnectedGeneration)
+    },
+    publishIdle: () => setStatus('idle')
+  })
+
+  const connectionLifecycle = new AcpConnectionLifecycleWorkflow({
+    appVersion: options.appVersion,
+    separateProviderNotices: options.separateProviderNotices,
+    toolLess: session.sessionEnvironment.role() === 'restricted-inference',
+    defaultCwd: options.defaultCwd,
+    currentConnection,
+    currentStatus: () => base.snapshotOwner.status,
+    currentGeneration: () => base.connectionResources.epoch,
+    currentFramework: () => currentFramework().id,
+    reconnectBarrier: () => base.connectionTransitions.barrier,
+    connect: (request) => host.connect(request),
+    getSnapshot: () => session.publication.getSnapshot(),
+    connectResources: base.connectionResources,
+    invalidatePendingSessionStartups,
+    disconnectCurrent: (emitClosedStatus, generation) =>
+      connectionClose.disconnectCurrent(emitClosedStatus, generation),
+    updateCwd: (cwd) => base.snapshotOwner.updateCwd(cwd),
+    updateError: (error) => base.snapshotOwner.updateError(error),
+    setStatus,
+    pushEvent: (event) => session.publication.pushEvent(event),
+    transitionStatus: (status) => base.snapshotOwner.transitionStatus(status),
+    emitState: () => session.publication.emitState(),
+    diagnosticContext,
+    openCandidate: (attempt, onFrameworkResolved) =>
+      host.openAgentConnection(attempt, onFrameworkResolved)
+  })
+
+  const sessionCleanup = new AcpSessionCleanupAdmission({
+    activeTransition: () => {
+      const model = modelChanges.applying
+      if (model) return { kind: 'model-application', completion: model }
+      const connection = base.connectionTransitions.inFlight
+      if (connection) return { kind: 'connection-teardown', completion: connection }
+      const resource = base.connectionResources.transition
+      return resource ? { kind: 'connection-resources', completion: resource } : undefined
+    },
+    withActivity: (work) => base.generationActivity.withActivity(work),
+    assertReady: () => {
+      if (!currentConnection() && !base.connectionResources.cleanupConfirmed) {
+        throw new Error('ACP connection cleanup is not confirmed.')
+      }
+    },
+    diagnosticContext
+  })
+
+  return Object.freeze({ modelChanges, connectionClose, connectionLifecycle, sessionCleanup })
+}
+/* eslint-enable @typescript-eslint/explicit-function-return-type */
+
+type AcpRuntimeLifecycleOwners = ReturnType<typeof composeAcpRuntimeLifecycleOwners>
+
+export { composeAcpRuntimeLifecycleOwners }
+export type { AcpRuntimeLifecycleHost, AcpRuntimeLifecycleOwners }

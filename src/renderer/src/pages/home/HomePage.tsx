@@ -1,0 +1,1378 @@
+import { UseCaseCarousel } from './UseCaseCarousel'
+import { useHomeGalleryNavigation } from './use-home-gallery-navigation'
+import { ProjectPackageDropZone } from '@/components/ProjectPackageDropZone'
+import { ErrorNotice } from '@/components/error-notice'
+import {
+  PackageExportProgressButton,
+  PackageOperationIndicator
+} from '@/components/SessionPackageOperation'
+/* Hallmark · macrostructure: operational-home-dashboard · genre: modern-minimal · tone: quiet/technical · anchor: teal
+ * pre-emit critique: P5 H5 E5 S5 R5 V4 · contrast: pass (40–41) · icons: pass (30)
+ * slop: pass (42–49) · mobile: pass (34, 49, 50–57)
+ */
+import {
+  Archive,
+  BookOpenText,
+  Store,
+  Check,
+  CircleAlert,
+  Clock,
+  GalleryVerticalEnd,
+  LoaderCircle,
+  MoreVertical,
+  Plus,
+  Search,
+  Settings,
+  Star,
+  Trash2,
+  X
+} from 'lucide-react'
+import { useEffect, useMemo, useState } from 'react'
+import { useTranslation } from 'react-i18next'
+import { isComputeJobTrackingStopped } from '@aipoch/compute'
+
+import { relativeTimeParts, type RelativeTimeUnit } from '@/lib/format-relative-time'
+import type { SessionCatalogRecovery } from '@/lib/session-persistence/session-persistence'
+import { cn } from '@/lib/utils'
+import { Button } from '@/components/ui/button'
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger
+} from '@/components/ui/dropdown-menu'
+import { useNavigationStore } from '@/stores/navigation-store'
+import { useNotificationInboxStore } from '@/stores/notification-inbox-store'
+import { useSessionJobStore } from '@/stores/session-job-store'
+import type { ChatSession } from '@/stores/session-store-contract'
+import { useSessionStore } from '@/stores/session-store'
+import { useProjectStore } from '@/stores/project-store'
+import { useArchiveUndoStore } from '@/stores/archive-undo-store'
+import { useSettingsStore } from '@/stores/settings-store'
+import { useProjectFormDialog } from '@/hooks/useProjectFormDialog'
+import {
+  useSessionPendingInteractions,
+  type SessionPendingInteractionFacts
+} from '@/hooks/useSessionPendingInteractions'
+import { startWslSetupConversation } from '@/lib/wsl-support-handoff'
+import { GitHubStarBadge } from '@/components/GitHubStarBadge'
+import { NetworkStatusIndicator } from '@/components/NetworkStatusIndicator'
+import { NotificationBell } from '@/components/NotificationBell'
+import { ProjectDeletionCleanupNotice } from '@/components/ProjectDeletionCleanupNotice'
+import { UpdateCapsule } from '@/components/UpdateCapsule'
+import { sessionWaitReasonLabelKeys } from '@/lib/session-wait-reason-labels'
+import { APP } from '../../../../shared/app-config'
+import { earliestCurrentDelegatedAttemptStartedAt } from '../../../../shared/delegated-work-projection'
+import type { Project } from '../../../../shared/projects'
+import type { EnvironmentCheckItem, EnvironmentCheckResult } from '../../../../shared/settings'
+import { getEnvironmentRepairPanel } from '@/lib/settings-navigation'
+import {
+  isSessionWaitReason,
+  projectPresentedSessionActionability,
+  type SessionWaitReason
+} from '../workspace/session-wait-reason'
+
+import { DeleteProjectDialog } from './DeleteProjectDialog'
+import { ProjectFormDialog } from './ProjectFormDialog'
+import { useRecentSessions } from './use-recent-sessions'
+
+// Compact labels for dense rows ("3d"), unlike the verbose wording in global search ("3 days ago").
+// The unit is a runtime value, so it maps to its English text rather than being interpolated into a
+// key. Every entry carries the 'ago' context: Chinese needs "3 天前" here, where the file browser's
+// bare-age column says "3 天" for the same unit.
+const COMPACT_ELAPSED = {
+  minute: '{{count}}m',
+  hour: '{{count}}h',
+  day: '{{count}}d',
+  week: '{{count}}w',
+  month: '{{count}}mo',
+  year: '{{count}}y'
+} as const satisfies Record<Exclude<RelativeTimeUnit, 'now'>, string>
+
+type ProjectSummary = {
+  project: Project
+  sessionCount: number
+  runningCount: number
+  waitingCount: number
+  lastActivityAt: number
+}
+
+type HomeSessionActivity = 'running' | 'completed' | SessionWaitReason
+
+const homeSessionWaitAriaLabelKeys = {
+  'waiting-for-user': 'Open session {{title}}, waiting for your answer',
+  'waiting-permission': 'Open session {{title}}, waiting for permission',
+  'waiting-plan-approval': 'Open session {{title}}, waiting for plan approval'
+} as const satisfies Record<SessionWaitReason, string>
+
+type HomeSessionUpdate = {
+  session: ChatSession
+  activity: HomeSessionActivity
+  activityTimestamp: number
+}
+
+type HomePageProps = {
+  canDeleteProjects: boolean
+  hasCompleteSessionCatalog: boolean
+  catalogRecovery?: SessionCatalogRecovery
+  onOpenGlobalSearch: () => void
+}
+
+const INCOMPLETE_PROJECT_SESSION_CATALOG_ERROR =
+  'Cannot archive a Project while its Session catalog is incomplete.'
+
+// Optional warnings (currently Python and reduced key protection) never create a Home alert. Only a
+// failed check that blocks the core flow asks an existing user to revisit environment setup.
+const getRequiredEnvironmentFailures = (
+  environment: EnvironmentCheckResult | undefined
+): EnvironmentCheckItem[] => environment?.checks.filter((check) => check.status === 'failed') ?? []
+
+const getHomeSessionActivity = (
+  session: ChatSession,
+  hasNonTerminalCompute: boolean,
+  pendingInteractions: SessionPendingInteractionFacts = {}
+): HomeSessionActivity | undefined => {
+  const actionability = projectPresentedSessionActionability(session, pendingInteractions)
+  if (actionability.waitReason) return actionability.waitReason
+  if (actionability.activity === 'running' || hasNonTerminalCompute) return 'running'
+  return undefined
+}
+
+const getRunningActivityTimestamp = (session: ChatSession, computeStartedAt?: number): number => {
+  const candidates = [
+    session.status === 'running' ? session.activeRun?.startedAt : undefined,
+    earliestCurrentDelegatedAttemptStartedAt(session),
+    computeStartedAt
+  ].filter((value): value is number => value !== undefined)
+  return candidates.length > 0
+    ? Math.min(...candidates)
+    : (session.presentedActivityAt ?? session.updatedAt)
+}
+
+const sectionHeadingClassName =
+  'sticky top-0 z-30 -mx-3 mb-3 flex items-center gap-2 bg-bg-10 px-3 py-2 text-[17px] font-medium leading-6 text-text-000'
+
+const listCardClassName = 'rounded-2xl bg-bg-000 p-1.5 shadow-card'
+
+const emptyStateClassName =
+  'flex min-h-[180px] flex-col items-center justify-center rounded-2xl border border-dashed border-border p-6 text-center'
+
+const rowClassName =
+  'group flex w-full items-center gap-2 rounded-xl px-2.5 py-2.5 text-left hover:bg-bg-300 sm:px-3'
+
+const rowActionClassName =
+  'inline-flex size-7 shrink-0 items-center justify-center rounded text-text-300 opacity-100 transition-opacity duration-150 ease-out hover:bg-bg-400 hover:text-text-000 focus-visible:opacity-100 [@media(hover:hover)_and_(pointer:fine)]:opacity-0 [@media(hover:hover)_and_(pointer:fine)]:group-hover:opacity-100 data-[state=open]:opacity-100 [@media(pointer:coarse)]:size-11'
+
+const withSessionDescriptionTooltip = (
+  description: string | undefined,
+  trigger: React.JSX.Element
+): React.JSX.Element => {
+  const displayDescription = description?.trim()
+  if (!displayDescription) return trigger
+
+  return (
+    <>
+      <Tooltip>
+        <TooltipTrigger asChild>{trigger}</TooltipTrigger>
+        <TooltipContent className="max-w-80 px-3 py-2 leading-5">
+          {displayDescription}
+        </TooltipContent>
+      </Tooltip>
+    </>
+  )
+}
+
+// Landing screen: pick a project or jump back into a recent session.
+const HomePage = ({
+  canDeleteProjects,
+  hasCompleteSessionCatalog,
+  catalogRecovery,
+  onOpenGlobalSearch
+}: HomePageProps): React.JSX.Element => {
+  const { t } = useTranslation()
+  const {
+    scrollRef,
+    contentRef,
+    projectsRef,
+    galleryRef,
+    showJump,
+    activeSection,
+    viewportHeight,
+    scrollToProjects,
+    scrollToGallery
+  } = useHomeGalleryNavigation()
+  const projects = useProjectStore((state) => state.projects)
+  const isProjectsLoaded = useProjectStore((state) => state.isLoaded)
+  const loadError = useProjectStore((state) => state.loadError)
+  const loadProjects = useProjectStore((state) => state.loadProjects)
+  const updateProject = useProjectStore((state) => state.updateProject)
+  const updateProjectArchive = useProjectStore((state) => state.updateProjectArchive)
+  const deleteProject = useProjectStore((state) => state.deleteProject)
+  const sessions = useSessionStore((state) => state.sessions)
+  const computeJobsById = useSessionJobStore((state) => state.nonTerminalJobsById)
+  const notificationItems = useNotificationInboxStore((state) => state.items)
+  const markSessionCompletionsRead = useNotificationInboxStore(
+    (state) => state.markSessionCompletionsRead
+  )
+  const enqueueProjectArchive = useArchiveUndoStore((state) => state.enqueueProject)
+  const openProject = useNavigationStore((state) => state.openProject)
+  const openSession = useNavigationStore((state) => state.openSession)
+  const openResourceCenter = useNavigationStore((state) => state.openResourceCenter)
+  const openLibrary = useNavigationStore((state) => state.openLibrary)
+  const pendingProjectCreation = useNavigationStore((state) => state.pendingProjectCreation)
+  const pendingWslSetupAfterProjectCreation = useNavigationStore(
+    (state) => state.pendingWslSetupAfterProjectCreation
+  )
+  const consumeProjectCreation = useNavigationStore((state) => state.consumeProjectCreation)
+  const consumeWslSetupProjectCreation = useNavigationStore(
+    (state) => state.consumeWslSetupProjectCreation
+  )
+  const openSettings = useSettingsStore((state) => state.openSettings)
+  const environmentCheck = useSettingsStore((state) => state.environmentCheck)
+  const openSettingsToPanel = useSettingsStore((state) => state.openSettingsToPanel)
+  const pendingInteractions = useSessionPendingInteractions()
+  const requiredEnvironmentFailures = getRequiredEnvironmentFailures(environmentCheck)
+  const environmentRepairPanel = getEnvironmentRepairPanel(requiredEnvironmentFailures)
+
+  const {
+    openCreateDialog,
+    openEditDialog,
+    dialogProps: projectFormDialogProps
+  } = useProjectFormDialog({
+    onCreateCancelled: consumeWslSetupProjectCreation,
+    onCreated: (project) => {
+      if (!pendingWslSetupAfterProjectCreation) {
+        openProject(project.id, 'user')
+        return
+      }
+      consumeWslSetupProjectCreation()
+      void startWslSetupConversation(project.id, t).catch(() => {
+        openProject(project.id, 'user')
+      })
+    }
+  })
+
+  const [projectToDelete, setProjectToDelete] = useState<Project | undefined>(undefined)
+  const [isDeletingProject, setIsDeletingProject] = useState(false)
+  const [deleteProjectError, setDeleteProjectError] = useState<string | undefined>(undefined)
+  const [archivingProjectIds, setArchivingProjectIds] = useState<Set<string>>(() => new Set())
+  const [pinningProjectIds, setPinningProjectIds] = useState<Set<string>>(() => new Set())
+  const [projectActionError, setProjectActionError] = useState<string | undefined>(undefined)
+  const [isRetryingProjects, setIsRetryingProjects] = useState(false)
+  const [artifactCounts, setArtifactCounts] = useState<Map<string, number>>(() => new Map())
+  const [markingReadSessionIds, setMarkingReadSessionIds] = useState<Set<string>>(() => new Set())
+  const [markReadErrorSessionIds, setMarkReadErrorSessionIds] = useState<Set<string>>(
+    () => new Set()
+  )
+  const effectiveCatalogRecovery: SessionCatalogRecovery =
+    catalogRecovery ??
+    (hasCompleteSessionCatalog ? { kind: 'ready' } : { kind: 'repairable', reason: 'session-scan' })
+
+  const activeProjects = useMemo(
+    () => projects.filter((project) => project.archivedAt === undefined),
+    [projects]
+  )
+  const activeProjectIds = useMemo(
+    () => new Set(activeProjects.map((project) => project.id)),
+    [activeProjects]
+  )
+
+  const isProjectArchiveBlockedByCatalogRecovery = (projectId: string): boolean => {
+    if (hasCompleteSessionCatalog) return false
+    if (effectiveCatalogRecovery.kind !== 'damaged-authority') return true
+    return effectiveCatalogRecovery.affectedFiles.some((file) => file.projectId === projectId)
+  }
+
+  // Non-pending sessions only; pending ones have no durable project yet.
+  const persistedSessions = useMemo(
+    () =>
+      sessions.filter(
+        (session) =>
+          !session.isPending &&
+          session.archivedAt === undefined &&
+          activeProjectIds.has(session.projectId)
+      ),
+    [activeProjectIds, sessions]
+  )
+
+  const unreadCompletedBySession = useMemo(() => {
+    const completedBySession = new Map<string, number>()
+
+    for (const item of notificationItems) {
+      if (item.kind !== 'task.completed' || item.readAt !== undefined || !item.sessionId) continue
+      completedBySession.set(
+        item.sessionId,
+        Math.max(completedBySession.get(item.sessionId) ?? 0, item.createdAt)
+      )
+    }
+
+    return completedBySession
+  }, [notificationItems])
+
+  const activeComputeStartedAtBySession = useMemo(() => {
+    const startedAtBySession = new Map<string, number>()
+
+    for (const job of computeJobsById.values()) {
+      if (isComputeJobTrackingStopped(job)) continue
+      if (job.status !== 'queued' && job.status !== 'submitted' && job.status !== 'running')
+        continue
+      const startedAt = job.started_at ?? job.created_at
+      startedAtBySession.set(
+        job.session_id,
+        Math.min(startedAtBySession.get(job.session_id) ?? startedAt, startedAt)
+      )
+    }
+
+    return startedAtBySession
+  }, [computeJobsById])
+
+  const sessionUpdates = useMemo<HomeSessionUpdate[]>(() => {
+    const updates = persistedSessions.flatMap<HomeSessionUpdate>((session) => {
+      const computeStartedAt = activeComputeStartedAtBySession.get(session.id)
+      const activity = getHomeSessionActivity(
+        session,
+        computeStartedAt !== undefined,
+        pendingInteractions.get(session.id)
+      )
+
+      if (activity) {
+        return [
+          {
+            session,
+            activity,
+            activityTimestamp: isSessionWaitReason(activity)
+              ? session.updatedAt
+              : getRunningActivityTimestamp(session, computeStartedAt)
+          }
+        ]
+      }
+
+      const completed = unreadCompletedBySession.get(session.id)
+      return session.status === 'idle' && completed !== undefined
+        ? [
+            {
+              session,
+              activity: 'completed',
+              activityTimestamp: completed
+            }
+          ]
+        : []
+    })
+
+    return updates.sort(
+      (left, right) =>
+        (isSessionWaitReason(left.activity) ? 0 : left.activity === 'running' ? 1 : 2) -
+          (isSessionWaitReason(right.activity) ? 0 : right.activity === 'running' ? 1 : 2) ||
+        right.activityTimestamp - left.activityTimestamp
+    )
+  }, [
+    activeComputeStartedAtBySession,
+    pendingInteractions,
+    persistedSessions,
+    unreadCompletedBySession
+  ])
+
+  const activeSessionCounts = useMemo(
+    () => ({
+      running: sessionUpdates.filter(({ activity }) => activity === 'running').length,
+      waiting: sessionUpdates.filter(({ activity }) => isSessionWaitReason(activity)).length
+    }),
+    [sessionUpdates]
+  )
+  const projectNames = useMemo(
+    () => new Map(activeProjects.map((project) => [project.id, project.name])),
+    [activeProjects]
+  )
+
+  // Per-project session and activity counts, ordered by most recent activity.
+  const projectSummaries = useMemo<ProjectSummary[]>(() => {
+    const summaries = activeProjects.map((project) => {
+      const projectSessions = persistedSessions.filter(
+        (session) => session.projectId === project.id
+      )
+      const lastActivityAt = projectSessions.reduce(
+        (latest, session) => Math.max(latest, session.updatedAt),
+        project.updatedAt
+      )
+
+      return {
+        project,
+        sessionCount: projectSessions.length,
+        runningCount: projectSessions.filter(
+          (session) =>
+            getHomeSessionActivity(
+              session,
+              activeComputeStartedAtBySession.has(session.id),
+              pendingInteractions.get(session.id)
+            ) === 'running'
+        ).length,
+        waitingCount: projectSessions.filter((session) => {
+          const activity = getHomeSessionActivity(
+            session,
+            activeComputeStartedAtBySession.has(session.id),
+            pendingInteractions.get(session.id)
+          )
+          return activity !== undefined && isSessionWaitReason(activity)
+        }).length,
+        lastActivityAt
+      }
+    })
+
+    return summaries.sort(
+      (left, right) =>
+        Number(Boolean(right.project.pinned)) - Number(Boolean(left.project.pinned)) ||
+        right.lastActivityAt - left.lastActivityAt
+    )
+  }, [activeComputeStartedAtBySession, activeProjects, pendingInteractions, persistedSessions])
+
+  const recentSessions = useRecentSessions(
+    persistedSessions,
+    isProjectsLoaded && !loadError && hasCompleteSessionCatalog
+  )
+
+  const bothListsEmpty =
+    isProjectsLoaded && !loadError && projectSummaries.length === 0 && recentSessions.length === 0
+
+  const showArtifactCounts = hasCompleteSessionCatalog && recentSessions.length === 0
+
+  useEffect(() => {
+    let cancelled = false
+    const activeProjectIds = new Set(activeProjects.map((project) => project.id))
+    const requestVersions = new Map<string, number>()
+
+    if (!showArtifactCounts) return
+
+    const refreshArtifactCount = async (projectId: string): Promise<void> => {
+      const requestVersion = (requestVersions.get(projectId) ?? 0) + 1
+      requestVersions.set(projectId, requestVersion)
+
+      let artifactCount: number | undefined
+      try {
+        const overview = await window.api.projectFiles.getOverview({ projectId })
+        if (overview.isIndexComplete) artifactCount = overview.artifactCount
+      } catch {
+        // An unavailable or incomplete index is not authoritative, so omit its count.
+      }
+
+      if (cancelled || requestVersions.get(projectId) !== requestVersion) return
+      setArtifactCounts((current) => {
+        const next = new Map(current)
+        if (artifactCount === undefined) next.delete(projectId)
+        else next.set(projectId, artifactCount)
+        return next
+      })
+    }
+
+    for (const project of activeProjects) void refreshArtifactCount(project.id)
+
+    const removeChangedListener = window.api.projectFiles.onChanged((event) => {
+      if (activeProjectIds.has(event.projectId)) void refreshArtifactCount(event.projectId)
+    })
+
+    return () => {
+      cancelled = true
+      removeChangedListener()
+    }
+  }, [activeProjects, showArtifactCounts])
+
+  const deleteTargetSessionCount = useMemo(
+    () =>
+      projectToDelete
+        ? persistedSessions.filter((session) => session.projectId === projectToDelete.id).length
+        : 0,
+    [persistedSessions, projectToDelete]
+  )
+
+  useEffect(() => {
+    if (!pendingProjectCreation) return
+    queueMicrotask(() => {
+      openCreateDialog()
+      consumeProjectCreation()
+    })
+  }, [consumeProjectCreation, openCreateDialog, pendingProjectCreation])
+
+  const retryProjectLoad = (): void => {
+    if (isRetryingProjects) return
+
+    setIsRetryingProjects(true)
+    void loadProjects().finally(() => setIsRetryingProjects(false))
+  }
+
+  const openDeleteDialog = (project: Project): void => {
+    if (!canDeleteProjects) return
+
+    setDeleteProjectError(undefined)
+    setProjectToDelete(project)
+  }
+
+  const closeDeleteDialog = (): void => {
+    if (isDeletingProject) return
+
+    setProjectToDelete(undefined)
+    setDeleteProjectError(undefined)
+  }
+
+  const canArchiveProject = (project: Project): boolean =>
+    !isProjectArchiveBlockedByCatalogRecovery(project.id) &&
+    canDeleteProjects &&
+    project.archivedAt === undefined &&
+    !sessions.some(
+      (session) =>
+        session.projectId === project.id &&
+        getHomeSessionActivity(
+          session,
+          activeComputeStartedAtBySession.has(session.id),
+          pendingInteractions.get(session.id)
+        ) !== undefined
+    )
+
+  const archiveUnavailableReason = (project: Project): string | undefined => {
+    if (!canDeleteProjects) return t('Retry project recovery before archiving.')
+    if (isProjectArchiveBlockedByCatalogRecovery(project.id)) {
+      if (effectiveCatalogRecovery.kind === 'damaged-authority') {
+        return t(
+          'Project archive is unavailable because a damaged conversation cannot be verified.'
+        )
+      }
+      if (effectiveCatalogRecovery.kind === 'unsupported-version') {
+        return t('Update Open-Science before archiving this project.')
+      }
+      return t('Repair the project index before archiving.')
+    }
+    if (!canArchiveProject(project)) {
+      return t('Finish or stop active sessions before archiving this project.')
+    }
+    return undefined
+  }
+
+  const archiveProject = (project: Project): void => {
+    if (!canArchiveProject(project) || archivingProjectIds.has(project.id)) return
+
+    setArchivingProjectIds((current) => new Set(current).add(project.id))
+    setProjectActionError(undefined)
+    void updateProjectArchive({
+      id: project.id,
+      archived: true,
+      expectedArchiveRevision: project.archiveRevision ?? 0
+    })
+      .then((archived) => enqueueProjectArchive(archived))
+      .catch((error: unknown) =>
+        setProjectActionError(
+          error instanceof Error && error.message.includes(INCOMPLETE_PROJECT_SESSION_CATALOG_ERROR)
+            ? t('Repair the project index before archiving.')
+            : error instanceof Error
+              ? error.message
+              : t('Could not archive project.')
+        )
+      )
+      .finally(() => {
+        setArchivingProjectIds((current) => {
+          const next = new Set(current)
+          next.delete(project.id)
+          return next
+        })
+      })
+  }
+
+  const dismissCompletedSession = async (sessionId: string): Promise<void> => {
+    if (markingReadSessionIds.has(sessionId)) return
+
+    setMarkingReadSessionIds((current) => new Set(current).add(sessionId))
+    setMarkReadErrorSessionIds((current) => {
+      const next = new Set(current)
+      next.delete(sessionId)
+      return next
+    })
+    try {
+      await markSessionCompletionsRead([sessionId])
+    } catch {
+      setMarkReadErrorSessionIds((current) => new Set(current).add(sessionId))
+    } finally {
+      setMarkingReadSessionIds((current) => {
+        const next = new Set(current)
+        next.delete(sessionId)
+        return next
+      })
+    }
+  }
+
+  const toggleProjectPin = (project: Project): void => {
+    if (pinningProjectIds.has(project.id)) return
+
+    setPinningProjectIds((current) => new Set(current).add(project.id))
+    setProjectActionError(undefined)
+    void updateProject({
+      id: project.id,
+      pinned: !project.pinned,
+      expectedUpdatedAt: project.updatedAt
+    })
+      .catch((error: unknown) =>
+        setProjectActionError(
+          error instanceof Error ? error.message : t('Could not update project pin.')
+        )
+      )
+      .finally(() => {
+        setPinningProjectIds((current) => {
+          const next = new Set(current)
+          next.delete(project.id)
+          return next
+        })
+      })
+  }
+
+  // Main coordinates durable project/session/index cleanup; renderer state changes only after it succeeds.
+  const confirmDeleteProject = (): void => {
+    if (!canDeleteProjects || !projectToDelete || isDeletingProject) return
+
+    const projectId = projectToDelete.id
+
+    // Deletion is an explicit user takeover even though it does not immediately navigate. Advance
+    // the navigation revision before the async mutation so deferred startup intents cannot reopen a
+    // conversation after the post-delete view has settled.
+    useNavigationStore.getState().recordUserNavigation()
+    setIsDeletingProject(true)
+    setDeleteProjectError(undefined)
+
+    void deleteProject(projectId)
+      .then(() => {
+        useSessionStore.getState().removeSessionsForProject(projectId)
+        setProjectToDelete(undefined)
+      })
+      .catch((error: unknown) => {
+        // Durable deletion failed; keep the target and in-memory sessions visible so the user can
+        // inspect the failure and retry or cancel explicitly.
+        console.warn('Project deletion failed', error)
+        setDeleteProjectError(t('Could not delete the project. Please try again.'))
+      })
+      .finally(() => {
+        setIsDeletingProject(false)
+      })
+  }
+
+  // The bucket comes from a pure helper; the wording is per-locale ("3d" vs "3 天前").
+  const relativeTime = (timestamp: number): string => {
+    const { unit, count } = relativeTimeParts(timestamp)
+    return unit === 'now' ? t('now') : t(COMPACT_ELAPSED[unit], { count, context: 'ago' })
+  }
+
+  return (
+    <TooltipProvider>
+      <ProjectPackageDropZone canImport className="relative h-svh">
+        <main className="flex h-svh flex-col overflow-hidden bg-bg-10 text-text-000">
+          {/* Keep only the title and toolbar fixed; status cards scroll with projects and cases. */}
+          <div className="max-h-[50%] shrink-0 overflow-y-auto">
+            <div className="mx-auto w-full max-w-[1080px] px-4 sm:px-8">
+              <header className="sticky top-0 z-20 flex flex-col gap-3 bg-bg-10 py-5 sm:flex-row sm:items-start sm:justify-between sm:py-7">
+                <div className="min-w-0">
+                  <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
+                    <a
+                      href={APP.links.website}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="font-serif text-[26px] font-medium leading-none tracking-[-0.02em] text-text-000 hover:text-text-100"
+                    >
+                      Open-Science
+                    </a>
+                    {hasCompleteSessionCatalog &&
+                    (activeSessionCounts.waiting > 0 || activeSessionCounts.running > 0) ? (
+                      <div className="flex items-center gap-1.5 text-xs font-medium">
+                        {activeSessionCounts.waiting > 0 ? (
+                          <span className="text-session-waiting">
+                            {t('{{count}} waiting on you', { count: activeSessionCounts.waiting })}
+                          </span>
+                        ) : null}
+                        {activeSessionCounts.waiting > 0 && activeSessionCounts.running > 0 ? (
+                          <span className="text-text-300" aria-hidden="true">
+                            ·
+                          </span>
+                        ) : null}
+                        {activeSessionCounts.running > 0 ? (
+                          <span className="text-session-running">
+                            {t('{{count}} running', { count: activeSessionCounts.running })}
+                          </span>
+                        ) : null}
+                      </div>
+                    ) : null}
+                  </div>
+                </div>
+                <div className="flex flex-wrap items-center justify-end gap-1">
+                  {requiredEnvironmentFailures.length > 0 && environmentRepairPanel ? (
+                    <button
+                      type="button"
+                      onClick={() => openSettingsToPanel(environmentRepairPanel)}
+                      className="inline-flex h-8 cursor-pointer items-center gap-1.5 rounded-md border border-danger-000/35 bg-danger-900 px-2.5 text-xs font-medium text-danger-000 hover:border-danger-000/55 hover:bg-danger-900/80"
+                      aria-label={t('Open environment repair')}
+                    >
+                      <CircleAlert className="size-3.5" strokeWidth={2} aria-hidden="true" />
+                      <span className="hidden sm:inline">
+                        {requiredEnvironmentFailures.length === 1
+                          ? t('{{label}} needs attention', {
+                              label: requiredEnvironmentFailures[0].label
+                            })
+                          : t('{{count}} environment items need attention', {
+                              count: requiredEnvironmentFailures.length
+                            })}
+                      </span>
+                      <span className="sm:hidden">{t('Environment')}</span>
+                    </button>
+                  ) : null}
+                  <NetworkStatusIndicator variant="pill" withTooltipProvider={false} />
+                  <PackageExportProgressButton iconOnly />
+                  <PackageOperationIndicator iconOnly />
+                  <span className="hidden sm:inline-flex">
+                    <GitHubStarBadge variant="home" withTooltipProvider={false} />
+                  </span>
+                  <Tooltip>
+                    <TooltipTrigger
+                      asChild
+                      onFocus={(event) => {
+                        if (!event.currentTarget.matches(':focus-visible')) event.preventDefault()
+                      }}
+                    >
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        className="size-9 rounded-lg text-text-300"
+                        onClick={onOpenGlobalSearch}
+                        aria-label={t('Search')}
+                      >
+                        <Search className="size-4" strokeWidth={2} aria-hidden="true" />
+                      </Button>
+                    </TooltipTrigger>
+                    <TooltipContent side="bottom">{t('Search (Cmd/Ctrl+K)')}</TooltipContent>
+                  </Tooltip>
+                  <Tooltip>
+                    <TooltipTrigger
+                      asChild
+                      onFocus={(event) => {
+                        if (!event.currentTarget.matches(':focus-visible')) event.preventDefault()
+                      }}
+                    >
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        className="size-9 rounded-lg text-text-300"
+                        onClick={() => openLibrary('user')}
+                        aria-label={t('Library')}
+                      >
+                        <BookOpenText className="size-4" strokeWidth={2} aria-hidden="true" />
+                      </Button>
+                    </TooltipTrigger>
+                    <TooltipContent side="bottom">{t('Library')}</TooltipContent>
+                  </Tooltip>
+                  <Tooltip>
+                    <TooltipTrigger
+                      asChild
+                      onFocus={(event) => {
+                        if (!event.currentTarget.matches(':focus-visible')) event.preventDefault()
+                      }}
+                    >
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        className="size-9 rounded-lg text-text-300"
+                        onClick={() => openResourceCenter('user')}
+                        aria-label={t('Resource center')}
+                      >
+                        <Store className="size-4" strokeWidth={2} aria-hidden="true" />
+                      </Button>
+                    </TooltipTrigger>
+                    <TooltipContent side="bottom">{t('Resource center')}</TooltipContent>
+                  </Tooltip>
+                  <NotificationBell withTooltipProvider={false} />
+                  <Tooltip>
+                    <TooltipTrigger
+                      asChild
+                      onFocus={(event) => {
+                        if (!event.currentTarget.matches(':focus-visible')) event.preventDefault()
+                      }}
+                    >
+                      <button
+                        type="button"
+                        aria-label={t('Settings')}
+                        onClick={openSettings}
+                        className="inline-flex size-9 items-center justify-center rounded-lg text-text-300 hover:bg-bg-300 hover:text-text-000"
+                      >
+                        <Settings className="size-4" strokeWidth={2} aria-hidden="true" />
+                      </button>
+                    </TooltipTrigger>
+                    <TooltipContent side="bottom">{t('Settings')}</TooltipContent>
+                  </Tooltip>
+                  <UpdateCapsule withTooltipProvider={false} />
+                  {/* Account button hidden for now; restore when the account flow lands. */}
+                  <Tooltip>
+                    <TooltipTrigger
+                      asChild
+                      onFocus={(event) => {
+                        if (!event.currentTarget.matches(':focus-visible')) event.preventDefault()
+                      }}
+                    >
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="h-8 gap-1 rounded-md px-3 text-xs"
+                        onClick={openCreateDialog}
+                        aria-label={t('New project')}
+                      >
+                        <Plus className="size-3.5" strokeWidth={2} aria-hidden="true" />
+                        <span className="hidden sm:inline">{t('New project')}</span>
+                      </Button>
+                    </TooltipTrigger>
+                    <TooltipContent side="bottom">{t('New project')}</TooltipContent>
+                  </Tooltip>
+                </div>
+              </header>
+            </div>
+          </div>
+
+          {/* Keep the scrollbar at the window edge and reserve a rail inside the centered content. */}
+          <div ref={scrollRef} data-home-scroll className="min-h-0 flex-1 overflow-y-auto">
+            <div
+              ref={contentRef}
+              className="mx-auto flex min-h-full w-full max-w-[1080px] gap-1 px-4 sm:px-8"
+            >
+              <div className="flex min-w-0 flex-1 flex-col px-1 pb-12 pt-4 sm:pb-16 sm:pt-3">
+                {sessionUpdates.length > 0 ? (
+                  <section className="pb-4" aria-label={t('Session updates')}>
+                    <div className="grid grid-cols-1 gap-3 py-1 md:grid-cols-2">
+                      {sessionUpdates.map(({ session, activity, activityTimestamp }) => {
+                        const waitReason = isSessionWaitReason(activity) ? activity : undefined
+                        const waiting = waitReason !== undefined
+                        const completed = activity === 'completed'
+                        // A finished session reads "just now" rather than the bare bucket, so the two cases
+                        // stay separate keys instead of being assembled from a translated fragment.
+                        const isJustNow = relativeTimeParts(activityTimestamp).unit === 'now'
+                        const relativeActivityTime = relativeTime(activityTimestamp)
+                        const markingRead = markingReadSessionIds.has(session.id)
+                        const markReadFailed = markReadErrorSessionIds.has(session.id)
+
+                        return (
+                          <div
+                            key={session.id}
+                            className="home-session-card group relative min-w-0"
+                          >
+                            {withSessionDescriptionTooltip(
+                              session.description,
+                              <button
+                                type="button"
+                                // Preserve the usual card height while allowing wrapped status copy
+                                // and time to fit on narrow screens and in longer translations.
+                                className="flex min-h-[156px] h-full w-full min-w-0 cursor-pointer flex-col rounded-2xl bg-bg-000 pb-3 px-[18px] pt-4 text-left shadow-card hover:bg-bg-200 focus-visible:ring-[3px] focus-visible:ring-ring/50 active:bg-bg-300 motion-reduce:transition-none"
+                                onClick={() => openSession(session.projectId, session.id, 'user')}
+                                aria-label={
+                                  waitReason
+                                    ? t(homeSessionWaitAriaLabelKeys[waitReason], {
+                                        title: session.title
+                                      })
+                                    : completed
+                                      ? t('Open session {{title}}, completed', {
+                                          title: session.title
+                                        })
+                                      : t('Open session {{title}}, running', {
+                                          title: session.title
+                                        })
+                                }
+                              >
+                                {/* Status leads the card — the Home grid answers "what needs me" at a glance. */}
+                                <span className="flex w-full flex-wrap items-center justify-between gap-x-3 gap-y-1">
+                                  <span
+                                    className={cn(
+                                      'inline-flex min-w-0 max-w-full items-center gap-1.5 rounded-md px-2 py-1 text-xs font-medium',
+                                      waiting
+                                        ? 'bg-session-waiting/10 text-session-waiting'
+                                        : completed
+                                          ? 'bg-success-000/10 text-success-000'
+                                          : 'bg-session-running/10 text-session-running'
+                                    )}
+                                  >
+                                    {completed ? (
+                                      <Check
+                                        className="size-3"
+                                        strokeWidth={2}
+                                        aria-hidden="true"
+                                      />
+                                    ) : waiting ? (
+                                      <span
+                                        className="size-1.5 rounded-full bg-session-waiting motion-safe:animate-pulse"
+                                        aria-hidden="true"
+                                      />
+                                    ) : (
+                                      <LoaderCircle
+                                        className="size-3.5 animate-spin motion-reduce:animate-none"
+                                        strokeWidth={2}
+                                        aria-hidden="true"
+                                      />
+                                    )}
+                                    {t(
+                                      waitReason
+                                        ? sessionWaitReasonLabelKeys[waitReason]
+                                        : completed
+                                          ? 'Completed'
+                                          : 'Running'
+                                    )}
+                                  </span>
+                                  {/* Flush right on every card — a reserved dismiss gap leaves the time
+                              floating left of where a long truncated title ends. */}
+                                  <span className="ml-auto max-w-full text-xs text-text-100">
+                                    {completed
+                                      ? isJustNow
+                                        ? t('just now')
+                                        : relativeActivityTime
+                                      : waiting
+                                        ? t('waiting {{time}}', { time: relativeActivityTime })
+                                        : t('running {{time}}', { time: relativeActivityTime })}
+                                  </span>
+                                </span>
+                                <span
+                                  className={cn(
+                                    'mt-2.5 min-w-0 max-w-full truncate text-base font-semibold text-text-000',
+                                    !waiting && !completed && 'home-session-title-running'
+                                  )}
+                                >
+                                  {session.title}
+                                </span>
+                                {session.description?.trim() ? (
+                                  <span
+                                    data-testid="session-description-preview"
+                                    className="mt-1.5 line-clamp-2 break-words text-xs leading-[1.4] text-text-300"
+                                  >
+                                    {session.description.trim()}
+                                  </span>
+                                ) : null}
+                                <span className="mt-auto w-full truncate pt-3 text-xs text-text-100">
+                                  {projectNames.get(session.projectId) ?? t('Unknown project')}
+                                </span>
+                              </button>
+                            )}
+                            {completed ? (
+                              <button
+                                type="button"
+                                className={cn(
+                                  "home-session-dismiss absolute top-3 right-3 inline-flex size-9 cursor-pointer items-center justify-center rounded-lg text-text-300 transition-opacity duration-150 ease-out before:absolute before:-inset-1 before:content-[''] hover:bg-bg-300 hover:text-text-000 focus-visible:ring-[3px] focus-visible:ring-ring/50 active:bg-bg-400 disabled:cursor-wait disabled:opacity-60 motion-reduce:transition-none",
+                                  markReadFailed && 'text-danger-000'
+                                )}
+                                onClick={() => void dismissCompletedSession(session.id)}
+                                disabled={markingRead}
+                                aria-busy={markingRead}
+                                aria-label={
+                                  markReadFailed
+                                    ? t('Retry marking completed session {{title}} as read', {
+                                        title: session.title
+                                      })
+                                    : t('Mark completed session {{title}} as read', {
+                                        title: session.title
+                                      })
+                                }
+                                title={
+                                  markReadFailed
+                                    ? t('Could not mark as read. Try again.')
+                                    : undefined
+                                }
+                              >
+                                {markingRead ? (
+                                  <LoaderCircle
+                                    className="size-4 animate-spin motion-reduce:animate-none"
+                                    strokeWidth={2}
+                                    aria-hidden="true"
+                                  />
+                                ) : (
+                                  <X className="size-4" strokeWidth={2} aria-hidden="true" />
+                                )}
+                                {markReadFailed ? (
+                                  <span className="sr-only" role="alert">
+                                    {t('Could not mark this completed session as read. Try again.')}
+                                  </span>
+                                ) : null}
+                              </button>
+                            ) : null}
+                          </div>
+                        )
+                      })}
+                    </div>
+                  </section>
+                ) : null}
+                <div
+                  ref={projectsRef}
+                  className="grid grid-cols-1 gap-x-6 gap-y-7 sm:gap-y-8 lg:grid-cols-2"
+                >
+                  <section
+                    className={cn('min-w-0', bothListsEmpty && 'lg:flex lg:flex-col')}
+                    aria-label={t('Projects')}
+                  >
+                    <h2 className={sectionHeadingClassName}>
+                      <GalleryVerticalEnd
+                        className="size-4 text-text-100"
+                        strokeWidth={2}
+                        aria-hidden="true"
+                      />
+                      {t('Projects')}
+                    </h2>
+                    {projectActionError ? (
+                      <div
+                        className="mb-3 rounded-2xl border border-danger-000/30 px-4 py-3 text-sm text-danger-000"
+                        role="alert"
+                      >
+                        {projectActionError}
+                      </div>
+                    ) : null}
+                    <ProjectDeletionCleanupNotice className="mb-3 rounded-2xl px-4 py-3" />
+                    {loadError ? (
+                      <ErrorNotice
+                        role="alert"
+                        description={t('Open-Science could not load projects. Retry to continue.')}
+                        primaryButton={{
+                          label: isRetryingProjects ? t('Retrying...') : t('Retry'),
+                          loading: isRetryingProjects,
+                          onClick: retryProjectLoad
+                        }}
+                      />
+                    ) : !isProjectsLoaded && projectSummaries.length === 0 ? (
+                      <div
+                        role="status"
+                        className="px-4 py-10 text-center text-sm text-muted-foreground"
+                      >
+                        {t('Loading…')}
+                      </div>
+                    ) : projectSummaries.length === 0 ? (
+                      <div className={cn(emptyStateClassName, bothListsEmpty && 'lg:flex-1')}>
+                        <h3 className="text-[15px] font-medium leading-5 text-foreground">
+                          {t('Create a project, start a conversation')}
+                        </h3>
+                        <p className="mt-2 text-[13px] leading-5 text-muted-foreground">
+                          {t('Keep your files and conversations together in a project.')}
+                        </p>
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          className="mt-5 h-auto min-h-8 max-w-full gap-1.5 rounded-md px-3 py-1.5 text-xs whitespace-normal"
+                          onClick={openCreateDialog}
+                        >
+                          <Plus className="size-3.5" strokeWidth={2} aria-hidden="true" />
+                          {t('New project')}
+                        </Button>
+                      </div>
+                    ) : (
+                      <div className={listCardClassName}>
+                        {projectSummaries.map(
+                          ({
+                            project,
+                            sessionCount,
+                            runningCount,
+                            waitingCount,
+                            lastActivityAt
+                          }) => (
+                            <div
+                              key={project.id}
+                              className={cn(rowClassName, 'relative')}
+                              title={project.description || project.name}
+                            >
+                              <button
+                                type="button"
+                                className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 text-left after:absolute after:inset-0 after:rounded-[inherit]"
+                                onClick={() => openProject(project.id, 'user')}
+                              >
+                                <span className="min-w-0 truncate font-semibold text-text-000">
+                                  {project.name}
+                                </span>
+                                {project.pinned ? (
+                                  <>
+                                    <Star
+                                      className="size-4 shrink-0 fill-current text-session-waiting"
+                                      strokeWidth={2}
+                                      aria-hidden="true"
+                                    />
+                                    <span className="sr-only">{t('Pinned project')}</span>
+                                  </>
+                                ) : null}
+                                {project.isExample ? (
+                                  <span className="shrink-0 rounded bg-bg-300 px-1.5 py-0.5 text-[10px] font-medium text-text-100">
+                                    {t('Example')}
+                                  </span>
+                                ) : null}
+                                {hasCompleteSessionCatalog && waitingCount > 0 ? (
+                                  <span
+                                    className="inline-flex shrink-0 items-center gap-1 text-xs font-medium text-session-waiting"
+                                    aria-label={t('{{count}} waiting on you', {
+                                      count: waitingCount
+                                    })}
+                                  >
+                                    <span
+                                      className="size-1.5 rounded-full bg-session-waiting motion-safe:animate-pulse"
+                                      aria-hidden="true"
+                                    />
+                                    <span aria-hidden="true">{waitingCount}</span>
+                                  </span>
+                                ) : null}
+                                {hasCompleteSessionCatalog && runningCount > 0 ? (
+                                  <span
+                                    className="inline-flex shrink-0 items-center gap-1 text-xs font-medium text-session-running"
+                                    aria-label={t('{{count}} running', { count: runningCount })}
+                                  >
+                                    <LoaderCircle
+                                      className="size-3 animate-spin motion-reduce:animate-none"
+                                      strokeWidth={2}
+                                      aria-hidden="true"
+                                    />
+                                    <span aria-hidden="true">{runningCount}</span>
+                                  </span>
+                                ) : null}
+                              </button>
+                              <span className="hidden shrink-0 text-xs text-text-100 sm:inline">
+                                {hasCompleteSessionCatalog
+                                  ? t('{{count}} sessions', {
+                                      defaultValue_one: '{{count}} session',
+                                      count: sessionCount
+                                    })
+                                  : t('Session count unavailable')}
+                              </span>
+                              {showArtifactCounts && artifactCounts.has(project.id) ? (
+                                <span className="hidden shrink-0 tabular-nums text-xs text-text-100 sm:inline">
+                                  {t('{{count}} artifacts', {
+                                    defaultValue_one: '{{count}} artifact',
+                                    count: artifactCounts.get(project.id)
+                                  })}
+                                </span>
+                              ) : null}
+                              <span className="hidden w-8 shrink-0 text-right text-xs text-text-000 sm:inline">
+                                {relativeTime(lastActivityAt)}
+                              </span>
+                              <DropdownMenu>
+                                <DropdownMenuTrigger asChild>
+                                  <button
+                                    type="button"
+                                    className={cn(rowActionClassName, 'relative z-10')}
+                                    aria-label={t('Open actions for {{name}}', {
+                                      name: project.name
+                                    })}
+                                  >
+                                    <MoreVertical
+                                      className="size-3.5"
+                                      strokeWidth={2}
+                                      aria-hidden="true"
+                                    />
+                                  </button>
+                                </DropdownMenuTrigger>
+                                <DropdownMenuContent
+                                  aria-label={t('Project actions')}
+                                  className="w-max min-w-0"
+                                  align="end"
+                                  sideOffset={6}
+                                >
+                                  <DropdownMenuItem
+                                    className="gap-2"
+                                    disabled={pinningProjectIds.has(project.id)}
+                                    onSelect={() => toggleProjectPin(project)}
+                                  >
+                                    <Star
+                                      className={cn('size-4', project.pinned && 'fill-current')}
+                                      strokeWidth={2}
+                                      aria-hidden="true"
+                                    />
+                                    {t(project.pinned ? 'Unpin project' : 'Pin project')}
+                                  </DropdownMenuItem>
+                                  <DropdownMenuItem
+                                    className="gap-2"
+                                    onSelect={() => openEditDialog(project)}
+                                  >
+                                    <Settings
+                                      className="size-4"
+                                      strokeWidth={2}
+                                      aria-hidden="true"
+                                    />
+                                    {t('Settings')}
+                                  </DropdownMenuItem>
+                                  <DropdownMenuItem
+                                    className="gap-2"
+                                    disabled={
+                                      !canArchiveProject(project) ||
+                                      archivingProjectIds.has(project.id)
+                                    }
+                                    aria-describedby={
+                                      archiveUnavailableReason(project)
+                                        ? `archive-reason-${project.id}`
+                                        : undefined
+                                    }
+                                    onSelect={() => archiveProject(project)}
+                                  >
+                                    <Archive
+                                      className="size-4"
+                                      strokeWidth={2}
+                                      aria-hidden="true"
+                                    />
+                                    {/* The verb. Bare 'Archive' is the noun (a .zip) in the file browser. */}
+                                    {archivingProjectIds.has(project.id)
+                                      ? t('Archiving…')
+                                      : t('Archive', { context: 'verb' })}
+                                  </DropdownMenuItem>
+                                  {archiveUnavailableReason(project) ? (
+                                    <p
+                                      id={`archive-reason-${project.id}`}
+                                      className="max-w-64 px-2 pb-2 text-xs text-muted-foreground"
+                                    >
+                                      {archiveUnavailableReason(project)}
+                                    </p>
+                                  ) : null}
+                                  <DropdownMenuSeparator />
+                                  <DropdownMenuItem
+                                    className="gap-2 text-danger-000 data-[highlighted]:bg-danger-900 data-[highlighted]:text-danger-000"
+                                    disabled={!canDeleteProjects}
+                                    aria-describedby={
+                                      !canDeleteProjects ? `delete-reason-${project.id}` : undefined
+                                    }
+                                    onSelect={() => openDeleteDialog(project)}
+                                  >
+                                    <Trash2 className="size-4" strokeWidth={2} aria-hidden="true" />
+                                    {t('Delete')}
+                                  </DropdownMenuItem>
+                                  {!canDeleteProjects ? (
+                                    <p
+                                      id={`delete-reason-${project.id}`}
+                                      className="max-w-64 px-2 pb-2 text-xs text-muted-foreground"
+                                    >
+                                      {t('Retry project recovery before deleting projects.')}
+                                    </p>
+                                  ) : null}
+                                </DropdownMenuContent>
+                              </DropdownMenu>
+                            </div>
+                          )
+                        )}
+                      </div>
+                    )}
+                  </section>
+
+                  <section
+                    className={cn('min-w-0', bothListsEmpty && 'lg:flex lg:flex-col')}
+                    aria-label={t('Recent sessions')}
+                  >
+                    <h2 className={sectionHeadingClassName}>
+                      <Clock className="size-4 text-text-100" strokeWidth={2} aria-hidden="true" />
+                      {t('Recent sessions')}
+                    </h2>
+                    {recentSessions.length === 0 ? (
+                      <div
+                        className={cn(
+                          emptyStateClassName,
+                          'text-[13px] leading-5 text-muted-foreground',
+                          bothListsEmpty && 'lg:flex-1'
+                        )}
+                      >
+                        {t('Sessions you start will appear here.')}
+                      </div>
+                    ) : (
+                      <div className={listCardClassName}>
+                        {recentSessions.map((session) => (
+                          <button
+                            key={session.id}
+                            type="button"
+                            className={cn(rowClassName, 'cursor-pointer items-start')}
+                            onClick={() => openSession(session.projectId, session.id, 'user')}
+                            title={session.title}
+                          >
+                            <span
+                              className="mt-1 inline-flex size-3 shrink-0 items-center justify-center"
+                              aria-hidden="true"
+                            >
+                              <span className="size-[7px] rounded-full border border-text-100" />
+                            </span>
+                            <span className="flex min-w-0 flex-1 flex-col gap-0.5">
+                              <span className="truncate text-sm font-medium text-text-000">
+                                {session.title}
+                              </span>
+                              <span className="truncate text-xs text-text-100">
+                                {projectNames.get(session.projectId) ?? t('Unknown project')}
+                              </span>
+                            </span>
+                            <span className="shrink-0 text-xs text-text-000">
+                              {relativeTime(session.updatedAt)}
+                            </span>
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </section>
+                </div>
+                <UseCaseCarousel sectionRef={galleryRef} />
+              </div>
+
+              <div className="relative w-11 shrink-0">
+                {showJump && (
+                  // A viewport-height sticky rail keeps the controls centered even at the list end.
+                  <div
+                    role="navigation"
+                    aria-label={t('Home section navigation')}
+                    data-home-navigation
+                    className="sticky top-0 z-20 flex flex-col justify-center"
+                    style={{ height: viewportHeight }}
+                  >
+                    {[
+                      {
+                        label: t('Projects'),
+                        onClick: scrollToProjects,
+                        active: activeSection === 'projects'
+                      },
+                      {
+                        label: t('Use Cases'),
+                        onClick: scrollToGallery,
+                        active: activeSection === 'examples'
+                      }
+                    ].map(({ label, onClick, active }, index) => (
+                      <Tooltip key={label}>
+                        <TooltipTrigger asChild>
+                          <button
+                            type="button"
+                            className="group relative flex h-6 w-11 cursor-pointer items-center justify-center rounded-full outline-none"
+                            aria-label={label}
+                            aria-current={active ? 'location' : undefined}
+                            onClick={onClick}
+                          >
+                            {/* Keep geometry fixed; reveal the capsule without resizing or shifting its edges. */}
+                            <span
+                              data-home-navigation-capsule
+                              aria-hidden="true"
+                              style={{ top: index === 0 ? 'calc(100% - 4.5px)' : '4.5px' }}
+                              className="pointer-events-none absolute right-5 h-[7px] w-6 -translate-y-1/2 rounded-full group-focus-visible:ring-2 group-focus-visible:ring-ring group-focus-visible:ring-offset-2 group-focus-visible:ring-offset-bg-10"
+                            >
+                              <span
+                                data-home-navigation-shape
+                                className={cn(
+                                  'absolute inset-0 rounded-full [clip-path:inset(1.5px_0_1.5px_20px_round_999px)] transition-[clip-path,background-color] duration-[240ms] ease-[cubic-bezier(0.4,0,0.2,1)] group-hover:[clip-path:inset(0_round_999px)] group-hover:bg-[color-mix(in_oklch,var(--text-300),white_5%)] group-focus-visible:[clip-path:inset(0_round_999px)] group-focus-visible:bg-[color-mix(in_oklch,var(--text-300),white_5%)] motion-reduce:transition-none',
+                                  active
+                                    ? 'bg-[color-mix(in_oklch,var(--text-300),white_20%)]'
+                                    : 'bg-[color-mix(in_oklch,var(--text-300),white_45%)]'
+                                )}
+                              />
+                            </span>
+                          </button>
+                        </TooltipTrigger>
+                        <TooltipContent side="left">{label}</TooltipContent>
+                      </Tooltip>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+
+          <ProjectFormDialog {...projectFormDialogProps} />
+
+          <DeleteProjectDialog
+            project={projectToDelete}
+            sessionCount={deleteTargetSessionCount}
+            hasCompleteSessionCatalog={hasCompleteSessionCatalog}
+            canDelete={canDeleteProjects}
+            isDeleting={isDeletingProject}
+            error={deleteProjectError}
+            onCancel={closeDeleteDialog}
+            onConfirmDelete={confirmDeleteProject}
+          />
+        </main>
+      </ProjectPackageDropZone>
+    </TooltipProvider>
+  )
+}
+
+export { HomePage }

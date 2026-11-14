@@ -1,0 +1,571 @@
+import { z } from 'zod'
+import { type ReasoningEffort } from '../../shared/model-preference-contract'
+import {
+  usesVendorMessagesApiKeyHeader,
+  type ModelReasoningEffort,
+  type ResolvedReasoningEffort
+} from '@aipoch/providers'
+import { resolveReasoningEffortValue } from '../../shared/reasoning-effort'
+
+import {
+  canUseClaudeProviderTransport,
+  CODEX_ISOLATED_PROVIDER_ID,
+  DEFAULT_REASONING_EFFORT,
+  isCodexSubscriptionProvider,
+  isXaiSubscriptionProvider,
+  preferredEndpoint,
+  providerValidationRoute,
+  shareProviderTransportFamily,
+  usesAppProviderTransport
+} from '../../shared/settings'
+import {
+  REQUEST_SKILL_IMPORT_TOOL_DESCRIPTION,
+  REQUEST_SKILL_IMPORT_TOOL_NAME,
+  SKILL_IMPORT_MCP_SERVER_NAME
+} from '../../shared/skill-import'
+import {
+  getAgentFramework,
+  type AgentFrameworkId,
+  type AgentModelCatalogEntry,
+  type AgentModelChangeTarget,
+  type AgentModelRoute
+} from '../agent-framework'
+import { CODEX_BRIDGE_MODEL, resolveResponsesBaseUrl } from '../agent-framework/codex'
+import { opencodeTransportProviderId } from '../agent-framework/opencode'
+import { piModelId, piSessionModel, type PiModelWire } from '../agent-framework/pi'
+import { REVIEWER_BRIDGE_NAMESPACED_TOOLS } from '../reviewer/bridge-tools'
+import { requestSkillImportToolSchema } from '../skills/mcp-server'
+import type { MessagesBridgeTarget } from './messages-bridge'
+import {
+  normalizeMessagesRootUrl,
+  resolveChatCompletionsUrl,
+  resolveChatCompletionsBaseUrl,
+  type ResponsesNamespacedTool
+} from '@aipoch/providers/protocol'
+import type { ClaudeRuntimeModelConfig } from './claude-config-provision'
+import { codexBridgeStaticMcpTools } from './codex-bridge-tools'
+import type { ProviderAccountsModule, ProviderRuntimeTarget } from './provider-accounts'
+
+import type { StoredSettings } from './types'
+type BackendRouteProviderPort = Pick<
+  ProviderAccountsModule,
+  'resolveRuntimeTarget' | 'resolveRuntimeModelCatalog'
+>
+type BackendRoutePlanInput = Readonly<{
+  settings: StoredSettings
+  frameworkId: AgentFrameworkId
+  target: ProviderRuntimeTarget
+  effortIntent: ReasoningEffort
+  resolvedEffort?: ResolvedReasoningEffort
+  conversationSkillImportEnabled: boolean
+  forceNativeResponsesCompatibility?: boolean
+}>
+type BackendModelChangePlanInput = Omit<
+  BackendRoutePlanInput,
+  'conversationSkillImportEnabled' | 'forceNativeResponsesCompatibility'
+>
+type PlannedProviderTarget = Readonly<{
+  id: string
+  target: ProviderRuntimeTarget
+  reasoningEffort?: ModelReasoningEffort
+  reasoningEfforts?: readonly ModelReasoningEffort[]
+}>
+export type PiPlannedTarget = PlannedProviderTarget &
+  Readonly<{
+    wire: PiModelWire
+    // Upstream URL for API-key providers. xAI subscription targets use the app OAuth bridge.
+    endpoint?: string
+    oauth?: 'xai'
+  }>
+type BackendTransportPlan =
+  | Readonly<{ kind: 'direct' }>
+  | Readonly<{ kind: 'pi'; targets: readonly PiPlannedTarget[]; initialTargetId: string }>
+  | Readonly<{
+      kind: 'codebuddy-provider-compatibility'
+      wire: 'messages' | 'responses'
+    }>
+  | Readonly<{
+      kind: 'claude-anthropic'
+      targets: readonly (MessagesBridgeTarget & {
+        runtimeTarget?: ProviderRuntimeTarget
+      })[]
+      initialTargetId: string
+    }>
+  | Readonly<{
+      kind:
+        | 'opencode-anthropic'
+        | 'opencode-openai'
+        | 'codex-chat'
+        | 'codex-responses-compatibility'
+        | 'codex-native-responses'
+      targets: readonly PlannedProviderTarget[]
+      initialTargetId?: string
+    }>
+type BackendRoutePlan = Readonly<{
+  modelRoute: AgentModelRoute
+  backendProviderId: string
+  sessionEffort?: ModelReasoningEffort
+  supportedReasoningEfforts?: readonly ModelReasoningEffort[]
+  providerModelCatalog: readonly AgentModelCatalogEntry[]
+  transport: BackendTransportPlan
+  claudeModelConfig?: ClaudeRuntimeModelConfig
+  codexBridgeTools?: readonly ResponsesNamespacedTool[]
+  reviewerBridgeTools?: readonly ResponsesNamespacedTool[]
+}>
+const modelRouteFor = (
+  frameworkId: AgentFrameworkId,
+  target: ProviderRuntimeTarget
+): AgentModelRoute => {
+  return providerValidationRoute(
+    {
+      ...target.provider,
+      apiEndpoints: target.apiEndpoints,
+      needsChatResponsesToChatCompletionsBridge: target.needsChatResponsesToChatCompletionsBridge,
+      needsNativeResponsesCompatibility: target.needsNativeResponsesCompatibility
+    },
+    frameworkId
+  ).route!
+}
+// Pi speaks every API-key protocol natively, so each target keeps its preferred wire. xAI
+// subscriptions use the shared OAuth bridge; other subscription logins stay with their own harness.
+const piWireFor = (
+  target: ProviderRuntimeTarget
+): Pick<PiPlannedTarget, 'wire' | 'endpoint' | 'oauth'> | undefined => {
+  if (isXaiSubscriptionProvider(target.provider.type)) {
+    return { wire: 'chat-completions', oauth: 'xai' }
+  }
+  if (target.provider.type !== 'custom' && target.provider.type !== 'official') return undefined
+  const wire = preferredEndpoint(target.apiEndpoints, ['responses', 'chat-completions', 'messages'])
+  const responses = resolveResponsesBaseUrl(target.provider)
+  const endpoint =
+    wire === 'responses'
+      ? responses && `${responses}/responses`
+      : wire === 'chat-completions'
+        ? resolveChatCompletionsUrl(target.provider)
+        : wire === 'messages'
+          ? normalizeMessagesRootUrl(target.provider.baseUrl ?? '')
+          : undefined
+  return wire && endpoint ? { wire, endpoint } : undefined
+}
+const modelEffort = (
+  intent: ReasoningEffort,
+  target: ProviderRuntimeTarget
+): ResolvedReasoningEffort =>
+  intent === DEFAULT_REASONING_EFFORT
+    ? DEFAULT_REASONING_EFFORT
+    : resolveReasoningEffortValue(intent, target.reasoningEffortProfile)
+const claudeTargetId = (providerId: string, model: string): string =>
+  JSON.stringify([providerId, model])
+const transportTargetId = (
+  frameworkId: AgentFrameworkId,
+  providerId: string,
+  model: string
+): string => JSON.stringify([frameworkId, providerId, model])
+const namespaceFor = (serverName: string): string =>
+  `mcp__${serverName.replace(/[^a-zA-Z0-9_]/g, '_')}`
+const STATIC_APP_MCP_TOOLS = codexBridgeStaticMcpTools()
+const SKILL_IMPORT_TOOLS: ResponsesNamespacedTool[] = [
+  {
+    namespace: namespaceFor(SKILL_IMPORT_MCP_SERVER_NAME),
+    name: REQUEST_SKILL_IMPORT_TOOL_NAME,
+    description: REQUEST_SKILL_IMPORT_TOOL_DESCRIPTION,
+    parameters: z.toJSONSchema(z.object(requestSkillImportToolSchema), {
+      target: 'draft-7'
+    }) as ResponsesNamespacedTool['parameters']
+  }
+]
+class BackendRoutePlanner {
+  private readonly providers: BackendRouteProviderPort
+  constructor({ providers }: { providers: BackendRouteProviderPort }) {
+    this.providers = providers
+  }
+  planBackend(input: BackendRoutePlanInput): BackendRoutePlan {
+    if (input.frameworkId === 'pi' && !piWireFor(input.target)) {
+      throw new Error('Pi cannot use this provider. Subscription logins stay with their own agent.')
+    }
+    const configuredRoute = modelRouteFor(input.frameworkId, input.target)
+    const forcedCompatibility =
+      input.forceNativeResponsesCompatibility === true &&
+      input.frameworkId === 'codex' &&
+      configuredRoute === 'codex-responses'
+    if (forcedCompatibility && isCodexSubscriptionProvider(input.target.provider.type)) {
+      throw new Error(
+        'Artifact code reconstruction is unavailable with Codex subscription authentication.'
+      )
+    }
+    const modelRoute = forcedCompatibility ? 'codex-responses-compatibility' : configuredRoute
+    const resolvedEffort = input.resolvedEffort ?? modelEffort(input.effortIntent, input.target)
+    const sessionEffort = resolvedEffort === 'default' ? undefined : resolvedEffort
+    const supportedReasoningEfforts = input.target.reasoningEffortProfile.supported
+      ? [...new Set(input.target.reasoningEffortProfile.slots)]
+      : undefined
+    const routeCandidates = this.routeCandidates(
+      input.settings,
+      input.target,
+      input.frameworkId,
+      modelRoute
+    )
+    const retargetable = new Set(routeCandidates.map(({ providerId }) => providerId)).size >= 2
+    const activeProvider = input.settings.providers.find(({ id }) => id === input.target.providerId)
+    const catalogSource =
+      input.frameworkId === 'codex' && retargetable
+        ? routeCandidates
+        : input.frameworkId === 'claude-code'
+          ? []
+          : activeProvider
+            ? this.providers.resolveRuntimeModelCatalog(
+                activeProvider,
+                getAgentFramework(input.frameworkId)
+              )
+            : []
+    const providerModelCatalog = this.modelCatalog(
+      catalogSource,
+      input.frameworkId,
+      modelRoute,
+      input.effortIntent
+    )
+    const backendProviderId =
+      input.frameworkId === 'codex' && isCodexSubscriptionProvider(input.target.provider.type)
+        ? CODEX_ISOLATED_PROVIDER_ID
+        : input.target.providerId
+    const transport = this.transportPlan(
+      input.target,
+      input.frameworkId,
+      modelRoute,
+      routeCandidates,
+      retargetable,
+      input.effortIntent
+    )
+    const claudeModelConfig =
+      input.frameworkId === 'claude-code' && input.target.provider.type === 'custom'
+        ? this.claudeModelConfig(routeCandidates)
+        : undefined
+    return Object.freeze({
+      modelRoute,
+      backendProviderId,
+      ...(sessionEffort ? { sessionEffort } : {}),
+      ...(supportedReasoningEfforts ? { supportedReasoningEfforts } : {}),
+      providerModelCatalog: Object.freeze(providerModelCatalog),
+      transport,
+      ...(claudeModelConfig ? { claudeModelConfig } : {}),
+      ...(modelRoute === 'codex-bridge'
+        ? {
+            codexBridgeTools: Object.freeze([
+              ...STATIC_APP_MCP_TOOLS,
+              ...(input.conversationSkillImportEnabled ? SKILL_IMPORT_TOOLS : [])
+            ]),
+            reviewerBridgeTools: REVIEWER_BRIDGE_NAMESPACED_TOOLS
+          }
+        : modelRoute === 'codex-responses-compatibility'
+          ? { reviewerBridgeTools: REVIEWER_BRIDGE_NAMESPACED_TOOLS }
+          : {})
+    })
+  }
+  projectModelChange(input: BackendModelChangePlanInput): AgentModelChangeTarget | undefined {
+    if (input.frameworkId === 'pi' && !piWireFor(input.target)) return undefined
+    const model = input.target.effectiveModel ?? input.target.provider.model
+    if (!model) return undefined
+    const route = modelRouteFor(input.frameworkId, input.target)
+    const candidates = this.routeCandidates(input.settings, input.target, input.frameworkId, route)
+    const retargetable = new Set(candidates.map(({ providerId }) => providerId)).size >= 2
+    const customTarget = usesAppProviderTransport(input.target.provider.type)
+    const hasClaudeTransport =
+      input.frameworkId === 'claude-code' && customTarget && candidates.includes(input.target)
+    const hasProviderTransport =
+      input.frameworkId === 'opencode' ||
+      input.frameworkId === 'pi' ||
+      (input.frameworkId === 'codex' &&
+        (retargetable || (route === 'codex-responses' && customTarget)))
+    const providerTransportTargetId = hasProviderTransport
+      ? transportTargetId(input.frameworkId, input.target.providerId, model)
+      : undefined
+    const backendProviderId =
+      input.frameworkId === 'codex' && isCodexSubscriptionProvider(input.target.provider.type)
+        ? CODEX_ISOLATED_PROVIDER_ID
+        : input.target.providerId
+    return Object.freeze({
+      frameworkId: input.frameworkId,
+      providerId: input.target.providerId,
+      providerName: input.target.providerName,
+      backendId: `${input.frameworkId}:${backendProviderId}`,
+      route,
+      model,
+      sessionModel:
+        route === 'codex-bridge'
+          ? CODEX_BRIDGE_MODEL
+          : input.frameworkId === 'opencode'
+            ? `${opencodeTransportProviderId(input.target.providerId, model)}/${model}`
+            : input.frameworkId === 'pi'
+              ? piSessionModel(piModelId(input.target.providerId, model))
+              : model,
+      sessionModelRequired:
+        input.frameworkId === 'codex' && isCodexSubscriptionProvider(input.target.provider.type),
+      supportsImageInput: input.target.provider.supportsImageInput === true,
+      reasoningEffort: modelEffort(input.effortIntent, input.target),
+      ...(hasClaudeTransport
+        ? { messagesBridgeTargetId: claudeTargetId(input.target.providerId, model) }
+        : {}),
+      ...(providerTransportTargetId ? { providerTransportTargetId } : {}),
+      ...(input.target.provider.contextWindow
+        ? { contextWindow: input.target.provider.contextWindow }
+        : {}),
+      ...(route === 'codex-bridge' || route === 'codex-responses-compatibility'
+        ? {
+            bridge: Object.freeze({
+              model,
+              ...(input.target.provider.vendorId
+                ? { vendorId: input.target.provider.vendorId }
+                : {}),
+              ...(input.target.provider.reasoningEffortTransport
+                ? { reasoningEffortTransport: input.target.provider.reasoningEffortTransport }
+                : {})
+            })
+          }
+        : {})
+    })
+  }
+  private transportPlan(
+    active: ProviderRuntimeTarget,
+    frameworkId: AgentFrameworkId,
+    route: AgentModelRoute,
+    candidates: readonly ProviderRuntimeTarget[],
+    retargetable: boolean,
+    effortIntent: ReasoningEffort
+  ): BackendTransportPlan {
+    if (frameworkId === 'claude-code') {
+      if (!usesAppProviderTransport(active.provider.type)) {
+        return Object.freeze({ kind: 'direct' })
+      }
+      const targets = candidates.flatMap(
+        (candidate): (MessagesBridgeTarget & { runtimeTarget?: ProviderRuntimeTarget })[] => {
+          const model = candidate.effectiveModel ?? candidate.provider.model
+          const baseUrl = normalizeMessagesRootUrl(candidate.provider.baseUrl ?? '')
+          return !model || !baseUrl
+            ? []
+            : [
+                Object.freeze({
+                  id: claudeTargetId(candidate.providerId, model),
+                  runtimeTarget: candidate,
+                  baseUrl,
+                  ...(candidate.provider.key ? { key: candidate.provider.key } : {}),
+                  model,
+                  ...(candidate.provider.vendorId === 'apodex'
+                    ? { backgroundModel: 'apodex-1.1-mini' }
+                    : {}),
+                  ...(candidate.provider.vendorId &&
+                  usesVendorMessagesApiKeyHeader(candidate.provider.vendorId)
+                    ? { useApiKeyHeader: true }
+                    : {})
+                })
+              ]
+        }
+      )
+      const model = active.effectiveModel ?? active.provider.model
+      if (!model) return Object.freeze({ kind: 'direct' })
+      const initialTargetId = claudeTargetId(active.providerId, model)
+      return targets.some(({ id }) => id === initialTargetId)
+        ? Object.freeze({
+            kind: 'claude-anthropic',
+            targets: Object.freeze(targets),
+            initialTargetId
+          })
+        : Object.freeze({ kind: 'direct' })
+    }
+    if (frameworkId === 'opencode') {
+      return Object.freeze({
+        kind: route as 'opencode-anthropic' | 'opencode-openai',
+        targets: this.plannedTargets(candidates, frameworkId, effortIntent)
+      })
+    }
+    if (frameworkId === 'open-science-agent') return Object.freeze({ kind: 'direct' })
+    if (frameworkId === 'pi') {
+      const model = active.effectiveModel ?? active.provider.model
+      if (!model || !piWireFor(active)) throw new Error('The Pi provider target is incomplete.')
+      // One Pi generation can mix wires: every compatible model joins the in-session catalog.
+      const targets = this.plannedTargets(candidates, frameworkId, effortIntent).flatMap(
+        (planned): PiPlannedTarget[] => {
+          const wire = piWireFor(planned.target)
+          return wire ? [Object.freeze({ ...planned, ...wire })] : []
+        }
+      )
+      return Object.freeze({
+        kind: 'pi',
+        targets: Object.freeze(targets),
+        initialTargetId: transportTargetId(frameworkId, active.providerId, model)
+      })
+    }
+    if (frameworkId === 'codebuddy') {
+      if (active.apiEndpoints.includes('chat-completions')) return Object.freeze({ kind: 'direct' })
+      return Object.freeze({
+        kind: 'codebuddy-provider-compatibility',
+        wire: active.apiEndpoints.includes('responses') ? 'responses' : 'messages'
+      })
+    }
+    if (route === 'codex-bridge' || route === 'codex-responses-compatibility') {
+      return Object.freeze({
+        kind: route === 'codex-bridge' ? 'codex-chat' : 'codex-responses-compatibility',
+        targets: retargetable
+          ? this.plannedTargets(candidates, frameworkId, effortIntent)
+          : Object.freeze([])
+      })
+    }
+    const model = active.effectiveModel ?? active.provider.model
+    return active.provider.type === 'custom' && model
+      ? Object.freeze({
+          kind: 'codex-native-responses',
+          targets: this.plannedTargets(candidates, frameworkId, effortIntent),
+          initialTargetId: transportTargetId(frameworkId, active.providerId, model)
+        })
+      : Object.freeze({ kind: 'direct' })
+  }
+  private plannedTargets(
+    candidates: readonly ProviderRuntimeTarget[],
+    frameworkId: AgentFrameworkId,
+    effortIntent: ReasoningEffort
+  ): readonly PlannedProviderTarget[] {
+    return Object.freeze(
+      candidates.flatMap((target): PlannedProviderTarget[] => {
+        const model = target.effectiveModel ?? target.provider.model
+        const effort = modelEffort(effortIntent, target)
+        return model
+          ? [
+              Object.freeze({
+                id: transportTargetId(frameworkId, target.providerId, model),
+                target,
+                ...(effort === 'default' ? {} : { reasoningEffort: effort }),
+                ...(target.reasoningEffortProfile.supported
+                  ? { reasoningEfforts: [...new Set(target.reasoningEffortProfile.slots)] }
+                  : {})
+              })
+            ]
+          : []
+      })
+    )
+  }
+
+  private routeCandidates(
+    settings: StoredSettings,
+    active: ProviderRuntimeTarget,
+    frameworkId: AgentFrameworkId,
+    route: AgentModelRoute
+  ): ProviderRuntimeTarget[] {
+    const seen = new Set<string>()
+    return this.enumerateCandidates(settings, active, frameworkId).filter((candidate) => {
+      const model = candidate.effectiveModel ?? candidate.provider.model
+      // Pi gives every target its own bridge, so xAI OAuth and API-key models can share a catalog.
+      if (
+        frameworkId !== 'pi' &&
+        !shareProviderTransportFamily(active.provider.type, candidate.provider.type)
+      )
+        return false
+      const endpoint =
+        frameworkId === 'claude-code'
+          ? normalizeMessagesRootUrl(candidate.provider.baseUrl ?? '')
+          : frameworkId === 'pi'
+            ? piWireFor(candidate)?.wire
+            : frameworkId === 'opencode'
+              ? route === 'opencode-openai'
+                ? resolveChatCompletionsUrl(candidate.provider)
+                : normalizeMessagesRootUrl(candidate.provider.baseUrl ?? '')
+              : frameworkId === 'codebuddy'
+                ? resolveChatCompletionsUrl(candidate.provider)
+                : route === 'codex-bridge'
+                  ? resolveChatCompletionsBaseUrl(candidate.provider)
+                  : resolveResponsesBaseUrl(candidate.provider)
+      const id = model
+        ? frameworkId === 'claude-code'
+          ? claudeTargetId(candidate.providerId, model)
+          : transportTargetId(frameworkId, candidate.providerId, model)
+        : undefined
+      if (
+        !candidate.frameworkCompatible ||
+        (frameworkId === 'claude-code' && !canUseClaudeProviderTransport(candidate.provider)) ||
+        (frameworkId === 'codex' && !candidate.modelBridgeSupported) ||
+        modelRouteFor(frameworkId, candidate) !== route ||
+        !model ||
+        !endpoint ||
+        !id ||
+        seen.has(id)
+      )
+        return false
+      seen.add(id)
+      return true
+    })
+  }
+
+  private enumerateCandidates(
+    settings: StoredSettings,
+    active: ProviderRuntimeTarget,
+    frameworkId: AgentFrameworkId
+  ): ProviderRuntimeTarget[] {
+    const framework = getAgentFramework(frameworkId)
+    const candidates = [active]
+    for (const provider of settings.providers) {
+      let configured: ProviderRuntimeTarget
+      try {
+        configured =
+          provider.id === active.providerId
+            ? active
+            : this.providers.resolveRuntimeTarget(
+                provider,
+                { kind: 'configured', requestedModel: provider.model },
+                framework
+              )
+      } catch {
+        // Stale sibling providers stay reconnect-only and cannot block the active generation.
+        continue
+      }
+      candidates.push(configured)
+      try {
+        candidates.push(...this.providers.resolveRuntimeModelCatalog(provider, framework))
+      } catch {
+        // A stale model catalog cannot discard the provider's configured target.
+      }
+    }
+    return candidates
+  }
+
+  private modelCatalog(
+    candidates: readonly ProviderRuntimeTarget[],
+    frameworkId: AgentFrameworkId,
+    route: AgentModelRoute,
+    effortIntent: ReasoningEffort
+  ): AgentModelCatalogEntry[] {
+    return candidates
+      .filter(
+        (candidate) =>
+          candidate.frameworkCompatible &&
+          (frameworkId !== 'codex' || candidate.modelBridgeSupported) &&
+          modelRouteFor(frameworkId, candidate) === route
+      )
+      .map((candidate) => {
+        const effort = modelEffort(effortIntent, candidate)
+        return Object.freeze({
+          provider: candidate.provider,
+          ...(effort === 'default' ? {} : { reasoningEffort: effort }),
+          ...(candidate.reasoningEffortProfile.supported
+            ? { reasoningEfforts: [...new Set(candidate.reasoningEffortProfile.slots)] }
+            : {})
+        })
+      })
+  }
+
+  private claudeModelConfig(
+    candidates: readonly ProviderRuntimeTarget[]
+  ): ClaudeRuntimeModelConfig | undefined {
+    const models = [
+      ...new Set(
+        candidates.map((candidate) => candidate.effectiveModel ?? candidate.provider.model)
+      )
+    ].filter((model): model is string => Boolean(model))
+    return models.length === 0
+      ? undefined
+      : Object.freeze({
+          availableModels: Object.freeze(models),
+          modelOverrides: Object.freeze(Object.fromEntries(models.map((model) => [model, model])))
+        })
+  }
+}
+
+export { BackendRoutePlanner }
+export type { BackendRoutePlan, BackendRouteProviderPort, BackendTransportPlan }

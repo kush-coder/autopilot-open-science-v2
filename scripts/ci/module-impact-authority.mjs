@@ -1,0 +1,128 @@
+/* eslint-disable @typescript-eslint/explicit-function-return-type */
+
+import { execFileSync } from 'node:child_process'
+import { appendFileSync } from 'node:fs'
+import { resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+import {
+  classifyChanges,
+  formatPlanSummary,
+  parseNameStatus,
+  platformExecutionPlan,
+  toGitHubOutputPlan
+} from './classify-pr-changes.mjs'
+import {
+  createModuleImpactShadowReport,
+  formatModuleImpactShadowSummary
+} from './module-impact-shadow.mjs'
+import { createAffectedTestPlan, createFullPlanFloor } from './module-test-impact.mjs'
+import { resolveModuleImpactInputs } from './module-impact-inputs.mjs'
+import { loadDerivedConsumers } from './module-graph/policy.mjs'
+import { selectWindowsCoreChecks } from './windows-core-plan.mjs'
+
+const manifestOnlyGraph = Object.freeze({
+  status: 'unavailable-manifest-only',
+  reason: 'CI authority uses the trusted repository manifest only',
+  testFiles: []
+})
+
+const unusedModulePlan = Object.freeze({
+  mode: 'selective',
+  modules: [],
+  testFiles: [],
+  capabilityOverlays: [],
+  fallbackCapabilities: [],
+  graphStatus: 'not-used',
+  graphReason: 'unit bundle not selected',
+  reasonChains: []
+})
+
+function argumentValue(arguments_, name) {
+  const index = arguments_.indexOf(name)
+  return index === -1 ? undefined : arguments_[index + 1]
+}
+
+function requireCommit(value, name) {
+  if (!value || !/^[0-9a-f]{40}$/i.test(value)) {
+    throw new Error(`${name} must be a full 40-character Git commit SHA`)
+  }
+  return value
+}
+
+function changesFromGit(base, head, { cwd = process.cwd(), execute = execFileSync } = {}) {
+  const diff = execute('git', ['diff', '--name-status', '-z', base, head], {
+    cwd,
+    maxBuffer: 64 * 1024 * 1024
+  })
+  return parseNameStatus(diff.toString('utf8'))
+}
+
+export function runModuleImpactAuthorityCli(
+  arguments_ = process.argv.slice(2),
+  environment = process.env,
+  { cwd = process.cwd(), execute = execFileSync, append = appendFileSync, write } = {}
+) {
+  const base = requireCommit(argumentValue(arguments_, '--base') ?? environment.BASE_SHA, '--base')
+  const head = requireCommit(argumentValue(arguments_, '--head') ?? environment.HEAD_SHA, '--head')
+  // An accepted derived index is removed from the changes it would otherwise route as global.
+  const { manifest, registrationModules, registrationOnly, changes } = resolveModuleImpactInputs(
+    changesFromGit(base, head, { cwd, execute }),
+    { base, head, cwd, execute }
+  )
+  const candidatePlan = classifyChanges(changes, undefined, {
+    moduleManifest: manifest,
+    registrationModules,
+    registrationOnly
+  })
+  const modulePlan = candidatePlan.bundles.includes('unit')
+    ? createAffectedTestPlan(changes, manifestOnlyGraph, manifest, registrationModules)
+    : unusedModulePlan
+  const report = createModuleImpactShadowReport(candidatePlan, modulePlan)
+  const unitFloor =
+    report.resolved.mode === 'full' &&
+    report.resolved.bundles.includes('unit') &&
+    createFullPlanFloor(changes, manifest, registrationModules) !== undefined
+  const platformPlan =
+    environment.PR_GATE_PLATFORM_POLICY === 'risk-v1'
+      ? platformExecutionPlan(report.resolved, changes, environment.EVENT_NAME, { unitFloor })
+      : report.resolved
+  // Trusted preflight has no parser to generate the derived index. Without a committed index the
+  // module plan lacks consumer evidence, so Windows core selection must fail closed to all checks.
+  const derivedAvailable = Object.keys(loadDerivedConsumers().modules).length > 0
+  const plan = selectWindowsCoreChecks(
+    platformPlan,
+    derivedAvailable ? modulePlan : { ...modulePlan, mode: 'full' },
+    changes,
+    manifest,
+    environment.EVENT_NAME
+  )
+  const planJson = JSON.stringify(plan)
+  const outputPlanJson = JSON.stringify(toGitHubOutputPlan(plan))
+  const lanesJson = JSON.stringify(plan.lanes)
+
+  if (environment.GITHUB_OUTPUT) {
+    append(environment.GITHUB_OUTPUT, `plan=${outputPlanJson}\nlanes=${lanesJson}\n`)
+  } else if (write) {
+    write(`${planJson}\n`)
+  } else {
+    process.stdout.write(`${planJson}\n`)
+  }
+  if (environment.GITHUB_STEP_SUMMARY) {
+    append(environment.GITHUB_STEP_SUMMARY, formatPlanSummary(plan))
+    append(environment.GITHUB_STEP_SUMMARY, formatModuleImpactShadowSummary(report))
+  }
+  return { plan, report }
+}
+
+const isDirectExecution =
+  process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)
+
+if (isDirectExecution) {
+  try {
+    runModuleImpactAuthorityCli()
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : error)
+    process.exitCode = 1
+  }
+}

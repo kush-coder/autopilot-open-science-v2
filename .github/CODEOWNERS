@@ -1,0 +1,15 @@
+# CI changes require owner review. Keep this file self-owned.
+/packages/test-impact/ @aipoch/ci-maintainers
+/.github/CODEOWNERS @aipoch/ci-maintainers
+/CODEOWNERS @aipoch/ci-maintainers
+/.github/workflows/ @aipoch/ci-maintainers
+/.github/actions/ @aipoch/ci-maintainers
+/.github/codeql/ @aipoch/ci-maintainers
+/.github/dependabot.yml @aipoch/ci-maintainers
+/.github/labels.json @aipoch/ci-maintainers
+/scripts/ci/ @aipoch/ci-maintainers
+
+# Ordinary registration is checked as data by trusted-base CI Integrity.
+# Last matching pattern wins; keep exceptions limited to validated JSON registration data.
+/scripts/ci/module-impact.json
+/scripts/ci/module-impact/*.json

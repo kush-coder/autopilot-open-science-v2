@@ -1,0 +1,263 @@
+// @vitest-environment jsdom
+
+import { act, cleanup, renderHook } from '@testing-library/react'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+
+import { SESSION_SIZE_LIMIT_ERROR_CODE } from '../../../../shared/session-persistence'
+import { createInitialSessionState, useSessionStore } from '../../stores/session-store'
+
+const respondToWorkspaceElicitation = vi.hoisted(() => vi.fn())
+
+vi.mock('./workspace-elicitation-runtime', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./workspace-elicitation-runtime')>()),
+  respondToWorkspaceElicitation
+}))
+
+import {
+  createWorkspaceElicitationRuntime,
+  pendingWorkspaceElicitations,
+  useWorkspaceElicitation,
+  useWorkspaceElicitationFailures
+} from './useWorkspaceElicitation'
+
+describe('createWorkspaceElicitationRuntime', () => {
+  const getState = vi.fn(async () => ({ sessionIds: [] }))
+  const resumeSession = vi.fn(async () => ({ sessionId: 'session-1' }))
+  const resetSessionContext = vi.fn(async () => ({ sessionId: 'session-1' }))
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    useWorkspaceElicitationFailures.setState({ failures: {} })
+    vi.stubGlobal('window', {
+      api: {
+        acp: {
+          getState,
+          resumeSession,
+          resetSessionContext,
+          respondToElicitation: vi.fn()
+        }
+      }
+    })
+  })
+
+  afterEach(cleanup)
+
+  it('forwards a disabled conversation Memory preference through resume and reset', async () => {
+    const runtime = await createWorkspaceElicitationRuntime()
+
+    await runtime.resumeSession(
+      'session-1',
+      '/workspace',
+      'project-1',
+      'ask',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      false
+    )
+    await runtime.resetSessionContext?.('session-1', '/workspace', 'project-1', 'ask', false)
+
+    expect(resumeSession).toHaveBeenCalledWith(
+      expect.objectContaining({ sessionId: 'session-1', memoryEnabled: false })
+    )
+    expect(resetSessionContext).toHaveBeenCalledWith(
+      expect.objectContaining({ sessionId: 'session-1', memoryEnabled: false })
+    )
+  })
+
+  it('reports an elicitation response size limit for the affected Session', async () => {
+    const error = Object.assign(new Error('Session exceeds the persistence limit.'), {
+      code: SESSION_SIZE_LIMIT_ERROR_CODE
+    })
+    respondToWorkspaceElicitation.mockRejectedValue(error)
+    const onSessionSizeLimit = vi.fn()
+    const { result } = renderHook(() => useWorkspaceElicitation(vi.fn(), onSessionSizeLimit))
+
+    await expect(
+      result.current.respondToElicitation({
+        requestId: 'question-1',
+        action: 'decline',
+        request: {
+          requestId: 'question-1',
+          sessionId: 'session-1',
+          toolCallId: 'tool-1',
+          message: 'Choose an approach',
+          fields: []
+        }
+      })
+    ).rejects.toBe(error)
+
+    expect(onSessionSizeLimit).toHaveBeenCalledWith('session-1')
+  })
+
+  it.each([false, true])(
+    'retains a question-scoped failure across responder remounts only after commitment (saved: %s)',
+    async (saved) => {
+      const request = {
+        requestId: 'choice-1',
+        sessionId: 'session-1',
+        toolCallId: 'tool-1',
+        message: 'Choose',
+        fields: [],
+        durable: { kind: 'agent-user-choice' as const, requestId: 'choice-1' }
+      }
+      useSessionStore.setState({
+        ...createInitialSessionState(),
+        sessions: [
+          {
+            id: request.sessionId,
+            projectId: 'project-1',
+            title: 'Choose',
+            cwd: '/workspace',
+            status: 'waiting-for-user',
+            messages: [],
+            createdAt: 1,
+            updatedAt: 1,
+            activities: [
+              {
+                id: request.toolCallId,
+                kind: 'tool',
+                title: request.message,
+                status: 'completed',
+                sortIndex: 1,
+                createdAt: 1,
+                updatedAt: 1,
+                eventIds: [],
+                elicitation: {
+                  message: request.message,
+                  fields: request.fields,
+                  durable: request.durable,
+                  state: saved ? 'answered' : 'pending',
+                  ...(saved ? { continuationPending: true as const } : {})
+                }
+              }
+            ]
+          }
+        ]
+      })
+      const attachment = Promise.withResolvers<void>()
+      respondToWorkspaceElicitation.mockReturnValueOnce(attachment.promise)
+      const hook = renderHook(() => useWorkspaceElicitation(vi.fn()))
+      const response = { requestId: request.requestId, action: 'accept' as const, request }
+      const responding = hook.result.current.respondToElicitation(response)
+      const rejected = expect(responding).rejects.toThrow('Recovery persistence failed')
+      hook.unmount()
+      await act(async () => {
+        attachment.reject(new Error('Recovery persistence failed'))
+        await rejected
+      })
+      const remounted = renderHook(() => useWorkspaceElicitation(vi.fn()))
+      expect(useWorkspaceElicitationFailures.getState().failures).toEqual(
+        saved
+          ? {
+              'session-1': { requestId: 'choice-1', error: 'Recovery persistence failed' }
+            }
+          : {}
+      )
+      respondToWorkspaceElicitation.mockResolvedValueOnce(undefined)
+      await act(async () =>
+        remounted.result.current.respondToElicitation({ ...response, action: 'cancel' })
+      )
+      expect(useWorkspaceElicitationFailures.getState().failures).toEqual({})
+    }
+  )
+})
+
+it('keeps imported pending questions as recorded evidence without reconstructing requests', () => {
+  const session = {
+    id: 'imported-session',
+    projectId: 'project',
+    title: 'Imported',
+    cwd: '',
+    status: 'waiting-for-user' as const,
+    messages: [],
+    createdAt: 1,
+    updatedAt: 1,
+    activities: [
+      {
+        id: 'choice-tool',
+        kind: 'tool' as const,
+        title: 'Choose',
+        status: 'failed' as const,
+        eventIds: [],
+        sortIndex: 1,
+        createdAt: 1,
+        updatedAt: 1,
+        elicitation: {
+          message: 'Choose an approach',
+          fields: [],
+          state: 'pending' as const,
+          durable: { kind: 'agent-user-choice' as const, requestId: 'choice-1' }
+        }
+      }
+    ]
+  }
+  expect(pendingWorkspaceElicitations(session)).toHaveLength(1)
+  expect(
+    pendingWorkspaceElicitations({
+      ...session,
+      packageOrigin: {
+        importId: 'import-1',
+        sourceProjectId: 'source-project',
+        sourceSessionId: 'source-session',
+        importedAt: 1,
+        manifestChecksum: 'a'.repeat(64)
+      }
+    })
+  ).toEqual([])
+  expect(session.activities[0].elicitation.state).toBe('pending')
+})
+
+it('releases a running observer composer when the live wait ends before its activity updates', () => {
+  const session = {
+    id: 'observer-session',
+    projectId: 'project',
+    title: 'Export analysis',
+    cwd: '/workspace',
+    status: 'running' as const,
+    messages: [],
+    activeRun: { promptMessageId: 'prompt-1', startedAt: 1 },
+    createdAt: 1,
+    updatedAt: 1,
+    activities: [
+      {
+        id: 'choice-tool',
+        kind: 'tool' as const,
+        title: 'Choose',
+        status: 'in_progress' as const,
+        eventIds: [],
+        sortIndex: 1,
+        createdAt: 1,
+        updatedAt: 1,
+        elicitation: {
+          message: 'Choose an approach',
+          fields: [],
+          state: 'pending' as const,
+          durable: { kind: 'agent-user-choice' as const, requestId: 'choice-1' }
+        }
+      }
+    ]
+  }
+  useSessionStore.setState({ ...createInitialSessionState(), sessions: [session] })
+  const requests = (): ReturnType<typeof pendingWorkspaceElicitations> =>
+    pendingWorkspaceElicitations(useSessionStore.getState().sessions[0])
+
+  expect(requests()).toEqual([])
+  useSessionStore.getState().setElicitationPending(session.id, true, { liveProjection: 'observer' })
+  expect(requests()).toMatchObject([{ requestId: 'choice-1' }])
+  expect(useSessionStore.getState().sessions[0].status).toBe('running')
+
+  useSessionStore
+    .getState()
+    .setElicitationPending(session.id, false, { liveProjection: 'observer' })
+  expect(requests()).toEqual([])
+  expect(useSessionStore.getState().sessions[0]).toMatchObject({
+    status: 'running',
+    activeRun: session.activeRun,
+    activities: session.activities
+  })
+})

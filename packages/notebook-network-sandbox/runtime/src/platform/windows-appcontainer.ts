@@ -1,0 +1,1093 @@
+import { spawn, type SpawnOptions } from 'node:child_process'
+import { randomBytes, randomUUID } from 'node:crypto'
+import { access, readFile, rm, writeFile } from 'node:fs/promises'
+import { constants } from 'node:fs'
+import { createServer, type Server } from 'node:net'
+import { join, win32 } from 'node:path'
+
+import { proxyEnvironment } from './proxy-environment.js'
+import { normalizeFilesystemLayout, type FilesystemLayoutInput } from './filesystem-layout.js'
+import {
+  applyElectronAsNodeLaunchPolicy,
+  ELECTRON_NO_STDIO_INIT
+} from './electron-as-node-launch-policy.js'
+import type { DependencyCheck } from './linux-isolation.js'
+import {
+  CommandGateway,
+  LOCAL_RPC_BROKER_HOST,
+  sharedGatewayPortActive,
+  type GatewayCredentials
+} from '../gateway/command-gateway.js'
+
+type WindowsShell = Readonly<{ kind: 'powershell' | 'cmd'; path: string }>
+
+const systemPowerShell = (): string => {
+  const root = process.env.SystemRoot || process.env.WINDIR
+  return root
+    ? win32.join(root, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+    : 'powershell.exe'
+}
+
+type WindowsRuntimeVerification = Readonly<{
+  argv: readonly string[]
+  env: NodeJS.ProcessEnv
+  signal?: AbortSignal
+}>
+
+type WindowsAclPreflightRequest = Readonly<{
+  path: string
+  access: 'ro' | 'rw'
+  /** The user-selected path before realpath, used to detect junctions and aliases. */
+  requestedPath?: string
+  /**
+   * How much of the selected tree to validate. `tree` (default) walks descendants so a folder
+   * grant can report protected descendants before it is persisted; `target` validates only the
+   * selected path and its ancestors.
+   */
+  scope?: 'target' | 'tree'
+  filesystem?: FilesystemLayoutInput
+}>
+
+type WindowsAclPreflightResult =
+  | Readonly<{ ok: true }>
+  | Readonly<{
+      ok: false
+      error: Readonly<{
+        code: string
+        path: string
+        access: 'ro' | 'rw'
+        stage: string
+        win32Code?: number
+        message: string
+        remediation: string
+      }>
+    }>
+
+type WindowsLaunchRequest = Readonly<{
+  command: string
+  executable?: string
+  args?: readonly string[]
+  electronAsNode?: boolean
+  shell?: string | WindowsShell
+  cwd: string
+  gatewayPort: number
+  gatewayCredentials: GatewayCredentials
+  env: NodeJS.ProcessEnv
+  localRpcSocketPath?: string
+  windowsShellControlPipe?: string
+  filesystem: FilesystemLayoutInput
+  hostPath: string
+  installationId: string
+  ownershipRoot: string
+}>
+
+const WINDOWS_BATCH_FILE = /\.(?:cmd|bat)$/i
+const CMD_META_CHARACTER = /([()\][%!^"`<>&|;, *?])/g
+
+// Ported from cross-spawn's Windows non-shell parser. Batch files require cmd.exe, while escaping
+// each token and asking the native host to preserve the resulting command line prevents cmd syntax
+// in an interpreter path or argument from becoming a second command.
+const escapeCmdCommand = (value: string): string => value.replace(CMD_META_CHARACTER, '^$1')
+
+const escapeCmdArgument = (value: string, doubleEscapeMetaCharacters: boolean): string => {
+  let escaped = value.replace(/(?=(\\+?)?)\1"/g, '$1$1\\"').replace(/(?=(\\+?)?)\1$/, '$1$1')
+  escaped = `"${escaped}"`.replace(CMD_META_CHARACTER, '^$1')
+  return doubleEscapeMetaCharacters ? escaped.replace(CMD_META_CHARACTER, '^$1') : escaped
+}
+
+const windowsBatchInvocation = (
+  executable: string,
+  args: readonly string[],
+  env: NodeJS.ProcessEnv
+): Readonly<{ executable: string; args: string[]; verbatimArguments: true }> => {
+  const command = [
+    escapeCmdCommand(executable),
+    // cmd.exe parses the invocation once and a batch file parses its expanded arguments again.
+    ...args.map((argument) => escapeCmdArgument(argument, true))
+  ].join(' ')
+  return {
+    executable: env.ComSpec ?? env.COMSPEC ?? 'cmd.exe',
+    args: ['/d', '/s', '/c', `"${command}"`],
+    verbatimArguments: true
+  }
+}
+
+type WindowsStandardLaunchRequest = Readonly<
+  Pick<
+    WindowsLaunchRequest,
+    | 'command'
+    | 'executable'
+    | 'args'
+    | 'shell'
+    | 'gatewayPort'
+    | 'gatewayCredentials'
+    | 'env'
+    | 'localRpcSocketPath'
+    | 'windowsShellControlPipe'
+  >
+>
+
+type WindowsSupervisedLaunchRequest = Readonly<
+  WindowsStandardLaunchRequest &
+    Pick<WindowsLaunchRequest, 'cwd' | 'hostPath'> &
+    Pick<WindowsLaunchRequest, 'ownershipRoot'>
+>
+
+type ProcessTreeTerminationProof = Readonly<{
+  path: string
+  token: string
+  confirm: () => Promise<boolean>
+  confirmState: () => Promise<WindowsProcessState>
+  request: () => Promise<boolean>
+  requestPath: string
+  release: () => Promise<void>
+}>
+
+type ProcessTreeProofMetadata = Pick<ProcessTreeTerminationProof, 'path' | 'token' | 'requestPath'>
+
+type WindowsProcessState = 'never-started' | 'started-and-reaped' | 'termination-unknown'
+
+type AppContainerStatus = Readonly<{
+  profileExists: boolean
+  loopbackAllowed: boolean
+  networkFenceReady: boolean
+  owned: boolean
+  ownershipState: 'unowned' | 'creating' | 'owned'
+  gatewayPort: number | null
+}>
+
+const loopbackPortAvailable = (port: number): Promise<boolean> =>
+  new Promise((resolve) => {
+    const server = createServer()
+    server.unref()
+    server.once('error', () => resolve(false))
+    server.listen(port, '127.0.0.1', () => server.close(() => resolve(true)))
+  })
+
+const listen = (port: number): Promise<Server> =>
+  new Promise((resolve, reject) => {
+    const server = createServer()
+    server.unref()
+    server.once('error', reject)
+    server.listen(port, '127.0.0.1', () => {
+      server.removeListener('error', reject)
+      resolve(server)
+    })
+  })
+
+const closeServer = (server: Server | undefined): Promise<void> =>
+  new Promise((resolve) => {
+    if (!server) return resolve()
+    server.close(() => resolve())
+  })
+
+const runCapture = (
+  program: string,
+  args: readonly string[],
+  options: Pick<SpawnOptions, 'env' | 'signal' | 'timeout'> & { maxBuffer?: number } = {}
+): Promise<{ code: number | null; stdout: string; stderr: string }> =>
+  new Promise((resolve, reject) => {
+    const { maxBuffer = Infinity, ...spawnOptions } = options
+    const child = spawn(program, [...args], {
+      ...spawnOptions,
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe']
+    })
+    let stdout = ''
+    let stderr = ''
+    let remaining = maxBuffer
+    let overflow = false
+    const capture = (chunk: string): string => {
+      if (overflow) return ''
+      remaining -= Buffer.byteLength(chunk)
+      if (remaining < 0) {
+        overflow = true
+        return ''
+      }
+      return chunk
+    }
+    child.stdout.setEncoding('utf8').on('data', (chunk: string) => (stdout += capture(chunk)))
+    child.stderr.setEncoding('utf8').on('data', (chunk: string) => (stderr += capture(chunk)))
+    child.once('error', reject)
+    // Keep draining until the native host closes so it can finish its process-tree cleanup proof.
+    child.once('close', (code) => {
+      if (overflow) reject(new Error('Windows AppContainer output exceeded its buffer limit.'))
+      else resolve({ code, stdout, stderr })
+    })
+  })
+
+const readAppContainerStatus = async (
+  hostPath: string,
+  installationId: string,
+  ownershipRoot: string
+): Promise<AppContainerStatus> => {
+  const result = await runCapture(hostPath, ['status', installationId, ownershipRoot])
+  if (result.code !== 0) {
+    throw new Error(result.stderr.trim() || `AppContainer host exited with code ${result.code}.`)
+  }
+  const parsed: unknown = JSON.parse(result.stdout)
+  if (
+    !parsed ||
+    typeof parsed !== 'object' ||
+    typeof (parsed as AppContainerStatus).profileExists !== 'boolean' ||
+    typeof (parsed as AppContainerStatus).loopbackAllowed !== 'boolean' ||
+    typeof (parsed as AppContainerStatus).networkFenceReady !== 'boolean' ||
+    typeof (parsed as AppContainerStatus).owned !== 'boolean' ||
+    ((parsed as AppContainerStatus).gatewayPort !== null &&
+      (!Number.isInteger((parsed as AppContainerStatus).gatewayPort) ||
+        (parsed as AppContainerStatus).gatewayPort! < 1 ||
+        (parsed as AppContainerStatus).gatewayPort! > 65535)) ||
+    !['unowned', 'creating', 'owned'].includes((parsed as AppContainerStatus).ownershipState)
+  ) {
+    throw new Error('AppContainer host returned an invalid status payload.')
+  }
+  return parsed as AppContainerStatus
+}
+
+const preflightFailure = (
+  request: WindowsAclPreflightRequest,
+  code: string,
+  stage: string,
+  message: string,
+  remediation: string
+): WindowsAclPreflightResult => ({
+  ok: false,
+  error: { code, path: request.path, access: request.access, stage, message, remediation }
+})
+
+const parseAclPreflightResult = (
+  value: unknown,
+  request: WindowsAclPreflightRequest
+): WindowsAclPreflightResult => {
+  if (value && typeof value === 'object' && (value as { ok?: unknown }).ok === true)
+    return { ok: true }
+  if (!value || typeof value !== 'object' || (value as { ok?: unknown }).ok !== false)
+    return preflightFailure(
+      request,
+      'WINDOWS_ACL_PREFLIGHT_INVALID_RESPONSE',
+      'native-response',
+      'The native ACL preflight returned an invalid result.',
+      'Update the application and retry.'
+    )
+  const error = (value as { error?: unknown }).error
+  if (!error || typeof error !== 'object')
+    return preflightFailure(
+      request,
+      'WINDOWS_ACL_PREFLIGHT_INVALID_RESPONSE',
+      'native-response',
+      'The native ACL preflight returned an invalid result.',
+      'Update the application and retry.'
+    )
+  const candidate = error as Record<string, unknown>
+  if (
+    typeof candidate.code !== 'string' ||
+    typeof candidate.path !== 'string' ||
+    (candidate.access !== 'ro' && candidate.access !== 'rw') ||
+    typeof candidate.stage !== 'string' ||
+    (candidate.win32Code !== undefined &&
+      (!Number.isSafeInteger(candidate.win32Code) ||
+        (candidate.win32Code as number) < 0 ||
+        (candidate.win32Code as number) > 0xffff_ffff)) ||
+    typeof candidate.message !== 'string' ||
+    typeof candidate.remediation !== 'string'
+  )
+    return preflightFailure(
+      request,
+      'WINDOWS_ACL_PREFLIGHT_INVALID_RESPONSE',
+      'native-response',
+      'The native ACL preflight error was incomplete.',
+      'Update the application and retry.'
+    )
+  return {
+    ok: false,
+    error: {
+      code: candidate.code,
+      path: candidate.path,
+      access: candidate.access,
+      stage: candidate.stage,
+      ...(candidate.win32Code === undefined ? {} : { win32Code: candidate.win32Code as number }),
+      message: candidate.message,
+      remediation: candidate.remediation
+    }
+  }
+}
+
+const preflightWindowsFilesystem = async (
+  hostPath: string,
+  installationId: string,
+  ownershipRoot: string,
+  request: WindowsAclPreflightRequest,
+  signal?: AbortSignal
+): Promise<WindowsAclPreflightResult> => {
+  signal?.throwIfAborted()
+  const specification = Buffer.from(
+    JSON.stringify({
+      ...request,
+      ...(request.filesystem ? { filesystem: normalizeFilesystemLayout(request.filesystem) } : {})
+    }),
+    'utf8'
+  ).toString('base64url')
+  const controller = new AbortController()
+  const cancel = (): void => controller.abort(signal?.reason)
+  signal?.addEventListener('abort', cancel, { once: true })
+  if (signal?.aborted) cancel()
+  let timedOut = false
+  const timeout = setTimeout(() => {
+    timedOut = true
+    controller.abort()
+  }, 60_000)
+  let result: Awaited<ReturnType<typeof runCapture>>
+  try {
+    result = await runCapture(
+      hostPath,
+      ['preflight-filesystem-acls', installationId, ownershipRoot, specification],
+      { maxBuffer: 16 * 1024 * 1024, signal: controller.signal }
+    )
+  } catch (cause) {
+    signal?.throwIfAborted()
+    return preflightFailure(
+      request,
+      timedOut ? 'WINDOWS_ACL_PREFLIGHT_TIMEOUT' : 'WINDOWS_ACL_PREFLIGHT_UNAVAILABLE',
+      'native-host',
+      timedOut
+        ? 'Windows ACL preflight exceeded 60 seconds.'
+        : cause instanceof Error
+          ? cause.message
+          : String(cause),
+      timedOut
+        ? 'Choose a smaller or local folder. A network or very large directory cannot be validated safely.'
+        : 'Repair or reinstall the Windows protection helper, then retry.'
+    )
+  } finally {
+    clearTimeout(timeout)
+    signal?.removeEventListener('abort', cancel)
+  }
+  signal?.throwIfAborted()
+  if (result.code !== 0)
+    return preflightFailure(
+      request,
+      'WINDOWS_ACL_PREFLIGHT_UNAVAILABLE',
+      'native-host',
+      result.stderr.trim() || `Windows ACL preflight exited with code ${result.code}.`,
+      'Repair or reinstall the Windows protection helper, then retry.'
+    )
+  try {
+    return parseAclPreflightResult(JSON.parse(result.stdout), request)
+  } catch {
+    return preflightFailure(
+      request,
+      'WINDOWS_ACL_PREFLIGHT_INVALID_RESPONSE',
+      'native-response',
+      'The native ACL preflight did not return JSON.',
+      'Update the application and retry.'
+    )
+  }
+}
+
+// A partial or unreadable receipt is not permission to launch outside AppContainer.
+const isWindowsProtectionConfigured = async (
+  hostPath: string,
+  installationId: string,
+  ownershipRoot: string
+): Promise<boolean> => {
+  const result = await runCapture(hostPath, ['configured', installationId, ownershipRoot], {
+    timeout: 5_000,
+    maxBuffer: 64 * 1024
+  })
+  if (result.code !== 0) {
+    throw new Error(
+      result.stderr.trim() ||
+        (result.code === null
+          ? 'Windows protection configuration check was terminated. Retry the operation.'
+          : `AppContainer host exited with code ${result.code}.`)
+    )
+  }
+  const configured: unknown = JSON.parse(result.stdout)
+  if (typeof configured !== 'boolean')
+    throw new Error('AppContainer host returned an invalid protection configuration payload.')
+  return configured
+}
+
+const connectionProbeSpecification = (port: number): string => {
+  const command = [
+    '$client = [Net.Sockets.TcpClient]::new()',
+    `try { $connect = $client.ConnectAsync('127.0.0.1', ${port}); if (-not $connect.Wait(5000)) { exit 34 }; $connect.GetAwaiter().GetResult(); exit 0 }`,
+    'catch { exit 33 }',
+    'finally { $client.Dispose() }'
+  ].join('\n')
+  return Buffer.from(
+    JSON.stringify({
+      executable: systemPowerShell(),
+      arguments: ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', command],
+      cwd: process.env.SystemRoot ?? 'C:\\Windows',
+      readOnlyRoots: [],
+      readWriteRoots: [],
+      deniedReadRoots: [],
+      deniedWriteRoots: []
+    }),
+    'utf8'
+  ).toString('base64url')
+}
+
+const verifyWindowsNetworkFence = async (
+  hostPath: string,
+  installationId: string,
+  ownershipRoot: string,
+  gatewayPort: number
+): Promise<void> => {
+  let outside: Server | undefined
+  let gateway: CommandGateway | undefined
+  try {
+    outside = await listen(0)
+    const outsideAddress = outside.address()
+    if (!outsideAddress || typeof outsideAddress === 'string')
+      throw new Error('The outside-port probe listener is unavailable.')
+    // Keep the shared listener alive even if the last command finishes during either probe.
+    gateway = await CommandGateway.open({
+      sharedPort: gatewayPort,
+      credentials: { username: randomUUID(), password: randomBytes(32).toString('hex') },
+      decide: async () => ({ allowed: false })
+    })
+    const outsideProbe = await runCapture(hostPath, [
+      'launch',
+      installationId,
+      ownershipRoot,
+      connectionProbeSpecification(outsideAddress.port)
+    ])
+    if (outsideProbe.code === 0) throw new Error('The outside-port probe unexpectedly connected.')
+    if (outsideProbe.code !== 33 && outsideProbe.code !== 34)
+      throw new Error(`The outside-port probe exited with code ${outsideProbe.code}.`)
+    const gatewayProbe = await runCapture(hostPath, [
+      'launch',
+      installationId,
+      ownershipRoot,
+      connectionProbeSpecification(gatewayPort)
+    ])
+    if (gatewayProbe.code !== 0)
+      throw new Error(`The gateway probe exited with code ${gatewayProbe.code}.`)
+  } catch (cause) {
+    throw new Error(
+      `Windows Notebook network protection could not be verified: ${cause instanceof Error ? cause.message : String(cause)}`,
+      { cause }
+    )
+  } finally {
+    await Promise.all([closeServer(outside), gateway?.close()])
+  }
+}
+
+const pendingProtectionChecks = new Map<string, Promise<DependencyCheck>>()
+
+const checkWindowsAppContainer = (
+  hostPath: string,
+  installationId: string,
+  ownershipRoot: string
+): Promise<DependencyCheck> => {
+  // The fence probe temporarily binds the installed gateway port. Concurrent callers must share
+  // that probe rather than mistake its listener for an unrelated process occupying the port.
+  // Keep only in-flight checks: every later request must verify the current native protection.
+  const key = JSON.stringify([hostPath, installationId, ownershipRoot])
+  const current = pendingProtectionChecks.get(key)
+  if (current) return current
+  const pending = probeWindowsAppContainer(hostPath, installationId, ownershipRoot).finally(() => {
+    pendingProtectionChecks.delete(key)
+  })
+  pendingProtectionChecks.set(key, pending)
+  return pending
+}
+
+const probeWindowsAppContainer = async (
+  hostPath: string,
+  installationId: string,
+  ownershipRoot: string
+): Promise<DependencyCheck> => {
+  try {
+    await access(hostPath, constants.X_OK)
+  } catch {
+    return { warnings: [], errors: [`Notebook AppContainer host not executable at ${hostPath}`] }
+  }
+  const status = await readAppContainerStatus(hostPath, installationId, ownershipRoot)
+  const errors: string[] = []
+  if (!status.profileExists) errors.push('Notebook AppContainer profile is not installed')
+  if (!status.loopbackAllowed) errors.push('Notebook AppContainer loopback access is not installed')
+  if (!status.networkFenceReady)
+    errors.push('Notebook AppContainer loopback network fence is not installed')
+  if (!status.owned || status.ownershipState !== 'owned')
+    errors.push('Notebook AppContainer resources have no valid Open-Science ownership receipt')
+  if (status.gatewayPort === null) {
+    errors.push('Notebook AppContainer gateway port is not configured')
+  } else if (!sharedGatewayPortActive(status.gatewayPort)) {
+    if (!(await loopbackPortAvailable(status.gatewayPort))) {
+      errors.push(`Notebook AppContainer gateway port ${status.gatewayPort} is unavailable`)
+    } else if (errors.length === 0) {
+      await verifyWindowsNetworkFence(hostPath, installationId, ownershipRoot, status.gatewayPort)
+    }
+  } else if (errors.length === 0) {
+    await verifyWindowsNetworkFence(hostPath, installationId, ownershipRoot, status.gatewayPort)
+  }
+  return { warnings: [], errors }
+}
+
+const powershellString = (value: string): string => `'${value.replaceAll("'", "''")}'`
+
+// ProcessStartInfo.Arguments uses Windows argv quoting, without a cmd.exe parsing layer.
+const windowsProcessArgument = (value: string): string =>
+  `"${value.replace(/(\\*)"/g, '$1$1\\"').replace(/(\\+)$/, '$1$1')}"`
+
+const windowsElevationScript = (
+  hostPath: string,
+  installationId: string,
+  ownershipRoot: string,
+  command: 'setup' | 'remove' | 'authorize-runtime-access',
+  args: readonly string[] = []
+): string =>
+  [
+    '[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)',
+    'try {',
+    '$start = [System.Diagnostics.ProcessStartInfo]::new()',
+    `$start.FileName = ${powershellString(hostPath)}`,
+    `$start.Arguments = ${powershellString([command, installationId, ownershipRoot, ...args].map(windowsProcessArgument).join(' '))}`,
+    '$start.UseShellExecute = $true',
+    "$start.Verb = 'runas'",
+    '$start.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden',
+    // Windows PowerShell Start-Process discards Win32Exception.NativeErrorCode on launch failure.
+    '$process = [System.Diagnostics.Process]::Start($start)',
+    '$process.WaitForExit()',
+    'exit $process.ExitCode',
+    '} catch {',
+    '$failure = $_.Exception',
+    'while ($null -ne $failure) { if ($failure -is [System.ComponentModel.Win32Exception] -and $failure.NativeErrorCode -eq 1223) { exit 1223 }; $failure = $failure.InnerException }',
+    '[Console]::Error.WriteLine($_.Exception.Message)',
+    'exit 1',
+    '}'
+  ].join('; ')
+
+const runHostCommand = async (
+  hostPath: string,
+  installationId: string,
+  ownershipRoot: string,
+  command: 'prepare-setup' | 'cancel-setup' | 'finish-setup' | 'prepare-remove' | 'finish-remove'
+): Promise<void> => {
+  const result = await runCapture(hostPath, [command, installationId, ownershipRoot])
+  if (result.code !== 0) {
+    throw new Error(result.stderr.trim() || `AppContainer host exited with code ${result.code}.`)
+  }
+}
+
+const runElevatedHostCommand = async (
+  hostPath: string,
+  installationId: string,
+  ownershipRoot: string,
+  command: 'setup' | 'remove' | 'authorize-runtime-access',
+  args: readonly string[] = []
+): Promise<{ cancelled: boolean }> => {
+  const script = windowsElevationScript(hostPath, installationId, ownershipRoot, command, args)
+  const encoded = Buffer.from(script, 'utf16le').toString('base64')
+  const result = await runCapture(systemPowerShell(), [
+    '-NoLogo',
+    '-NoProfile',
+    '-NonInteractive',
+    '-EncodedCommand',
+    encoded
+  ]).catch((error) => ({
+    code: null,
+    stdout: '',
+    stderr: error instanceof Error ? error.message : String(error)
+  }))
+  if (result.code === 0) return { cancelled: false }
+  if (result.code === 1223) {
+    return { cancelled: true }
+  }
+  throw new Error(
+    result.stderr.trim() || `Windows AppContainer ${command} exited with code ${result.code}.`
+  )
+}
+
+const installWindowsAppContainer = async (
+  hostPath: string,
+  installationId: string,
+  ownershipRoot: string
+): Promise<{ cancelled: boolean }> => {
+  await runHostCommand(hostPath, installationId, ownershipRoot, 'prepare-setup')
+  const elevated = await runElevatedHostCommand(hostPath, installationId, ownershipRoot, 'setup')
+  if (elevated.cancelled) {
+    await runHostCommand(hostPath, installationId, ownershipRoot, 'cancel-setup')
+    return elevated
+  }
+  await runHostCommand(hostPath, installationId, ownershipRoot, 'finish-setup')
+  return elevated
+}
+
+const removeWindowsAppContainer = async (
+  hostPath: string,
+  installationId: string,
+  ownershipRoot: string
+): Promise<{ cancelled: boolean }> => {
+  await runHostCommand(hostPath, installationId, ownershipRoot, 'prepare-remove')
+  const elevated = await runElevatedHostCommand(hostPath, installationId, ownershipRoot, 'remove')
+  if (elevated.cancelled) return elevated
+  await runHostCommand(hostPath, installationId, ownershipRoot, 'finish-remove')
+  return elevated
+}
+
+const getWindowsRuntimeAccess = async (
+  hostPath: string,
+  installationId: string,
+  ownershipRoot: string,
+  executable: string
+): Promise<{ authorized: boolean; registered: boolean }> => {
+  const status = await runCapture(hostPath, [
+    'runtime-access-status',
+    installationId,
+    ownershipRoot,
+    executable
+  ])
+  if (status.code !== 0)
+    throw new Error(status.stderr.trim() || 'Could not inspect R runtime access.')
+  const current: unknown = JSON.parse(status.stdout)
+  if (
+    !current ||
+    typeof current !== 'object' ||
+    typeof (current as { authorized?: unknown }).authorized !== 'boolean' ||
+    typeof (current as { registered?: unknown }).registered !== 'boolean'
+  ) {
+    throw new Error('AppContainer host returned invalid runtime access status.')
+  }
+  return current as { authorized: boolean; registered: boolean }
+}
+
+const runVerifiedRuntimeAccess = async (
+  hostPath: string,
+  installationId: string,
+  ownershipRoot: string,
+  verification: WindowsRuntimeVerification
+): Promise<{ cancelled: boolean }> => {
+  const ticket = randomBytes(32).toString('hex')
+  const child = spawn(
+    hostPath,
+    [
+      'verify-runtime-access',
+      installationId,
+      ownershipRoot,
+      ticket,
+      String(process.pid),
+      verification.argv[4]!
+    ],
+    { env: verification.env, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] }
+  )
+  let stderr = ''
+  let exited = false
+  const completion = new Promise<{ code: number | null; error?: Error }>((resolve) => {
+    child.stdout.resume()
+    child.stderr.setEncoding('utf8').on('data', (chunk: string) => {
+      stderr = (stderr + chunk).slice(-1024 * 1024)
+    })
+    child.once('error', (error) => {
+      exited = true
+      resolve({ code: null, error })
+    })
+    child.once('close', (code) => {
+      exited = true
+      resolve({ code })
+    })
+  })
+  const stop = (): void => {
+    if (!exited) child.kill()
+  }
+  verification.signal?.addEventListener('abort', stop, { once: true })
+  try {
+    if (!child.pid) {
+      const failure = await completion
+      throw failure.error ?? new Error('Could not start the R verification process.')
+    }
+    if (verification.signal?.aborted) return { cancelled: true }
+    let result: { cancelled: boolean }
+    try {
+      result = await runElevatedHostCommand(
+        hostPath,
+        installationId,
+        ownershipRoot,
+        'authorize-runtime-access',
+        [ticket, String(child.pid), String(process.pid)]
+      )
+    } catch (error) {
+      stop()
+      await completion
+      throw new Error(
+        [stderr.trim(), error instanceof Error ? error.message : String(error)]
+          .filter(Boolean)
+          .join('\n')
+      )
+    }
+    if (result.cancelled) return result
+    const verified = await completion
+    if (verified.error || verified.code !== 0)
+      throw verified.error ?? new Error(stderr.trim() || 'The contained R verification failed.')
+    return result
+  } finally {
+    verification.signal?.removeEventListener('abort', stop)
+    stop()
+    await completion
+  }
+}
+
+const setWindowsRuntimeAccess = async (
+  hostPath: string,
+  installationId: string,
+  ownershipRoot: string,
+  executable: string,
+  authorized: boolean,
+  verification?: WindowsRuntimeVerification
+): Promise<{ cancelled: boolean }> => {
+  const access = await getWindowsRuntimeAccess(hostPath, installationId, ownershipRoot, executable)
+  if (
+    verification &&
+    (!authorized ||
+      verification.argv.length !== 5 ||
+      verification.argv[0] !== hostPath ||
+      verification.argv[1] !== 'launch' ||
+      verification.argv[2] !== installationId ||
+      verification.argv[3] !== ownershipRoot)
+  )
+    throw new Error('R verification must use this installation’s contained launch.')
+  if (verification?.signal?.aborted) return { cancelled: true }
+  if ((authorized && access.authorized) || (!authorized && !access.registered)) {
+    if (verification) {
+      const result = await runCapture(hostPath, verification.argv.slice(1), {
+        env: verification.env,
+        signal: verification.signal,
+        timeout: 20_000,
+        maxBuffer: 1024 * 1024
+      })
+      if (result.code !== 0 || !result.stdout.includes('OPEN_SCIENCE_R_ACCESS_OK'))
+        throw new Error(result.stderr.trim() || 'The contained R verification failed.')
+    }
+    return { cancelled: false }
+  }
+  const prepared = await runCapture(hostPath, [
+    authorized
+      ? verification
+        ? 'prepare-verified-runtime-access'
+        : 'prepare-runtime-access'
+      : 'prepare-remove-runtime-access',
+    installationId,
+    ownershipRoot,
+    executable
+  ])
+  if (prepared.code !== 0)
+    throw new Error(prepared.stderr.trim() || 'Could not prepare R runtime access.')
+  if (verification) {
+    try {
+      const result = await runVerifiedRuntimeAccess(
+        hostPath,
+        installationId,
+        ownershipRoot,
+        verification
+      )
+      if (result.cancelled)
+        await runHostCommand(hostPath, installationId, ownershipRoot, 'cancel-setup')
+      return result
+    } catch (error) {
+      // Safe only after the helper/verifier have exited. Native cancellation refuses to discard
+      // a partially applied journal; failed rollback therefore remains repairable and visible.
+      try {
+        await runHostCommand(hostPath, installationId, ownershipRoot, 'cancel-setup')
+      } catch (cleanup) {
+        throw new Error(
+          `${error instanceof Error ? error.message : String(error)}\nR access repair is required: ${cleanup instanceof Error ? cleanup.message : String(cleanup)}`
+        )
+      }
+      throw error
+    }
+  }
+  const result = await runElevatedHostCommand(hostPath, installationId, ownershipRoot, 'setup')
+  if (result.cancelled) {
+    await runHostCommand(hostPath, installationId, ownershipRoot, 'cancel-setup')
+  } else {
+    await runHostCommand(hostPath, installationId, ownershipRoot, 'finish-setup')
+  }
+  return result
+}
+
+const createProcessTreeTerminationProof = (proofRoot: string): ProcessTreeTerminationProof => {
+  const token = randomUUID()
+  const path = join(proofRoot, `.open-science-process-tree-terminated-${token}.proof`)
+  const requestPath = `${path}.request`
+  let requestSent = false
+  let terminalState: WindowsProcessState | undefined
+  let requesting: Promise<boolean> | undefined
+  let confirming: Promise<WindowsProcessState> | undefined
+  const confirmState = (): Promise<WindowsProcessState> => {
+    if (terminalState) return Promise.resolve(terminalState)
+    if (confirming) return confirming
+    confirming = (async () => {
+      try {
+        const parse = (contents: string): WindowsProcessState => {
+          if (contents === token) return 'started-and-reaped'
+          try {
+            const value = JSON.parse(contents) as Record<string, unknown>
+            return value.version === 1 &&
+              value.token === token &&
+              (value.processState === 'never-started' ||
+                value.processState === 'started-and-reaped')
+              ? value.processState
+              : 'termination-unknown'
+          } catch {
+            return 'termination-unknown'
+          }
+        }
+        try {
+          const state = parse(await readFile(path, 'utf8'))
+          if (state !== 'termination-unknown') {
+            terminalState = state
+            // Keep the terminal proof until the owning receipt or sandbox cleanup settles. A
+            // restart may need this evidence if the owner dies after confirmation but before it
+            // publishes cleanup completion.
+            return state
+          }
+        } catch {
+          // The proof may not exist yet. Missing evidence never upgrades process state.
+        }
+        return 'termination-unknown'
+      } finally {
+        confirming = undefined
+      }
+    })()
+    return confirming
+  }
+  const request = (): Promise<boolean> => {
+    if (requesting) return requesting
+    requesting = (async () => {
+      if ((await confirmState()) !== 'termination-unknown') return true
+      // The supervisor is the only process allowed to publish started-and-reaped. Ask it to
+      // terminate its own Job before falling back to PID/tree teardown. This request is
+      // idempotent and token-bound by the launch-specific path.
+      if (!requestSent) {
+        requestSent = await writeFile(requestPath, token, { encoding: 'utf8' }).then(
+          () => true,
+          () => false
+        )
+        if (!requestSent) return false
+      }
+      // Give the original owner a bounded window to terminate its Job and publish proof. The
+      // caller may still use taskkill afterwards, but that fallback remains unverified.
+      for (let attempt = 0; attempt < 80; attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, 25))
+        if ((await confirmState()) !== 'termination-unknown') return true
+      }
+      return false
+    })().finally(() => {
+      requesting = undefined
+    })
+    return requesting
+  }
+  const release = async (): Promise<void> => {
+    await Promise.all([rm(path, { force: true }), rm(requestPath, { force: true })])
+  }
+  return {
+    path,
+    token,
+    confirmState,
+    request,
+    confirm: async () => (await confirmState()) !== 'termination-unknown',
+    requestPath,
+    release
+  }
+}
+
+const windowsLaunch = (
+  request: WindowsLaunchRequest
+): {
+  argv: string[]
+  env: NodeJS.ProcessEnv
+  processTreeProof: ProcessTreeProofMetadata
+  confirmProcessTreeTermination: () => Promise<boolean>
+  requestProcessTreeTermination: () => Promise<boolean>
+  confirmProcessState: () => Promise<WindowsProcessState>
+  releaseProcessTreeProof: () => Promise<void>
+} => {
+  const shell: WindowsShell =
+    typeof request.shell === 'object'
+      ? request.shell
+      : request.shell
+        ? { kind: 'cmd', path: request.shell }
+        : { kind: 'powershell', path: systemPowerShell() }
+  const childArgs =
+    shell.kind === 'powershell'
+      ? ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', request.command]
+      : ['/d', '/s', '/c', request.command]
+  const directInvocation = request.executable
+    ? WINDOWS_BATCH_FILE.test(request.executable)
+      ? windowsBatchInvocation(request.executable, request.args ?? [], request.env)
+      : { executable: request.executable, args: [...(request.args ?? [])] }
+    : { executable: shell.path, args: childArgs }
+  // The AppContainer launch is the one place where the Electron-as-Node child is created under
+  // the restricted token. Electron's NUL initialization can fail there; preserve the same args and
+  // environment everywhere else (including Python/R, ordinary shells, and standard-mode workers).
+  const policyArguments = applyElectronAsNodeLaunchPolicy({
+    platform: process.platform,
+    restricted: true,
+    electronAsNode:
+      request.executable !== undefined &&
+      !WINDOWS_BATCH_FILE.test(request.executable) &&
+      request.electronAsNode === true,
+    args: directInvocation.args
+  })
+  const policyInvocation = { ...directInvocation, args: [...policyArguments] }
+  const layout = normalizeFilesystemLayout(request.filesystem)
+  const proof = createProcessTreeTerminationProof(request.ownershipRoot)
+  const specification = Buffer.from(
+    JSON.stringify({
+      executable: policyInvocation.executable,
+      ...(request.windowsShellControlPipe
+        ? { shellControlPipe: request.windowsShellControlPipe }
+        : {}),
+      arguments: policyInvocation.args,
+      ...('verbatimArguments' in policyInvocation
+        ? { verbatimArguments: policyInvocation.verbatimArguments }
+        : {}),
+      cwd: request.cwd,
+      readOnlyRoots: layout.readOnlyRoots,
+      optionalReadOnlyRoots: layout.optionalReadOnlyRoots ?? [],
+      optionalReadWriteRoots: layout.optionalReadWriteRoots ?? [],
+      readWriteRoots: layout.readWriteRoots,
+      deniedReadRoots: layout.deniedReadRoots,
+      deniedWriteRoots: layout.deniedWriteRoots,
+      terminationProofPath: proof.path,
+      terminationProofToken: proof.token,
+      terminationRequestPath: proof.requestPath
+    }),
+    'utf8'
+  ).toString('base64url')
+  const env: NodeJS.ProcessEnv = {
+    ...request.env,
+    // CreateProcessW requires this base while applying AppContainer security capabilities. Windows
+    // maps it to the profile's isolated Packages/.../AC directory for the sandboxed child.
+    ...(request.env.LOCALAPPDATA === undefined && process.env.LOCALAPPDATA
+      ? { LOCALAPPDATA: process.env.LOCALAPPDATA }
+      : {}),
+    ...proxyEnvironment(request.gatewayPort, request.gatewayCredentials)
+  }
+  if (request.localRpcSocketPath) {
+    env.OPEN_SCIENCE_MCP_RPC_ENDPOINT = `http://${LOCAL_RPC_BROKER_HOST}/`
+    delete env.OPEN_SCIENCE_MCP_RPC_SOCKET_PATH
+  }
+  return {
+    argv: [
+      request.hostPath,
+      'launch',
+      request.installationId,
+      request.ownershipRoot,
+      specification
+    ],
+    env,
+    processTreeProof: { path: proof.path, token: proof.token, requestPath: proof.requestPath },
+    confirmProcessTreeTermination: proof.confirm,
+    requestProcessTreeTermination: proof.request,
+    confirmProcessState: proof.confirmState,
+    releaseProcessTreeProof: proof.release
+  }
+}
+
+const windowsStandardLaunch = (
+  request: WindowsStandardLaunchRequest
+): { argv: string[]; env: NodeJS.ProcessEnv } => {
+  const shell: WindowsShell =
+    typeof request.shell === 'object'
+      ? request.shell
+      : request.shell
+        ? { kind: 'cmd', path: request.shell }
+        : { kind: 'powershell', path: systemPowerShell() }
+  // PowerShell does not transparently relay a redirected stdin stream to a long-lived native child:
+  // a Notebook loop can observe EOF and exit before the executor writes its first protocol frame.
+  // Preserve structured native invocations in standard mode just as protected mode does. Batch
+  // shims still need a command shell, so retain the existing serialized-command path for them.
+  const argv =
+    request.executable && !WINDOWS_BATCH_FILE.test(request.executable)
+      ? [request.executable, ...(request.args ?? [])]
+      : shell.kind === 'powershell'
+        ? [shell.path, '-NoLogo', '-NoProfile', '-NonInteractive', '-Command', request.command]
+        : [shell.path, '/d', '/s', '/c', request.command]
+  const env = {
+    ...request.env,
+    ...proxyEnvironment(request.gatewayPort, request.gatewayCredentials)
+  }
+  if (request.localRpcSocketPath) {
+    env.OPEN_SCIENCE_MCP_RPC_ENDPOINT = `http://${LOCAL_RPC_BROKER_HOST}/`
+    delete env.OPEN_SCIENCE_MCP_RPC_SOCKET_PATH
+  }
+  return { argv, env }
+}
+
+const windowsSupervisedLaunch = (
+  request: WindowsSupervisedLaunchRequest
+): {
+  argv: string[]
+  env: NodeJS.ProcessEnv
+  processTreeProof: ProcessTreeProofMetadata
+  confirmProcessTreeTermination: () => Promise<boolean>
+  requestProcessTreeTermination: () => Promise<boolean>
+  confirmProcessState: () => Promise<WindowsProcessState>
+  releaseProcessTreeProof: () => Promise<void>
+} => {
+  // This path does not apply AppContainer capabilities or ACLs. It only asks the bundled host to
+  // contain an opted-in standard-mode worker and its helpers in a kill-on-close Job Object.
+  const direct = windowsStandardLaunch(request)
+  const [executable, ...args] = direct.argv
+  if (!executable) throw new Error('Windows supervisor received an empty command.')
+  const proof = createProcessTreeTerminationProof(request.ownershipRoot)
+  const specification = Buffer.from(
+    JSON.stringify({
+      executable,
+      arguments: args,
+      ...(request.windowsShellControlPipe
+        ? { shellControlPipe: request.windowsShellControlPipe }
+        : {}),
+      cwd: request.cwd,
+      readOnlyRoots: [],
+      readWriteRoots: [],
+      deniedReadRoots: [],
+      deniedWriteRoots: [],
+      terminationProofPath: proof.path,
+      terminationProofToken: proof.token,
+      terminationRequestPath: proof.requestPath
+    }),
+    'utf8'
+  ).toString('base64url')
+  return {
+    argv: [request.hostPath, 'supervise', specification],
+    env: direct.env,
+    processTreeProof: { path: proof.path, token: proof.token, requestPath: proof.requestPath },
+    confirmProcessTreeTermination: proof.confirm,
+    requestProcessTreeTermination: proof.request,
+    confirmProcessState: proof.confirmState,
+    releaseProcessTreeProof: proof.release
+  }
+}
+
+export {
+  applyElectronAsNodeLaunchPolicy,
+  ELECTRON_NO_STDIO_INIT,
+  checkWindowsAppContainer,
+  isWindowsProtectionConfigured,
+  preflightWindowsFilesystem,
+  connectionProbeSpecification,
+  installWindowsAppContainer,
+  setWindowsRuntimeAccess,
+  getWindowsRuntimeAccess,
+  removeWindowsAppContainer,
+  readAppContainerStatus,
+  loopbackPortAvailable,
+  windowsElevationScript,
+  windowsLaunch,
+  windowsSupervisedLaunch,
+  windowsStandardLaunch
+}
+export type {
+  AppContainerStatus,
+  WindowsAclPreflightRequest,
+  WindowsAclPreflightResult,
+  WindowsLaunchRequest,
+  WindowsShell,
+  WindowsStandardLaunchRequest,
+  WindowsRuntimeVerification
+}

@@ -1,0 +1,763 @@
+import { z } from 'zod'
+import { randomUUID } from 'node:crypto'
+import { realpath } from 'node:fs/promises'
+import { basename, isAbsolute, relative, resolve } from 'node:path'
+import { assertResearchSessionWritable } from '../storage/session-package-state'
+
+import type { JobStatusResult, SubmitJobResult } from '@aipoch/compute'
+import type {
+  ComputeCallError,
+  ComputeJob,
+  JobResult,
+  ExternalComputeMode
+} from '../../shared/compute'
+
+import { ComputeHostUnavailableError } from '@aipoch/compute'
+
+import type { ComputeConnectionBrokerAcquirer } from '@aipoch/compute/node'
+import { resolveNotebookStagedInputPath } from '../notebook/input-staging'
+import { getNotebookSessionRoot } from '../notebook/repository'
+import {
+  beginComputeJobFileEvidence,
+  cleanupComputeJobFileEvidence
+} from '../notebook/working-file-observer'
+import { encodeDataPath } from '../storage/data-path'
+import type { ComputeApprovalBroker } from './compute-approval-broker'
+
+import type { ConcurrencyManager, SessionStatus, StagedInputEntry } from '@aipoch/compute/node'
+import {
+  assertSafeInputDestination,
+  computeRemoteWorkdir,
+  createComputeExecution,
+  GLOB_CHARS,
+  hashCommand,
+  parseKubernetesResourceRequest,
+  hasLeadingSlurmDirective,
+  projectJobStatus,
+  SHELL_UNSAFE_CHARS,
+  SlurmDriverError,
+  validateComputeEnvironmentName,
+  validateHarvestConfig,
+  validateSlurmCommand,
+  type ComputeExecution
+} from '@aipoch/compute/node'
+import { dispatchComputeJob as dispatchJob } from './dispatch-evidence'
+import {
+  UnencryptedComputeJobPersistenceApprovalRequiredError,
+  type CreateJobRequest,
+  type ComputeJobRepository
+} from './job-repository'
+import { bindExternalJob, findExternalJobConfig } from './external-job-submission'
+import type { ComputeHostRepository } from './repository'
+import { listArchivedJobFiles } from './workspace-path'
+
+const COMMAND_PREVIEW_MAX_LEN = 120
+const JOB_MAX_TIMEOUT_SECONDS = 7 * 24 * 3600
+const JOB_DEFAULT_TIMEOUT_SECONDS = 24 * 3600
+const MODAL_DEFAULT_TIMEOUT_SECONDS = 4 * 3600
+const MODAL_MAX_TIMEOUT_SECONDS = 24 * 3600
+const TERMINAL_JOB_STATUSES: ReadonlySet<ComputeJob['status']> = new Set([
+  'success',
+  'failed',
+  'timeout',
+  'error'
+])
+
+export type RawInputSpec =
+  { src: string; dst_filename: string } | { remote_path: string; dst_filename?: string }
+
+export type ComputeJobReadScope = Readonly<{
+  projectId: string
+  sessionId: string
+  providerId: string
+}>
+
+export interface ArtifactResolver {
+  resolveArtifactPath(path: string, scope?: ComputeJobReadScope): Promise<string>
+}
+
+export const createComputeArtifactResolver = (
+  storageRoot: string,
+  resolveManagedArtifactPath: (path: string) => Promise<string>
+): ArtifactResolver => ({
+  resolveArtifactPath: async (path, scope) => {
+    if (scope) {
+      const staged = await resolveNotebookStagedInputPath(
+        storageRoot,
+        scope.projectId,
+        scope.sessionId,
+        path
+      )
+      if (staged) return staged
+      throw new Error('Compute input is not staged for the submitting Project and Session.')
+    }
+    return resolveManagedArtifactPath(path)
+  }
+})
+
+const assertBareName = (name: string, label: string): void => {
+  if (!name || name.includes('/') || name.includes('\\') || name === '.' || name === '..') {
+    throw new Error(
+      `dstFilename must be a bare filename with no path separators (got "${name}" for ${label})`
+    )
+  }
+}
+
+const resolveWorkspacePath = (workspaceCwd: string, srcPath: string): string => {
+  const resolved = resolve(workspaceCwd, srcPath)
+  const rel = relative(resolve(workspaceCwd), resolved)
+  if (rel.startsWith('..') || isAbsolute(rel)) {
+    throw new Error(`workspace path "${srcPath}" would escape the workspace root "${workspaceCwd}"`)
+  }
+  return resolved
+}
+
+export const resolveInputs = async (
+  rawInputs: RawInputSpec[],
+  workspaceCwd: string | undefined,
+  artifactResolver: ArtifactResolver | undefined,
+  scope?: ComputeJobReadScope
+): Promise<{ entries: StagedInputEntry[]; inputsSummary: string }> => {
+  const entries: StagedInputEntry[] = []
+  const summaryParts: string[] = []
+  const destinations = new Set<string>()
+
+  const reserveDestination = (dstFilename: string): void => {
+    assertSafeInputDestination(dstFilename)
+    if (destinations.has(dstFilename)) {
+      throw new Error(`dstFilename must be unique within a Compute Job (got "${dstFilename}")`)
+    }
+    destinations.add(dstFilename)
+  }
+
+  for (const raw of rawInputs) {
+    if ('remote_path' in raw) {
+      const remotePath = raw.remote_path
+      if (!remotePath.startsWith('/')) {
+        throw new Error(`remotePath must be an absolute path (got "${remotePath}")`)
+      }
+      if (GLOB_CHARS.test(remotePath)) {
+        throw new Error(`remotePath must not contain glob characters (got "${remotePath}")`)
+      }
+      if (SHELL_UNSAFE_CHARS.test(remotePath)) {
+        throw new Error(`remotePath must not contain shell-unsafe characters (got "${remotePath}")`)
+      }
+      const dstFilename = raw.dst_filename ?? basename(remotePath)
+      assertBareName(dstFilename, `remotePath "${remotePath}"`)
+      reserveDestination(dstFilename)
+      entries.push({
+        kind: 'symlink',
+        remotePath,
+        dstFilename,
+        label: remotePath
+      })
+      summaryParts.push(`${dstFilename} (symlink)`)
+      continue
+    }
+
+    const { src, dst_filename: dstFilename } = raw
+    assertBareName(dstFilename, `src "${src}"`)
+    reserveDestination(dstFilename)
+    if (isAbsolute(src)) {
+      if (!artifactResolver) {
+        throw new Error(`Cannot resolve artifact "${src}": ArtifactResolver is not available`)
+      }
+      const localPath = scope
+        ? await artifactResolver.resolveArtifactPath(src, scope)
+        : await artifactResolver.resolveArtifactPath(src)
+      entries.push({ kind: 'upload', localPath, dstFilename, label: src })
+    } else {
+      if (!workspaceCwd) {
+        throw new Error(`Cannot resolve workspace path "${src}": workspace_cwd is not available`)
+      }
+      const localPath = resolveWorkspacePath(workspaceCwd, src)
+      entries.push({ kind: 'upload', localPath, dstFilename, label: src })
+    }
+    summaryParts.push(dstFilename)
+  }
+
+  return {
+    entries,
+    inputsSummary:
+      entries.length === 0
+        ? ''
+        : `${entries.length} input${entries.length === 1 ? '' : 's'}: ${summaryParts.join(', ')}`
+  }
+}
+
+const queueFullError = (): Error & { computeCallError: ComputeCallError } => {
+  const message =
+    'Job queue is full (100 queued jobs). Wait for queued jobs to start running before submitting more.'
+  const error = new Error(message) as Error & { computeCallError: ComputeCallError }
+  error.computeCallError = {
+    error_code: 'queue_full',
+    message,
+    retry_after_user_action: false
+  }
+  return error
+}
+
+const externalOutputGlob = z
+  .string()
+  .min(1)
+  .refine(
+    (value) => value.trim().length > 0 && !value.startsWith('/') && !value.split('/').includes('..')
+  )
+const externalOutputs = z.array(
+  z.union([
+    externalOutputGlob,
+    z.strictObject({
+      glob: externalOutputGlob,
+      visibility: z.enum(['featured', 'hidden']).optional(),
+      residency: z.literal('remote').optional()
+    })
+  ])
+)
+
+export class ComputeJobWorkflowOwner {
+  constructor(
+    private readonly connectionBroker: ComputeConnectionBrokerAcquirer,
+    private readonly hostRepository: ComputeHostRepository,
+    private readonly approvalBroker: ComputeApprovalBroker | undefined,
+    private readonly jobRepository: ComputeJobRepository | undefined,
+    private readonly publishJobUpdated: ((job: ComputeJob) => void) | undefined,
+    private readonly artifactResolver: ArtifactResolver | undefined,
+    private readonly storageRoot: string | undefined,
+    private readonly concurrencyManager: ConcurrencyManager | undefined,
+    private readonly observeBackgroundDispatch?: (dispatch: Promise<void>) => void,
+    private readonly execution: ComputeExecution = createComputeExecution(),
+    private readonly wakeExternalJobs?: (mode: ExternalComputeMode) => void
+  ) {}
+
+  async submitJob(
+    providerId: string,
+    intent: string,
+    command: string,
+    options: {
+      environment?: string
+      resourceRequest?: string
+      inputs?: RawInputSpec[]
+      outputManifest?: string
+      harvestConfig?: string
+      timeoutSeconds?: number
+      workspaceCwd?: string
+    },
+    context: { sessionId: string; projectId: string; producerRunId?: string },
+    signal?: AbortSignal,
+    assertTargetEnabled?: () => Promise<void>
+  ): Promise<SubmitJobResult> {
+    if (this.storageRoot)
+      await assertResearchSessionWritable(this.storageRoot, context.projectId, context.sessionId)
+    if (!this.jobRepository) {
+      throw new Error('ComputeJobRepository is required to call submitJob.')
+    }
+
+    if (options.environment !== undefined) {
+      validateComputeEnvironmentName(options.environment)
+    }
+
+    if (options.harvestConfig !== undefined) {
+      let harvestConfig: unknown
+      try {
+        harvestConfig = JSON.parse(options.harvestConfig)
+      } catch {
+        throw new Error('harvest must be valid JSON.')
+      }
+      validateHarvestConfig(harvestConfig)
+    }
+
+    const configured = await findExternalJobConfig(this.hostRepository, providerId)
+    const host = configured
+      ? {
+          ...configured.settings,
+          shape: 'bridge_runner' as const,
+          executionMode: configured.mode,
+          scratchRoot: undefined
+        }
+      : await this.hostRepository.get(providerId)
+    if (!host) {
+      throw new Error(`No compute host found with provider id "${providerId}".`)
+    }
+    if (configured) {
+      if (
+        options.environment ||
+        (configured.mode !== 'kubernetes' && options.resourceRequest !== undefined) ||
+        hasLeadingSlurmDirective(command)
+      )
+        throw new Error('This target uses its configured execution environment and resources.')
+      if (configured.mode === 'kubernetes') parseKubernetesResourceRequest(options.resourceRequest)
+      if (options.inputs?.some((entry) => 'remote_path' in entry))
+        throw new Error('Remote inputs must refer to workspace files or artifacts.')
+      if (
+        options.outputManifest !== undefined &&
+        !externalOutputs.safeParse(JSON.parse(options.outputManifest)).success
+      )
+        throw new Error('Outputs require relative glob declarations.')
+      if (!this.storageRoot) throw new Error('Remote jobs require local artifact storage.')
+    } else if (host.executionMode === 'slurm') {
+      try {
+        validateSlurmCommand(command)
+      } catch (error) {
+        if (!(error instanceof SlurmDriverError)) throw error
+        const exposed = error as SlurmDriverError & { computeCallError: ComputeCallError }
+        exposed.computeCallError = {
+          error_code: 'invalid_resources',
+          message: error.message,
+          retry_after_user_action: true
+        }
+        throw exposed
+      }
+    } else if (hasLeadingSlurmDirective(command)) {
+      const message =
+        'This host uses Direct SSH. Choose Slurm in Compute settings to submit scheduler directives, or remove #SBATCH for intended direct execution.'
+      const error = new Error(message) as Error & { computeCallError: ComputeCallError }
+      error.computeCallError = {
+        error_code: 'invalid_resources',
+        message,
+        retry_after_user_action: true
+      }
+      throw error
+    }
+
+    const rawTimeout = options.timeoutSeconds
+    if (rawTimeout !== undefined) {
+      if (!Number.isFinite(rawTimeout)) {
+        const error = new Error(
+          `timeoutSeconds must be a finite number (got ${rawTimeout}).`
+        ) as Error & { computeCallError: ComputeCallError }
+        error.computeCallError = {
+          error_code: 'timeout',
+          message: 'timeoutSeconds must be a finite number. The Compute Job was not submitted.',
+          retry_after_user_action: false
+        }
+        throw error
+      }
+      if (!Number.isInteger(rawTimeout) || rawTimeout <= 0) {
+        const error = new Error(
+          `timeoutSeconds must be a positive integer (got ${rawTimeout}).`
+        ) as Error & { computeCallError: ComputeCallError }
+        error.computeCallError = {
+          error_code: 'timeout',
+          message: 'timeoutSeconds must be a positive integer. The Compute Job was not submitted.',
+          retry_after_user_action: false
+        }
+        throw error
+      }
+      if (configured?.mode === 'modal_sandbox' && rawTimeout > MODAL_MAX_TIMEOUT_SECONDS) {
+        const message = 'Modal Sandboxes support a maximum timeout of 24 hours.'
+        throw Object.assign(new Error(message), {
+          computeCallError: { error_code: 'timeout', message, retry_after_user_action: false }
+        })
+      }
+      if (rawTimeout > JOB_MAX_TIMEOUT_SECONDS) {
+        const error = new Error(
+          `timeoutSeconds ${rawTimeout} exceeds the 7-day maximum. The Compute Job was not submitted.`
+        ) as Error & { computeCallError: ComputeCallError }
+        error.computeCallError = {
+          error_code: 'timeout',
+          message: `timeoutSeconds exceeds the 7-day (${JOB_MAX_TIMEOUT_SECONDS}s) maximum. The Compute Job was not submitted.`,
+          retry_after_user_action: false
+        }
+        throw error
+      }
+    }
+    const timeoutSeconds =
+      rawTimeout ??
+      (configured?.mode === 'hugging_face_jobs'
+        ? configured.settings.timeoutSeconds
+        : configured?.mode === 'modal_sandbox'
+          ? MODAL_DEFAULT_TIMEOUT_SECONDS
+          : JOB_DEFAULT_TIMEOUT_SECONDS)
+
+    let stagedEntries: StagedInputEntry[] = []
+    let inputsSummary = ''
+    if (options.inputs && options.inputs.length > 0) {
+      const resolved = await resolveInputs(
+        options.inputs,
+        options.workspaceCwd,
+        this.artifactResolver,
+        { ...context, providerId }
+      )
+      stagedEntries = resolved.entries
+      inputsSummary = resolved.inputsSummary
+    }
+
+    const jobId = randomUUID()
+    const target = configured ? await bindExternalJob(configured, jobId, signal) : undefined
+    const remoteWorkdir = target?.workdir ?? computeRemoteWorkdir(host.scratchRoot, jobId)
+    if (this.concurrencyManager) {
+      const preview = await this.concurrencyManager.enqueue({
+        jobId,
+        sessionId: context.sessionId,
+        projectId: context.projectId,
+        providerId
+      })
+      if (preview === 'queue_full') throw queueFullError()
+    }
+
+    if (!this.approvalBroker) {
+      throw new Error('ComputeApprovalBroker is required to call submitJob.')
+    }
+    const approvalBroker = this.approvalBroker
+    const commandPreview =
+      command.length > COMMAND_PREVIEW_MAX_LEN
+        ? `${command.slice(0, COMMAND_PREVIEW_MAX_LEN)}…`
+        : command
+    const jobRepository = this.jobRepository
+    let evidenceCaptured = false
+    let rowCreated = false
+    let rowCreationAttempted = false
+    let initialStatus: 'submitted' | 'queued' = 'submitted'
+    const freezeInputs = async (): Promise<void> => {
+      if (!this.storageRoot) return
+      const uploads = stagedEntries.filter(
+        (entry): entry is Extract<StagedInputEntry, { kind: 'upload' }> => entry.kind === 'upload'
+      )
+      const frozen = await beginComputeJobFileEvidence({
+        storageRoot: this.storageRoot,
+        projectId: context.projectId,
+        sessionId: context.sessionId,
+        jobId,
+        producerRunId: context.producerRunId,
+        inputs: uploads.map((entry) => ({
+          localPath: entry.localPath,
+          dstFilename: entry.dstFilename,
+          label: entry.label
+        })),
+        signal
+      })
+      evidenceCaptured = true
+      const frozenByDestination = new Map(frozen.map((entry) => [entry.dstFilename, entry]))
+      const evidenceStorageRoot = await realpath(this.storageRoot)
+      stagedEntries = stagedEntries.map((entry) => {
+        if (entry.kind !== 'upload') return entry
+        const generation = frozenByDestination.get(entry.dstFilename)
+        if (!generation) throw new Error(`Compute input could not be frozen: ${entry.label}`)
+        return {
+          ...entry,
+          localPath: encodeDataPath(generation.frozenPath, evidenceStorageRoot)!,
+          generationId: generation.generationId,
+          checksum: generation.checksum,
+          sizeBytes: generation.sizeBytes
+        }
+      })
+    }
+
+    try {
+      if (target) await freezeInputs()
+      const approvalInfo = {
+        operation: 'submit_job' as const,
+        provider_id: host.providerId,
+        provider_name: host.displayName,
+        shape: host.shape,
+        intent,
+        command_preview: commandPreview,
+        command_full: command,
+        execution_mode: host.executionMode ?? 'direct_ssh',
+        environment: options.environment,
+        inputs_summary: inputsSummary || undefined,
+        resources: options.resourceRequest,
+        timeout_seconds: timeoutSeconds,
+        remote_workdir: remoteWorkdir,
+        ...target?.disclosure({
+          inputFiles: stagedEntries.map((entry) => {
+            if (entry.kind !== 'upload' || !entry.checksum || entry.sizeBytes === undefined)
+              throw new Error('Submission requires a frozen generation for each input.')
+            return {
+              source: entry.label,
+              destination: entry.dstFilename,
+              sizeBytes: entry.sizeBytes,
+              sha256: entry.checksum
+            }
+          }),
+          outputManifest: options.outputManifest,
+          harvestConfig: options.harvestConfig
+        })
+      }
+      const approvalContext = {
+        sessionId: context.sessionId,
+        projectId: context.projectId,
+        operation: 'submit_job' as const,
+        ownerId: host.id
+      }
+
+      const requestApproval = async (willPersistUnencrypted: boolean): Promise<void> => {
+        const decision = await approvalBroker.requestWithContext(
+          {
+            ...approvalInfo,
+            ...(willPersistUnencrypted ? { willPersistUnencrypted: true } : {})
+          },
+          approvalContext,
+          signal
+        )
+
+        if (decision === 'deny') {
+          const error = new Error(
+            `Job submission approval was denied for host "${host.displayName}".`
+          ) as Error & { computeCallError: ComputeCallError }
+          error.computeCallError = {
+            error_code: 'approval_denied',
+            message: `Approval denied for submit_job on ${host.displayName}.`,
+            retry_after_user_action: false
+          }
+          throw error
+        }
+      }
+
+      let allowUnencryptedPersistence = !this.jobRepository.isFieldProtectionAvailable()
+      await requestApproval(allowUnencryptedPersistence)
+      signal?.throwIfAborted()
+
+      if (!target) await freezeInputs()
+
+      const commandHash = hashCommand(command)
+      const inputManifest = stagedEntries.length > 0 ? JSON.stringify(stagedEntries) : undefined
+      let releaseDispatchHandoff: (() => void) | undefined
+      const createRow = async (initialStatus: 'submitted' | 'queued'): Promise<void> => {
+        signal?.throwIfAborted()
+        if (initialStatus === 'submitted') {
+          releaseDispatchHandoff = this.execution.holdDispatch(jobId)
+        }
+        const request: CreateJobRequest = {
+          id: jobId,
+          providerId: host.providerId,
+          shape: host.shape,
+          // Snapshot execution semantics so later Host edits cannot move an active Job between drivers.
+          executionMode: host.executionMode ?? 'direct_ssh',
+          sessionId: context.sessionId,
+          projectId: context.projectId,
+          intent,
+          command,
+          commandHash,
+          environment: options.environment,
+          resourceRequest: options.resourceRequest,
+          inputManifest,
+          producerRunId: context.producerRunId,
+          fileEvidence: {
+            schemaVersion: 1,
+            activityId: jobId,
+            activityKind: 'compute-job',
+            ...(context.producerRunId ? { parentActivityId: context.producerRunId } : {}),
+            state: 'unavailable',
+            scientificOutputCount: 0,
+            initialViewState: evidenceCaptured ? 'complete' : 'unavailable',
+            managedRootsFinalState: 'unavailable',
+            scientificOutputAnalysis: 'unavailable',
+            fileReads: 'unavailable',
+            externalPaths: 'unavailable',
+            writerAttribution: context.producerRunId ? 'complete' : 'unavailable',
+            reasonCodes: [
+              ...(context.producerRunId ? [] : ['compute-activity-lineage-missing' as const]),
+              'remote-output-not-harvested'
+            ]
+          },
+          outputManifest: options.outputManifest,
+          harvestConfig: options.harvestConfig,
+          timeoutSeconds,
+          remoteWorkdir,
+          initialStatus,
+          allowUnencryptedPersistence
+        }
+        if (target) await assertTargetEnabled?.()
+        signal?.throwIfAborted()
+        rowCreationAttempted = true
+        const created = target
+          ? await target.create(jobRepository, request)
+          : await jobRepository.create(request)
+        rowCreated = true
+        if (created) this.handleJobUpdated(created)
+      }
+
+      while (true) {
+        try {
+          if (this.concurrencyManager) {
+            const admitted = await this.concurrencyManager.admit(
+              { sessionId: context.sessionId, projectId: context.projectId, providerId },
+              createRow
+            )
+            if (admitted === 'queue_full') throw queueFullError()
+            initialStatus = admitted
+          } else {
+            await createRow('submitted')
+          }
+
+          if (initialStatus === 'submitted' && target) this.wakeExternalJobs?.(target.mode)
+          if (initialStatus === 'submitted' && !target) {
+            const dispatch = dispatchJob(jobId, {
+              connectionBroker: this.connectionBroker,
+              hostRepository: this.hostRepository,
+              jobRepository: this.jobRepository,
+              onJobUpdated: this.handleJobUpdated,
+              execution: this.execution,
+              storageRoot: this.storageRoot
+            })
+            this.observeBackgroundDispatch?.(dispatch)
+            void dispatch
+          }
+          break
+        } catch (error) {
+          if (
+            allowUnencryptedPersistence ||
+            !(error instanceof UnencryptedComputeJobPersistenceApprovalRequiredError)
+          ) {
+            throw error
+          }
+          await requestApproval(true)
+          allowUnencryptedPersistence = true
+        } finally {
+          releaseDispatchHandoff?.()
+          releaseDispatchHandoff = undefined
+        }
+      }
+    } catch (error) {
+      if (evidenceCaptured && !rowCreated && this.storageRoot) {
+        const rowDefinitelyAbsent =
+          !rowCreationAttempted ||
+          (await jobRepository
+            .get(jobId)
+            .then((job) => job === null)
+            .catch(() => false))
+        if (rowDefinitelyAbsent) {
+          await cleanupComputeJobFileEvidence({
+            storageRoot: this.storageRoot,
+            projectId: context.projectId,
+            sessionId: context.sessionId,
+            jobId
+          }).catch(() => undefined)
+        }
+      }
+      throw error
+    }
+
+    return {
+      job_id: jobId,
+      provider_id: host.providerId,
+      status: initialStatus,
+      remote_workdir: remoteWorkdir,
+      ...(initialStatus === 'queued' && this.concurrencyManager
+        ? {
+            queue_blocked_reason: await this.concurrencyManager.getQueueBlockedReason(
+              context.sessionId,
+              context.projectId
+            )
+          }
+        : {})
+    }
+  }
+
+  async getJobStatus(jobId: string, scope?: ComputeJobReadScope): Promise<JobStatusResult> {
+    const job = await this.getJob(jobId, scope)
+    return {
+      ...projectJobStatus(job, job.cancellation_status),
+      ...(job.queue_blocked_reason ? { queue_blocked_reason: job.queue_blocked_reason } : {})
+    }
+  }
+
+  async getJob(jobId: string, scope?: ComputeJobReadScope): Promise<ComputeJob> {
+    if (!this.jobRepository) {
+      throw new Error('ComputeJobRepository is required to read Compute Jobs.')
+    }
+    const job = await this.jobRepository.get(jobId)
+    if (!job) {
+      if (scope) throw new ComputeHostUnavailableError()
+      throw new Error(`No compute job found with id "${jobId}".`)
+    }
+    if (
+      scope &&
+      (job.project_id !== scope.projectId ||
+        job.session_id !== scope.sessionId ||
+        job.provider_id !== scope.providerId)
+    ) {
+      throw new ComputeHostUnavailableError()
+    }
+    return job.status === 'queued' && this.concurrencyManager
+      ? {
+          ...job,
+          queue_blocked_reason: await this.concurrencyManager.getQueueBlockedReason(
+            job.session_id,
+            job.project_id
+          )
+        }
+      : job
+  }
+
+  async getJobResult(jobId: string, scope?: ComputeJobReadScope): Promise<JobResult> {
+    const job = await this.getJob(jobId, scope)
+    const localOutputRoot = this.storageRoot
+      ? getNotebookSessionRoot(this.storageRoot, job.project_id, job.session_id)
+      : undefined
+
+    let leftOnRemote: Array<{ uri: string; size_mb: number; reason: string }> = []
+    if (job.left_on_remote) {
+      try {
+        leftOnRemote = JSON.parse(job.left_on_remote) as typeof leftOnRemote
+      } catch {
+        // Preserve the existing projection for malformed persisted JSON.
+      }
+    }
+
+    if (!TERMINAL_JOB_STATUSES.has(job.status) || !job.harvested_at) {
+      return jobResultWithFiles(job, localOutputRoot, [], [], [])
+    }
+    if (!this.storageRoot) {
+      return jobResultWithFiles(job, localOutputRoot, [], [], leftOnRemote)
+    }
+    if (job.harvest_error) {
+      return jobResultWithFiles(job, localOutputRoot, [], [], leftOnRemote)
+    }
+
+    const { featured_files, hidden_files } = await listArchivedJobFiles(job, this.storageRoot)
+    return jobResultWithFiles(job, localOutputRoot, featured_files, hidden_files, leftOnRemote)
+  }
+
+  async setSessionConcurrencyLimit(sessionId: string, limit: number): Promise<void> {
+    if (!this.concurrencyManager) {
+      throw new Error('ConcurrencyManager is required to set session concurrency limit.')
+    }
+    if (!Number.isInteger(limit) || limit < 1 || limit > 500) {
+      throw new Error(
+        `Session concurrency limit must be an integer in the range 1..500 (got ${limit}).`
+      )
+    }
+    await this.concurrencyManager.setSessionLimit(sessionId, limit)
+  }
+
+  async getSessionConcurrencyStatus(sessionId: string): Promise<SessionStatus> {
+    if (!this.concurrencyManager) {
+      throw new Error('ConcurrencyManager is required to get session concurrency status.')
+    }
+    const status = await this.concurrencyManager.getStatus(sessionId)
+    for (const host of await this.hostRepository.list()) {
+      if (!(host.providerId in status.provider_ceilings)) {
+        status.provider_ceilings[host.providerId] = host.concurrencyLimit ?? 10
+      }
+    }
+    return status
+  }
+
+  handleJobUpdated = (job: ComputeJob): void => {
+    if (this.concurrencyManager) this.concurrencyManager.handleJobUpdated(job)
+    else this.publishJobUpdated?.(job)
+  }
+}
+
+const jobResultWithFiles = (
+  job: ComputeJob,
+  localOutputRoot: string | undefined,
+  featuredFiles: string[],
+  hiddenFiles: string[],
+  leftOnRemote: Array<{ uri: string; size_mb: number; reason: string }>
+): JobResult => ({
+  ...(job.queue_blocked_reason ? { queue_blocked_reason: job.queue_blocked_reason } : {}),
+  ...(job.producer_run_id ? { producer_run_id: job.producer_run_id } : {}),
+  ...projectJobStatus(job),
+  ...(localOutputRoot ? { local_output_root: localOutputRoot } : {}),
+  featured_files: featuredFiles,
+  hidden_files: hiddenFiles,
+  output_files: [...featuredFiles, ...hiddenFiles],
+  left_on_remote: leftOnRemote,
+  remote_workdir: job.remote_workdir,
+  stdout_tail: job.stdout_tail,
+  stderr_tail: job.stderr_tail,
+  harvest_error: job.harvest_error
+})

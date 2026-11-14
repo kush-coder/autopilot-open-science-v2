@@ -1,0 +1,371 @@
+import { matchNotebookControlTool, resolveNotebookLanguage } from './notebook-tool-names'
+import { identityTranslate, type TranslateClause } from './workspace-translate-clause'
+
+export type ToolSummary = {
+  title: string
+  subtitle?: string
+  fields: Array<{ label: string; value: string; expandable?: boolean }>
+  rows?: Array<{ title: string; detail?: string; status?: string; error?: string }>
+  note?: string
+  error?: string
+}
+
+const record = (value: unknown): Record<string, unknown> | undefined =>
+  value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined
+
+const text = (value: unknown): string | undefined =>
+  typeof value === 'string' && value.trim() ? value : undefined
+const scalar = (value: unknown): string | undefined =>
+  text(value) ?? (typeof value === 'number' && Number.isFinite(value) ? String(value) : undefined)
+
+// Providers wrap the same MCP result in JSON text, content blocks or a bridge envelope.
+export const readNotebookToolResult = (
+  value: unknown,
+  depth = 0
+): Record<string, unknown> | undefined => {
+  if (depth > 5) return undefined
+  if (typeof value === 'string') {
+    try {
+      return readNotebookToolResult(JSON.parse(value), depth + 1)
+    } catch {
+      return undefined
+    }
+  }
+  const item = record(value)
+  if (!item) return undefined
+  if (
+    [
+      'kernelStatus',
+      'runtimes',
+      'bound',
+      'bindingChanged',
+      'status',
+      'packages',
+      'environments',
+      'created',
+      'removed'
+    ].some((key) => key in item) ||
+    text(item.error)
+  )
+    return item
+  for (const nested of [item.structuredContent, item.result]) {
+    const found = readNotebookToolResult(nested, depth + 1)
+    if (found) return found
+  }
+  if (Array.isArray(item.content)) {
+    for (const block of item.content) {
+      const found = readNotebookToolResult(record(block)?.text, depth + 1)
+      if (found) return found
+    }
+  }
+  return undefined
+}
+
+export const notebookInput = (value: unknown): Record<string, unknown> => {
+  const input = record(value) ?? {}
+  return record(input.arguments) ?? input
+}
+
+export type NotebookCodeReview = {
+  code: string
+  language: string
+  environment?: string
+  riskCount?: number
+  uncertain?: boolean
+  risks: Array<{ operation: string; source: string; line: number }>
+}
+
+// Callers validate host ownership before projecting the same evidence in approvals and receipts.
+export const readNotebookCodeReview = (rawInput: unknown): NotebookCodeReview | undefined => {
+  const input = notebookInput(rawInput)
+  const risk = notebookInput(input.notebookCodeRisk)
+  if (
+    typeof input.code !== 'string' ||
+    typeof risk.language !== 'string' ||
+    !['python', 'r', 'repl', 'bash'].includes(risk.language) ||
+    !Array.isArray(risk.risks) ||
+    !risk.risks.length ||
+    !risk.risks.every(
+      (finding) =>
+        finding &&
+        typeof finding.operation === 'string' &&
+        typeof finding.source === 'string' &&
+        Number.isInteger(finding.line) &&
+        finding.line > 0
+    )
+  )
+    return undefined
+  return {
+    code: input.code,
+    language: resolveNotebookLanguage(undefined, risk, input.code),
+    environment:
+      [risk.environment, risk.runtimeId]
+        .filter(
+          (value, index, values) => typeof value === 'string' && values.indexOf(value) === index
+        )
+        .join(' · ') || undefined,
+    riskCount:
+      typeof risk.riskCount === 'number' && Number.isSafeInteger(risk.riskCount)
+        ? Math.max(risk.riskCount, risk.risks.length)
+        : risk.risks.length,
+    uncertain: risk.risks.every((finding) =>
+      /\bdynamic\b|\bunresolved\b|analysis (?:limit|unavailable)|^(?:parse-error|parser-unavailable)$|\b(?:script|nested) execution\b/.test(
+        finding.operation.split(': ').at(-1) ?? finding.operation
+      )
+    ),
+    risks: risk.risks
+  }
+}
+
+const statusLabel = (value: unknown, t: TranslateClause): string | undefined => {
+  switch (value) {
+    case 'idle':
+      return t('Idle')
+    case 'active':
+      return t('Active')
+    case 'completed':
+      return t('Completed')
+    case 'failed':
+      return t('Failed')
+    case 'running':
+      return t('Running')
+    case 'restarted':
+      return t('Restarted')
+    case 'shutdown':
+      return t('Completed')
+    default:
+      return text(value)
+  }
+}
+
+export const isNotebookSummaryTool = (identity: string | undefined): boolean =>
+  [
+    'notebook_state',
+    'list_notebook_runtimes',
+    'notebook_bind_runtime',
+    'notebook_switch_runtime',
+    'notebook_restart',
+    'notebook_shutdown',
+    'inspect_packages',
+    'manage_environments'
+  ].includes(matchNotebookControlTool(identity) ?? '')
+
+export const buildNotebookToolSummary = (
+  identity: string | undefined,
+  rawInput: unknown,
+  result?: Record<string, unknown>,
+  t: TranslateClause = identityTranslate,
+  approval = false
+): ToolSummary | undefined => {
+  const tool = matchNotebookControlTool(identity)
+  if (!isNotebookSummaryTool(identity)) return undefined
+  const input = notebookInput(rawInput)
+  const fields: ToolSummary['fields'] = []
+  const field = (label: string, value: unknown, expandable = false): void => {
+    const formatted = scalar(value)
+    if (formatted !== undefined)
+      fields.push({ label, value: formatted, ...(expandable ? { expandable: true } : {}) })
+  }
+  const summary: ToolSummary = { title: '', fields, error: text(result?.error) }
+  const language = (value: unknown): string | undefined =>
+    value === 'r' ? 'R' : value === 'python' ? 'Python' : text(value)
+  if (tool === 'notebook_restart') {
+    summary.title = t('Restart notebook')
+    field(t('Status'), statusLabel(result?.status, t))
+    field(t('Kernel'), statusLabel(result?.kernelStatus, t))
+    field(t('Cells'), result?.cells)
+    if (approval) summary.note = t('Clears in-memory variables. Run history is preserved.')
+    else if (result?.status === 'restarted' && !summary.error)
+      summary.note = t('In-memory variables cleared. Run history preserved.')
+  } else if (tool === 'notebook_shutdown') {
+    summary.title = t('Shutdown notebook')
+    field(t('Status'), statusLabel(result?.status, t))
+    if (result?.status === 'shutdown' && !summary.error) summary.note = t('Notebook shut down.')
+  } else if (tool === 'inspect_packages') {
+    summary.title = t('Inspect packages')
+    field(t('Language'), language(result?.language ?? input.language))
+    field(t('Environment'), result?.environmentName)
+    field(t('Runtime source'), result?.runtimeSource)
+    field(t('Runtime'), result?.runtimeLabel)
+    const inventory = record(result?.inventory)
+    field(t('Captured at'), inventory?.capturedAt)
+    if (Array.isArray(result?.packages)) {
+      summary.rows = result.packages.slice(0, 50).flatMap((entry) => {
+        const pkg = record(entry)
+        if (!pkg) return []
+        return [
+          {
+            title: text(pkg.requested) ?? text(pkg.name) ?? t('Package'),
+            detail: [
+              text(pkg.version),
+              text(pkg.ecosystem),
+              text(pkg.loadedState),
+              text(pkg.versionStatus)
+            ]
+              .filter(Boolean)
+              .join(' · '),
+            status: text(pkg.status)
+          }
+        ]
+      })
+    }
+    if (Array.isArray(result?.warnings) && result.warnings.length)
+      summary.note = result.warnings
+        .filter((warning): warning is string => typeof warning === 'string')
+        .join(' ')
+  } else if (tool === 'manage_environments') {
+    summary.title = t('Manage environments')
+    if (approval) {
+      field(t('Action'), input.action)
+      field(t('Environment'), input.name)
+      field(t('Language'), language(input.language))
+      if (Array.isArray(input.packages)) {
+        const packages = input.packages.filter((pkg): pkg is string => typeof pkg === 'string')
+        if (packages.length) field(t('Packages'), packages.join(', '))
+      }
+    }
+    const created = record(result?.created)
+    const removed = record(result?.removed)
+    if (created) {
+      field(t('Environment'), created.name)
+      field(t('Language'), language(created.language))
+      field(t('Runtime'), created.runtimeId)
+      field(t('Status'), created.runnable === true ? t('Ready') : t('Unavailable'))
+      summary.note = text(created.detail)
+    } else if (removed) {
+      field(t('Environment'), removed.name)
+      summary.note = t('Removed')
+    } else {
+      field(t('Offset'), result?.offset)
+      if (Array.isArray(result?.environments)) {
+        summary.rows = result.environments.slice(0, 40).flatMap((entry) => {
+          const environment = record(entry)
+          if (!environment) return []
+          return [
+            {
+              title: text(environment.name) ?? t('Environment'),
+              detail: [language(environment.language), scalar(environment.sizeBytes)]
+                .filter(Boolean)
+                .join(' · '),
+              status:
+                environment.isDefault === true
+                  ? t('Default')
+                  : environment.ready === true
+                    ? t('Ready')
+                    : t('Unavailable')
+            }
+          ]
+        })
+      }
+    }
+  } else if (tool === 'notebook_bind_runtime' || tool === 'notebook_switch_runtime') {
+    const bound = record(result?.bound)
+    const target = record(result?.target)
+    summary.title =
+      tool === 'notebook_switch_runtime' ? t('Switch notebook runtime') : t('Bind notebook runtime')
+    if (approval && tool === 'notebook_switch_runtime')
+      summary.note = t(
+        'Clears memory in the selected language kernel. Other kernels are unaffected.'
+      )
+    summary.subtitle = text(bound?.label)
+    field(t('Language'), language(bound?.language ?? input.language))
+    field(t('Version'), bound?.version)
+    field(
+      t('Runtime source'),
+      bound?.source === 'managed'
+        ? t('Managed')
+        : bound?.source === 'external'
+          ? t('External')
+          : bound?.source
+    )
+    field(t('Status'), statusLabel(bound?.status, t))
+    field(t('Runtime'), bound?.runtimeId ?? target?.runtimeId ?? input.runtimeId, !approval)
+    if (result?.bindingChanged === true)
+      summary.note = t('The runtime binding changed despite the error.')
+  } else if (tool === 'list_notebook_runtimes') {
+    summary.title = t('Notebook runtimes')
+    if (approval) summary.note = t('Lists the notebook runtimes available to this conversation.')
+    field(t('Language'), language(input.language))
+    field(t('Limit'), input.limit)
+    field(t('Offset'), input.offset)
+    field(t('Total'), result?.runtimeCount)
+    if (Array.isArray(result?.runtimes)) {
+      summary.rows = result.runtimes.slice(0, 40).flatMap((entry) => {
+        const runtime = record(entry)
+        if (!runtime) return []
+        return [
+          {
+            title: text(runtime.label) ?? text(runtime.runtimeId) ?? t('Runtime'),
+            detail: [
+              language(runtime.language),
+              text(runtime.version),
+              runtime.source === 'managed'
+                ? t('Managed')
+                : runtime.source === 'external'
+                  ? t('External')
+                  : text(runtime.source)
+            ]
+              .filter(Boolean)
+              .join(' · '),
+            status: runtime.bound === true ? t('Bound') : statusLabel(runtime.status, t),
+            error:
+              runtime.runnable === false
+                ? (text(runtime.reason) ?? text(runtime.detail) ?? t('Unavailable'))
+                : undefined
+          }
+        ]
+      })
+      if (!result.runtimes.length) summary.note = t('No runtimes returned.')
+      else if (result.nextOffset !== undefined || result.runtimes.length > 40)
+        summary.note = t('More runtimes are available. See details for pagination.')
+    }
+  } else {
+    summary.title = t('Notebook state')
+    if (approval) summary.note = t('Reads the current notebook environment and runtime state.')
+    field(t('Kernel'), statusLabel(result?.kernelStatus, t))
+    field(t('Cells'), result?.cellCount)
+    field(t('Runs'), result?.runCount)
+    field(t('Environments'), result?.environmentCount)
+    if (Array.isArray(result?.environments)) {
+      for (const environment of result.environments.slice(0, 4)) {
+        const env = record(environment)
+        if (env)
+          field(
+            language(env.kind) ?? t('Environment'),
+            [text(env.environment), statusLabel(env.status, t)].filter(Boolean).join(' · ')
+          )
+      }
+    }
+    if (Array.isArray(result?.recentRuns)) {
+      summary.rows = result.recentRuns
+        .slice(-5)
+        .reverse()
+        .flatMap((entry) => {
+          const run = record(entry)
+          if (!run) return []
+          return [
+            {
+              title: text(run.cellId) ?? text(run.runId) ?? t('Notebook run'),
+              detail: [
+                language(run.kernelKind),
+                text(run.environment),
+                scalar(run.executionCount) ? `#${scalar(run.executionCount)}` : undefined
+              ]
+                .filter(Boolean)
+                .join(' · '),
+              status: statusLabel(run.status, t),
+              error: run.status === 'failed' ? text(run.outputPreview) : undefined
+            }
+          ]
+        })
+    }
+    if (
+      result?.historyCompacted === true ||
+      (Array.isArray(result?.recentRuns) && result.recentRuns.length > 5)
+    )
+      summary.note = t('Recent runs only. Full history is available in the Notebook preview.')
+  }
+  return summary
+}

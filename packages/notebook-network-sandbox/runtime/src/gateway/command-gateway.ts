@@ -1,0 +1,1596 @@
+import { NETWORK_APPROVAL_REQUIRED, NETWORK_UPSTREAM_FAILED } from './recovery-context.js'
+import { normalizeRequestedHost } from './address-policy.js'
+import { createServer as createHttpServer, request as httpRequest } from 'node:http'
+import { request as httpsRequest } from 'node:https'
+import { connect as connectTcp, createServer as createTcpServer, isIP, type Socket } from 'node:net'
+import { connect as connectTls, TLSSocket, type SecureContext } from 'node:tls'
+import { domainToASCII } from 'node:url'
+import { inspectReadRequest, MAX_HEADER_BYTES, MAX_TARGET_BYTES } from './read-request.js'
+import { timingSafeEqual } from 'node:crypto'
+import type { ClientRequest, IncomingHttpHeaders, IncomingMessage, ServerResponse } from 'node:http'
+
+// Parse routing authority separately: URL normalization must not rewrite resource names.
+const proxyRequestTarget = (request: IncomingMessage): { target: URL; path: string } => {
+  const raw = request.url ?? ''
+  if (!raw || /[^\x21-\x7e]|[#\\]/.test(raw)) throw new Error('Invalid request target')
+  const absolute = /^(https?):\/\/([^/?]+)(.*)$/i.exec(raw)
+  const authority = absolute?.[2] ?? request.headers.host
+  const scheme = absolute?.[1]?.toLowerCase() ?? 'http'
+  let path = absolute ? absolute[3] || '/' : raw
+  if (absolute && path.startsWith('?')) path = `/${path}`
+  if (!path.startsWith('/') && !(path === '*' && request.method === 'OPTIONS'))
+    throw new Error('Invalid request target')
+  if (!authority || /[\s/@?#\\]/.test(authority)) throw new Error('Invalid authority')
+  const target = new URL(`${scheme}://${authority}`)
+  if (!target.hostname || target.username || target.password || target.pathname !== '/')
+    throw new Error('Invalid authority')
+  return { target, path }
+}
+
+const isTlsClientHello = (value: Buffer): boolean =>
+  value.length >= 3 &&
+  value[0] === 0x16 &&
+  value[1] === 0x03 &&
+  value[2]! >= 0x01 &&
+  value[2]! <= 0x04
+
+const bridgeTlsTunnel = (client: Socket, upstream: Socket, initial: Buffer): void => {
+  let prefix = Buffer.alloc(0)
+  const reject = (): void => {
+    client.destroy()
+    upstream.destroy()
+  }
+  const inspect = (chunk: Buffer): void => {
+    prefix = Buffer.concat([prefix, chunk])
+    if (prefix.length < 3) {
+      client.once('data', inspect)
+      client.resume()
+      return
+    }
+    client.pause()
+    if (!isTlsClientHello(prefix)) {
+      reject()
+      return
+    }
+    const forward = (): void => {
+      if (!client.destroyed && !upstream.destroyed) client.pipe(upstream)
+    }
+    if (upstream.write(prefix)) forward()
+    else upstream.once('drain', forward)
+  }
+  upstream.once('error', reject)
+  client.once('end', () => upstream.end())
+  upstream.pipe(client)
+  inspect(initial)
+}
+
+const forwardResponse = (
+  upstream: ClientRequest,
+  request: IncomingMessage,
+  response: ServerResponse,
+  failureMessage: string,
+  onEnd?: () => void,
+  isCurrent: () => boolean = () => true
+): void => {
+  let incoming: IncomingMessage | undefined
+  const fail = (): void => {
+    upstream.destroy()
+    if (response.destroyed) return
+    if (response.headersSent) response.destroy()
+    else {
+      for (const name of response.getHeaderNames()) response.removeHeader(name)
+      response.writeHead(502, { connection: 'close', 'content-type': 'text/plain' })
+      response.end(failureMessage)
+    }
+  }
+  upstream.once('response', (message) => {
+    if (!isCurrent() || response.destroyed) {
+      upstream.destroy()
+      response.destroy()
+      return
+    }
+    incoming = message
+    message.once('error', () => response.destroy())
+    message.once('end', () => onEnd?.())
+    try {
+      response.writeHead(message.statusCode ?? 502, withoutConnectionHeaders(message.headers))
+    } catch {
+      fail()
+      return
+    }
+    message.pipe(response)
+  })
+  upstream.once('error', () => {
+    // The parser can reject excess bytes after a complete response, before its body drains.
+    if (!incoming?.complete) fail()
+  })
+  request.once('aborted', () => upstream.destroy())
+  request.once('error', () => upstream.destroy())
+  response.once('error', () => upstream.destroy())
+  response.once('close', () => upstream.destroy())
+  if (request.aborted || response.destroyed) upstream.destroy()
+}
+
+type GatewayDecision =
+  | Readonly<{ allowed: true; address: string }>
+  | Readonly<{
+      allowed: false
+      message?: string
+      source?: 'unknown' | 'explicit'
+      address?: string
+    }>
+
+type ParentProxySettings = Readonly<{
+  http?: string
+  https?: string
+  noProxy?: string
+  trustedCaCertificates?: readonly string[]
+}>
+
+type CommandGatewayOptions = Readonly<{
+  decide: (
+    host: string,
+    port: number,
+    purpose?: 'probe' | 'block',
+    canResume?: () => boolean,
+    protocol?: 'http' | 'https'
+  ) => Promise<GatewayDecision>
+  inspection?: Readonly<{
+    certificate: (host: string) => Promise<SecureContext>
+    isExecutionActive: () => boolean
+    trustedCaCertificates?: readonly string[]
+  }>
+  credentials: GatewayCredentials
+  localRpcSocketPath?: string
+  parentProxy?: ParentProxySettings
+  sharedPort?: number
+}>
+
+type GatewayCredentials = Readonly<{ username: string; password: string }>
+
+type ParentProxy = Readonly<{
+  http?: URL
+  https?: URL
+  noProxy: readonly string[]
+  ca?: readonly string[]
+}>
+
+type SocketReader = Readonly<{
+  receive: (needed: number) => Promise<Buffer>
+  remainder: () => Buffer
+}>
+
+type SharedIngressState = {
+  port: number
+  ingress: ReturnType<typeof createTcpServer>
+  gateways: Set<CommandGateway>
+  pendingConnections: Set<Socket>
+}
+
+let sharedIngress: SharedIngressState | undefined
+let sharedIngressOperation: Promise<void> = Promise.resolve()
+
+const sharedGatewayPortActive = (port: number): boolean => sharedIngress?.port === port
+
+const withSharedIngressLock = async <T>(operation: () => Promise<T>): Promise<T> => {
+  const previous = sharedIngressOperation
+  let release!: () => void
+  sharedIngressOperation = new Promise<void>((resolve) => (release = resolve))
+  await previous
+  try {
+    return await operation()
+  } finally {
+    release()
+  }
+}
+
+const socketReader = (client: Socket, initial: Buffer, pauseOnReceive = false): SocketReader => {
+  let buffered = initial
+  return {
+    receive: async (needed) => {
+      while (buffered.length < needed) {
+        const chunk = await new Promise<Buffer>((resolve, reject) => {
+          const onData = (value: Buffer): void => {
+            if (pauseOnReceive) client.pause()
+            cleanup()
+            resolve(value)
+          }
+          const onError = (error: Error): void => {
+            cleanup()
+            reject(error)
+          }
+          const onClose = (): void => {
+            cleanup()
+            reject(new Error('Gateway client closed.'))
+          }
+          const cleanup = (): void => {
+            client.removeListener('data', onData)
+            client.removeListener('error', onError)
+            client.removeListener('close', onClose)
+          }
+          client.once('data', onData)
+          client.once('error', onError)
+          client.once('close', onClose)
+          client.resume()
+        })
+        buffered = Buffer.concat([buffered, chunk])
+      }
+      const value = buffered.subarray(0, needed)
+      buffered = buffered.subarray(needed)
+      return value
+    },
+    remainder: () => buffered
+  }
+}
+
+const withoutConnectionHeaders = (headers: IncomingHttpHeaders): IncomingHttpHeaders => {
+  const result = { ...headers }
+  const named = String(headers.connection ?? '')
+    .split(',')
+    .map((name) => name.trim().toLowerCase())
+    .filter(Boolean)
+  for (const name of [
+    'connection',
+    'proxy-connection',
+    'keep-alive',
+    'proxy-authenticate',
+    'proxy-authorization',
+    'te',
+    'trailer',
+    'transfer-encoding',
+    'upgrade',
+    ...named
+  ]) {
+    delete result[name]
+  }
+  return result
+}
+
+const proxyCredentials = (url: URL): string | undefined => {
+  if (!url.username && !url.password) return undefined
+  const value = `${decodeURIComponent(url.username)}:${decodeURIComponent(url.password)}`
+  return `Basic ${Buffer.from(value).toString('base64')}`
+}
+
+const isSocksProxy = (url: URL): boolean =>
+  url.protocol === 'socks:' || url.protocol === 'socks4:' || url.protocol === 'socks5:'
+
+const defaultPort = (url: URL): number =>
+  Number(url.port || (isSocksProxy(url) ? 1080 : url.protocol === 'https:' ? 443 : 80))
+
+const urlHost = (address: string): string => (address.includes(':') ? `[${address}]` : address)
+
+const parseProxy = (settings: ParentProxySettings | undefined): ParentProxy | undefined => {
+  if (!settings?.http && !settings?.https) return undefined
+  const parse = (value: string | undefined): URL | undefined => {
+    if (!value) return undefined
+    const url = new URL(value)
+    if (
+      url.protocol !== 'http:' &&
+      url.protocol !== 'https:' &&
+      url.protocol !== 'socks:' &&
+      url.protocol !== 'socks4:' &&
+      url.protocol !== 'socks5:'
+    ) {
+      throw new Error(`Unsupported parent proxy protocol: ${url.protocol}`)
+    }
+    return url
+  }
+  return {
+    http: parse(settings.http),
+    https: parse(settings.https),
+    noProxy: (settings.noProxy ?? '')
+      .split(',')
+      .map((entry) => entry.trim().toLowerCase())
+      .filter(Boolean),
+    ...(settings.trustedCaCertificates?.length ? { ca: [...settings.trustedCaCertificates] } : {})
+  }
+}
+
+const bypassesProxy = (proxy: ParentProxy, host: string, port: number): boolean =>
+  proxy.noProxy.some((entry) => {
+    if (entry === '*') return true
+    const split = entry.lastIndexOf(':')
+    const hasPort = split > 0 && /^\d+$/.test(entry.slice(split + 1))
+    if (hasPort && Number(entry.slice(split + 1)) !== port) return false
+    const pattern = (hasPort ? entry.slice(0, split) : entry).replace(/^\./, '')
+    return host === pattern || host.endsWith(`.${pattern}`)
+  })
+
+const selectProxy = (
+  proxy: ParentProxy | undefined,
+  host: string,
+  port: number,
+  secureTarget: boolean
+): URL | undefined => {
+  if (!proxy || bypassesProxy(proxy, host, port)) return undefined
+  return secureTarget ? (proxy.https ?? proxy.http) : (proxy.http ?? proxy.https)
+}
+
+const waitForTcpConnection = (socket: Socket): Promise<Socket> =>
+  new Promise((resolve, reject) => {
+    const connected = (): void => {
+      socket.removeListener('error', failed)
+      resolve(socket)
+    }
+    const failed = (error: Error): void => {
+      socket.removeListener('connect', connected)
+      reject(error)
+    }
+    socket.once('connect', connected)
+    socket.once('error', failed)
+  })
+
+const connectProxySocket = (
+  url: URL,
+  ca: readonly string[] | undefined,
+  signal?: AbortSignal,
+  onSocket?: (socket: Socket) => void
+): Promise<Socket> => {
+  const options = { host: url.hostname, port: defaultPort(url), signal }
+  if (url.protocol !== 'https:') {
+    const socket = connectTcp(options)
+    onSocket?.(socket)
+    return waitForTcpConnection(socket)
+  }
+  return new Promise((resolve, reject) => {
+    const socket = connectTls({
+      ...options,
+      ca: ca ? [...ca] : undefined,
+      rejectUnauthorized: true
+    })
+    onSocket?.(socket)
+    const ready = (): void => {
+      socket.removeListener('error', failed)
+      resolve(socket)
+    }
+    const failed = (error: Error): void => {
+      socket.removeListener('secureConnect', ready)
+      reject(error)
+    }
+    socket.once('secureConnect', ready)
+    socket.once('error', failed)
+  })
+}
+
+const socks5Address = (address: string): Buffer => {
+  if (isIP(address) === 4) {
+    return Buffer.from([1, ...address.split('.').map(Number)])
+  }
+  const encoded = Buffer.from(address, 'ascii')
+  if (encoded.length > 255) throw new Error('SOCKS destination address is too long.')
+  // The policy layer already resolved and approved this value. Passing a numeric IPv6 address as a
+  // SOCKS domain avoids a second DNS lookup without carrying an IP parsing dependency.
+  return Buffer.concat([Buffer.from([3, encoded.length]), encoded])
+}
+
+const tunnelThroughSocks5 = async (
+  proxyUrl: URL,
+  address: string,
+  port: number,
+  signal?: AbortSignal,
+  onSocket?: (socket: Socket) => void
+): Promise<Socket> => {
+  const socket = await connectProxySocket(proxyUrl, undefined, signal, onSocket)
+  const reader = socketReader(socket, Buffer.alloc(0))
+  try {
+    socket.write(Buffer.from([5, 1, 0]))
+    const greeting = await reader.receive(2)
+    if (greeting[0] !== 5 || greeting[1] !== 0) {
+      throw new Error('Parent SOCKS5 proxy does not permit unauthenticated connections.')
+    }
+    const portBytes = Buffer.alloc(2)
+    portBytes.writeUInt16BE(port)
+    socket.write(Buffer.concat([Buffer.from([5, 1, 0]), socks5Address(address), portBytes]))
+    const response = await reader.receive(4)
+    if (response[0] !== 5 || response[1] !== 0) {
+      throw new Error(`Parent SOCKS5 proxy rejected the tunnel with status ${response[1] ?? 1}.`)
+    }
+    if (response[3] === 1) await reader.receive(4)
+    else if (response[3] === 4) await reader.receive(16)
+    else if (response[3] === 3) await reader.receive((await reader.receive(1))[0]!)
+    else throw new Error('Parent SOCKS5 proxy returned an invalid address type.')
+    await reader.receive(2)
+    const remainder = reader.remainder()
+    if (remainder.length) socket.unshift(remainder)
+    return socket
+  } catch (error) {
+    socket.destroy()
+    throw error
+  }
+}
+
+const tunnelThroughSocks4 = async (
+  proxyUrl: URL,
+  address: string,
+  port: number,
+  signal?: AbortSignal,
+  onSocket?: (socket: Socket) => void
+): Promise<Socket> => {
+  if (isIP(address) !== 4) {
+    throw new Error('Parent SOCKS4 proxy cannot route a non-IPv4 policy address.')
+  }
+  const socket = await connectProxySocket(proxyUrl, undefined, signal, onSocket)
+  const reader = socketReader(socket, Buffer.alloc(0))
+  try {
+    const portBytes = Buffer.alloc(2)
+    portBytes.writeUInt16BE(port)
+    socket.write(
+      Buffer.concat([
+        Buffer.from([4, 1]),
+        portBytes,
+        Buffer.from(address.split('.').map(Number)),
+        Buffer.from([0])
+      ])
+    )
+    const response = await reader.receive(8)
+    if (response[0] !== 0 || response[1] !== 0x5a) {
+      throw new Error(`Parent SOCKS4 proxy rejected the tunnel with status ${response[1] ?? 91}.`)
+    }
+    const remainder = reader.remainder()
+    if (remainder.length) socket.unshift(remainder)
+    return socket
+  } catch (error) {
+    socket.destroy()
+    throw error
+  }
+}
+
+const readHeader = (socket: Socket): Promise<{ header: string; remainder: Buffer }> =>
+  new Promise((resolve, reject) => {
+    let received = Buffer.alloc(0)
+    const onData = (chunk: Buffer): void => {
+      received = Buffer.concat([received, chunk])
+      const end = received.indexOf('\r\n\r\n')
+      if (end < 0) {
+        if (received.length > 64 * 1024) reject(new Error('Parent proxy response is too large.'))
+        return
+      }
+      cleanup()
+      resolve({
+        header: received.subarray(0, end + 4).toString('latin1'),
+        remainder: received.subarray(end + 4)
+      })
+    }
+    const onError = (error: Error): void => {
+      cleanup()
+      reject(error)
+    }
+    const onClose = (): void => {
+      cleanup()
+      reject(new Error('Parent proxy closed the tunnel handshake.'))
+    }
+    const cleanup = (): void => {
+      socket.removeListener('data', onData)
+      socket.removeListener('error', onError)
+      socket.removeListener('close', onClose)
+    }
+    socket.on('data', onData)
+    socket.once('error', onError)
+    socket.once('close', onClose)
+  })
+
+const readClientHttpHead = (socket: Socket, initial: Buffer): Promise<Buffer> =>
+  new Promise((resolve, reject) => {
+    let received = initial
+    const inspect = (): void => {
+      if (received.indexOf('\r\n\r\n') >= 0) {
+        cleanup()
+        resolve(received)
+      } else if (received.length > 64 * 1024) {
+        cleanup()
+        reject(new Error('Proxy request headers are too large.'))
+      }
+    }
+    const onData = (chunk: Buffer): void => {
+      received = Buffer.concat([received, chunk])
+      inspect()
+    }
+    const onError = (error: Error): void => {
+      cleanup()
+      reject(error)
+    }
+    const onClose = (): void => {
+      cleanup()
+      reject(new Error('Proxy client closed before sending request headers.'))
+    }
+    const cleanup = (): void => {
+      socket.removeListener('data', onData)
+      socket.removeListener('error', onError)
+      socket.removeListener('close', onClose)
+    }
+    socket.on('data', onData)
+    socket.once('error', onError)
+    socket.once('close', onClose)
+    inspect()
+  })
+
+const tunnelThroughProxy = async (
+  proxyUrl: URL,
+  address: string,
+  port: number,
+  ca: readonly string[] | undefined,
+  signal?: AbortSignal,
+  onSocket?: (socket: Socket) => void
+): Promise<Socket> => {
+  if (proxyUrl.protocol === 'socks4:')
+    return tunnelThroughSocks4(proxyUrl, address, port, signal, onSocket)
+  if (proxyUrl.protocol === 'socks:' || proxyUrl.protocol === 'socks5:') {
+    return tunnelThroughSocks5(proxyUrl, address, port, signal, onSocket)
+  }
+  if (!['http:', 'https:'].includes(proxyUrl.protocol))
+    throw new Error('Unsupported proxy protocol.')
+  const socket = await connectProxySocket(proxyUrl, ca, signal, onSocket)
+  const authority = `${urlHost(address)}:${port}`
+  const authorization = proxyCredentials(proxyUrl)
+  socket.write(
+    `CONNECT ${authority} HTTP/1.1\r\nHost: ${authority}\r\n${authorization ? `Proxy-Authorization: ${authorization}\r\n` : ''}Connection: keep-alive\r\n\r\n`
+  )
+  const response = await readHeader(socket).catch((error: unknown) => {
+    socket.destroy()
+    throw error
+  })
+  const status = /^HTTP\/\d(?:\.\d)?\s+(\d{3})/i.exec(response.header)?.[1]
+  if (status !== '200') {
+    socket.destroy()
+    throw new Error(`Parent proxy rejected the tunnel with status ${status ?? 'unknown'}.`)
+  }
+  if (response.remainder.length) socket.unshift(response.remainder)
+  return socket
+}
+
+const directSocket = (address: string, port: number, signal?: AbortSignal): Promise<Socket> =>
+  waitForTcpConnection(connectTcp({ host: address, port, signal }))
+
+const destinationSocket = (
+  parent: ParentProxy | undefined,
+  host: string,
+  address: string,
+  port: number,
+  protocol: 'http' | 'https',
+  signal?: AbortSignal
+): Promise<Socket> => {
+  const proxyUrl = selectProxy(parent, host, port, protocol === 'https')
+  return proxyUrl
+    ? tunnelThroughProxy(proxyUrl, address, port, parent?.ca, signal)
+    : directSocket(address, port, signal)
+}
+
+const rejectHttp = (response: ServerResponse, message: string): void => {
+  response.writeHead(403, { 'content-type': 'text/plain; charset=utf-8', connection: 'close' })
+  response.end(message)
+}
+
+const rejectSocket = (socket: Socket, message: string): void => {
+  socket.end(
+    `HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\nContent-Length: ${Buffer.byteLength(message)}\r\n\r\n${message}`
+  )
+}
+
+const rejectAuthentication = (response: ServerResponse): void => {
+  response.writeHead(407, {
+    'proxy-authenticate': 'Basic realm="Open-Science Notebook"',
+    connection: 'close'
+  })
+  response.end('Proxy authentication required.')
+}
+
+const rejectSocketAuthentication = (socket: Socket): void => {
+  socket.end(
+    'HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm="Open-Science Notebook"\r\nConnection: close\r\nContent-Length: 30\r\n\r\nProxy authentication required.'
+  )
+}
+
+const secureEqual = (actual: string, expected: string): boolean => {
+  const left = Buffer.from(actual)
+  const right = Buffer.from(expected)
+  return left.length === right.length && timingSafeEqual(left, right)
+}
+
+const parseAuthority = (
+  authority: string,
+  fallbackPort: number
+): { host: string; port: number } => {
+  if (!authority || /[\s/@?#\\]/.test(authority)) throw new Error('Malformed authority')
+  // Match CONNECT's default: URL normalizes an explicit default port to empty.
+  // Using http here would turn an explicit :80 into the 443 fallback.
+  const url = new URL(`https://${authority}`)
+  if (url.username || url.password || url.pathname !== '/' || url.search || url.hash)
+    throw new Error('Malformed authority')
+  const host = normalizeRequestedHost(url.hostname)
+  if (!host) throw new Error('Malformed authority')
+  return { host, port: Number(url.port || fallbackPort) }
+}
+
+const LOCAL_RPC_BROKER_HOST = 'open-science-notebook-rpc.invalid'
+
+const gatewayListenError = (error: NodeJS.ErrnoException, sharedPort?: number): Error => {
+  const target = sharedPort === undefined ? '127.0.0.1 (temporary port)' : `127.0.0.1:${sharedPort}`
+  const recovery =
+    sharedPort === undefined
+      ? 'Check local port restrictions or security software, then retry the Notebook cell.'
+      : 'Open Settings > Network, check Notebook network protection, and run Set up if required before retrying the Notebook cell.'
+  return Object.assign(
+    new Error(
+      `Notebook network gateway could not listen on ${target}. ${recovery}\n${error.message}`,
+      {
+        cause: error
+      }
+    ),
+    { code: error.code }
+  )
+}
+
+class CommandGateway {
+  readonly #options: CommandGatewayOptions
+  #parent: ParentProxy | undefined
+  readonly #connections = new Set<Socket>()
+  readonly #http = createHttpServer()
+  readonly #ingress = createTcpServer()
+  #inspections = 0
+  #active = true
+  #connectionGeneration = 0
+  #closePromise: Promise<void> | undefined
+  #port: number | undefined
+  #sharedIngress: SharedIngressState | undefined
+
+  private constructor(options: CommandGatewayOptions) {
+    this.#options = options
+    this.#parent = parseProxy(options.parentProxy)
+    this.#http.on('request', (request, response) => void this.#forwardHttp(request, response))
+    this.#http.on(
+      'connect',
+      (request, socket, head) => void this.#openConnect(request, socket as Socket, head)
+    )
+    this.#http.on('clientError', (_error, socket) => socket.destroy())
+    this.#ingress.on('connection', (socket) => this.#accept(socket))
+  }
+
+  static async open(options: CommandGatewayOptions): Promise<CommandGateway> {
+    const gateway = new CommandGateway(options)
+    if (options.sharedPort !== undefined) {
+      if (
+        !Number.isInteger(options.sharedPort) ||
+        options.sharedPort < 1 ||
+        options.sharedPort > 65535
+      ) {
+        throw new Error('Shared policy gateway port is invalid.')
+      }
+      await CommandGateway.#attachShared(gateway, options.sharedPort)
+      return gateway
+    }
+    const listen = (port: number): Promise<void> =>
+      new Promise((resolve, reject) => {
+        const failed = (error: Error): void => {
+          gateway.#ingress.removeListener('listening', ready)
+          reject(gatewayListenError(error))
+        }
+        const ready = (): void => {
+          gateway.#ingress.removeListener('error', failed)
+          resolve()
+        }
+        gateway.#ingress.once('error', failed)
+        gateway.#ingress.once('listening', ready)
+        gateway.#ingress.listen(port, '127.0.0.1')
+      })
+    await listen(0)
+    const address = gateway.#ingress.address()
+    if (!address || typeof address === 'string') throw new Error('Policy gateway did not bind TCP.')
+    gateway.#port = address.port
+    gateway.#ingress.unref()
+    return gateway
+  }
+
+  get port(): number {
+    if (this.#port === undefined) throw new Error('Policy gateway is not listening.')
+    return this.#port
+  }
+
+  updateParentProxy(settings: ParentProxySettings | undefined): void {
+    this.#parent = parseProxy(settings)
+  }
+
+  resetConnections(): void {
+    this.#connectionGeneration += 1
+    for (const socket of this.#connections) socket.destroy()
+  }
+
+  close(): Promise<void> {
+    if (this.#closePromise) return this.#closePromise
+    this.#active = false
+    this.#closePromise = this.#close()
+    return this.#closePromise
+  }
+
+  async #close(): Promise<void> {
+    this.resetConnections()
+    if (this.#sharedIngress) {
+      const state = this.#sharedIngress
+      this.#sharedIngress = undefined
+      await withSharedIngressLock(async () => {
+        state.gateways.delete(this)
+        if (state.gateways.size > 0 || sharedIngress !== state) return
+        sharedIngress = undefined
+        for (const socket of state.pendingConnections) socket.destroy()
+        await new Promise<void>((resolve) => state.ingress.close(() => resolve()))
+      })
+      return
+    }
+    await new Promise<void>((resolve) => this.#ingress.close(() => resolve()))
+  }
+
+  static async #attachShared(gateway: CommandGateway, port: number): Promise<void> {
+    await withSharedIngressLock(async () => {
+      if (!sharedIngress) {
+        const ingress = createTcpServer()
+        const state: SharedIngressState = {
+          port,
+          ingress,
+          gateways: new Set(),
+          pendingConnections: new Set()
+        }
+        ingress.on('connection', (socket) => CommandGateway.#routeShared(state, socket))
+        await new Promise<void>((resolve, reject) => {
+          const failed = (error: Error): void => reject(gatewayListenError(error, port))
+          ingress.once('error', failed)
+          ingress.listen(port, '127.0.0.1', () => {
+            ingress.removeListener('error', failed)
+            resolve()
+          })
+        })
+        ingress.unref()
+        sharedIngress = state
+      }
+      if (sharedIngress.port !== port) {
+        throw new Error('Notebook shared policy gateway port does not match the active listener.')
+      }
+      sharedIngress.gateways.add(gateway)
+      gateway.#sharedIngress = sharedIngress
+      gateway.#port = port
+    })
+  }
+
+  static #routeShared(state: SharedIngressState, socket: Socket): void {
+    state.pendingConnections.add(socket)
+    socket.once('close', () => state.pendingConnections.delete(socket))
+    socket.once('error', () => socket.destroy())
+    socket.once('data', (first: Buffer) => {
+      if (first[0] === 0x05) void CommandGateway.#routeSharedSocks(state, socket, first)
+      else void CommandGateway.#routeSharedHttp(state, socket, first)
+    })
+  }
+
+  static async #routeSharedHttp(
+    state: SharedIngressState,
+    socket: Socket,
+    first: Buffer
+  ): Promise<void> {
+    try {
+      const request = await readClientHttpHead(socket, first)
+      const authorization = request
+        .toString('latin1')
+        .match(/(?:^|\r\n)proxy-authorization:\s*([^\r\n]+)/i)?.[1]
+      const gateway = [...state.gateways].find((candidate) =>
+        candidate.#authenticated(authorization)
+      )
+      if (!gateway || !state.gateways.has(gateway)) {
+        rejectSocketAuthentication(socket)
+        return
+      }
+      state.pendingConnections.delete(socket)
+      if (!gateway.#trackConnection(socket)) return
+      socket.unshift(request)
+      gateway.#http.emit('connection', socket)
+    } catch {
+      socket.destroy()
+    }
+  }
+
+  static async #routeSharedSocks(
+    state: SharedIngressState,
+    client: Socket,
+    first: Buffer
+  ): Promise<void> {
+    const reader = socketReader(client, first)
+    try {
+      const greeting = await reader.receive(2)
+      if (greeting[0] !== 5) throw new Error('Unsupported SOCKS version.')
+      const methods = await reader.receive(greeting[1]!)
+      if (!methods.includes(2)) {
+        client.end(Buffer.from([5, 0xff]))
+        return
+      }
+      client.write(Buffer.from([5, 2]))
+      const authHeader = await reader.receive(2)
+      if (authHeader[0] !== 1) throw new Error('Unsupported SOCKS authentication version.')
+      const username = (await reader.receive(authHeader[1]!)).toString('utf8')
+      const passwordLength = (await reader.receive(1))[0]!
+      const password = (await reader.receive(passwordLength)).toString('utf8')
+      const gateway = [...state.gateways].find((candidate) =>
+        candidate.#matchesCredentials(username, password)
+      )
+      const authenticated = gateway !== undefined && state.gateways.has(gateway)
+      client.write(Buffer.from([1, authenticated ? 0 : 1]))
+      if (!gateway || !authenticated) {
+        client.end()
+        return
+      }
+      state.pendingConnections.delete(client)
+      if (!gateway.#trackConnection(client)) return
+      await gateway.#serveSocksRequest(client, reader)
+    } catch {
+      if (!client.destroyed) client.end(Buffer.from([5, 1, 0, 1, 0, 0, 0, 0, 0, 0]))
+    }
+  }
+
+  #accept(socket: Socket): void {
+    if (!this.#trackConnection(socket)) return
+    socket.once('data', (first: Buffer) => {
+      if (first[0] === 0x05) {
+        void this.#serveSocks(socket, first)
+      } else {
+        socket.unshift(first)
+        this.#http.emit('connection', socket)
+      }
+    })
+  }
+
+  #trackConnection(socket: Socket): boolean {
+    if (!this.#active) {
+      socket.destroy()
+      return false
+    }
+    this.#connections.add(socket)
+    socket.once('error', () => socket.destroy())
+    socket.once('close', () => this.#connections.delete(socket))
+    return true
+  }
+
+  async #authorize(
+    host: string,
+    port: number,
+    generation: number,
+    purpose: 'probe' | 'block' = 'block',
+    connectionAlive: () => boolean = () => true,
+    protocol: 'http' | 'https' = 'https'
+  ): Promise<GatewayDecision> {
+    const canResume = (): boolean =>
+      this.#active && generation === this.#connectionGeneration && connectionAlive()
+    try {
+      const decision = await this.#options.decide(host, port, purpose, canResume, protocol)
+      if (!canResume()) {
+        return { allowed: false, message: 'OPEN_SCIENCE_NETWORK_POLICY_BLOCKED' }
+      }
+      return decision
+    } catch {
+      return { allowed: false, message: 'OPEN_SCIENCE_NETWORK_POLICY_BLOCKED' }
+    }
+  }
+
+  async #bridgeClassifiedTunnel(
+    client: Socket,
+    host: string,
+    port: number,
+    initial: Buffer,
+    generation: number,
+    responseSent: boolean,
+    response: 'connect' | 'socks'
+  ): Promise<void> {
+    // CONNECT and SOCKS carry no scheme. Classify the actual application bytes; never infer
+    // protocol from the destination port.
+    const reader = socketReader(client, initial, true)
+    client.setTimeout(10_000, () => client.destroy())
+    try {
+      const prefix = await reader.receive(3)
+      const protocol: 'http' | 'https' | undefined = isTlsClientHello(prefix)
+        ? 'https'
+        : /^[A-Z]{3}$/.test(prefix.toString('ascii'))
+          ? 'http'
+          : undefined
+      if (!protocol) {
+        client.destroy()
+        return
+      }
+      let buffered: Buffer
+      if (protocol === 'http') {
+        let line = prefix
+        while (!line.includes('\r\n') && line.length < 8192)
+          line = Buffer.concat([line, await reader.receive(1)])
+        if (!/^[A-Z]+ [^\r\n ]+ HTTP\/1\.[01]\r\n$/.test(line.toString('latin1'))) {
+          client.destroy()
+          return
+        }
+        buffered = Buffer.concat([line, reader.remainder()])
+      } else buffered = Buffer.concat([prefix, reader.remainder()])
+
+      client.pause()
+      client.setTimeout(0)
+      let decision = await this.#authorize(
+        host,
+        port,
+        generation,
+        protocol === 'https' && this.#options.inspection ? 'probe' : 'block',
+        () => !client.destroyed,
+        protocol
+      )
+      if (!decision.allowed) {
+        if (
+          protocol === 'https' &&
+          port === 443 &&
+          !isIP(host) &&
+          decision.source === 'unknown' &&
+          this.#options.inspection
+        ) {
+          await this.#inspectConnect(host, client, buffered, generation, responseSent)
+          return
+        }
+        if (protocol === 'https' && this.#options.inspection) {
+          decision = await this.#authorize(
+            host,
+            port,
+            generation,
+            'block',
+            () => !client.destroyed,
+            protocol
+          )
+        }
+        if (!decision.allowed) {
+          client.destroy()
+          return
+        }
+      }
+      const lifetime = new AbortController()
+      client.once('close', () => lifetime.abort())
+      const upstream = await destinationSocket(
+        this.#parent,
+        host,
+        decision.address,
+        port,
+        protocol,
+        lifetime.signal
+      )
+      client.once('close', () => upstream.destroy())
+      upstream.once('close', () => client.destroy())
+      if (
+        !this.#active ||
+        generation !== this.#connectionGeneration ||
+        client.destroyed ||
+        !this.#trackConnection(upstream)
+      ) {
+        upstream.destroy()
+        client.destroy()
+        return
+      }
+      client.setTimeout(0)
+      if (!responseSent) {
+        client.write(
+          response === 'connect'
+            ? 'HTTP/1.1 200 Connection Established\r\n\r\n'
+            : Buffer.from([5, 0, 0, 1, 0, 0, 0, 0, 0, 0])
+        )
+      }
+      if (protocol === 'http') {
+        if (buffered.length) upstream.write(buffered)
+        client.pipe(upstream).pipe(client)
+      } else bridgeTlsTunnel(client, upstream, buffered)
+    } catch {
+      client.destroy()
+    }
+  }
+
+  #authenticated(header: string | string[] | undefined): boolean {
+    if (!this.#active) return false
+    if (typeof header !== 'string' || !header.startsWith('Basic ')) return false
+    let supplied: string
+    try {
+      supplied = Buffer.from(header.slice(6), 'base64').toString('utf8')
+    } catch {
+      return false
+    }
+    return secureEqual(
+      supplied,
+      `${this.#options.credentials.username}:${this.#options.credentials.password}`
+    )
+  }
+
+  #matchesCredentials(username: string, password: string): boolean {
+    return (
+      this.#active &&
+      secureEqual(username, this.#options.credentials.username) &&
+      secureEqual(password, this.#options.credentials.password)
+    )
+  }
+
+  async #forwardHttp(request: IncomingMessage, response: ServerResponse): Promise<void> {
+    const generation = this.#connectionGeneration
+    if (!this.#authenticated(request.headers['proxy-authorization'])) {
+      rejectAuthentication(response)
+      return
+    }
+    let target: URL
+    let path: string
+    try {
+      ;({ target, path } = proxyRequestTarget(request))
+    } catch {
+      rejectHttp(response, 'OPEN_SCIENCE_NETWORK_POLICY_BLOCKED: malformed proxy request')
+      return
+    }
+    if (target.hostname === LOCAL_RPC_BROKER_HOST) {
+      this.#forwardLocalRpc(request, response, target, path)
+      return
+    }
+    const port = defaultPort(target)
+    const decision = await this.#authorize(
+      target.hostname,
+      port,
+      generation,
+      'block',
+      () => !response.destroyed && !request.socket.destroyed,
+      target.protocol === 'https:' ? 'https' : 'http'
+    )
+    if (!decision.allowed) {
+      rejectHttp(response, decision.message ?? 'OPEN_SCIENCE_NETWORK_POLICY_BLOCKED')
+      return
+    }
+    const proxyUrl = selectProxy(this.#parent, target.hostname, port, target.protocol === 'https:')
+    const routedTarget = new URL(target.href)
+    routedTarget.hostname = urlHost(decision.address)
+    const headers = withoutConnectionHeaders(request.headers)
+    headers.host = target.host
+    if (proxyUrl && !isSocksProxy(proxyUrl)) {
+      const credentials = proxyCredentials(proxyUrl)
+      if (credentials) headers['proxy-authorization'] = credentials
+    }
+    if (proxyUrl && isSocksProxy(proxyUrl)) {
+      try {
+        const tunnel = await tunnelThroughProxy(proxyUrl, decision.address, port, undefined)
+        if (!this.#active || generation !== this.#connectionGeneration) {
+          tunnel.destroy()
+          response.destroy()
+          return
+        }
+        const connection =
+          target.protocol === 'https:'
+            ? await new Promise<Socket>((resolve, reject) => {
+                const tls = connectTls({
+                  socket: tunnel,
+                  servername: target.hostname,
+                  ca: this.#parent?.ca ? [...this.#parent.ca] : undefined
+                })
+                tls.once('secureConnect', () => resolve(tls))
+                tls.once('error', reject)
+              })
+            : tunnel
+        if (!this.#trackConnection(connection)) {
+          response.destroy()
+          return
+        }
+        const send = target.protocol === 'https:' ? httpsRequest : httpRequest
+        const upstream = send({
+          // Without an agent, Node uses this socket directly; agent:false creates an Agent
+          // that ignores this callback and opens a different connection.
+          createConnection: () => connection,
+          method: request.method,
+          path,
+          headers
+        })
+        forwardResponse(
+          upstream,
+          request,
+          response,
+          'Policy gateway could not reach the destination.'
+        )
+        request.pipe(upstream)
+      } catch (error) {
+        if (!response.headersSent) response.writeHead(502, { 'content-type': 'text/plain' })
+        response.end(
+          `Policy gateway could not reach the destination: ${error instanceof Error ? error.message : String(error)}`
+        )
+      }
+      return
+    }
+    const send = (proxyUrl?.protocol ?? target.protocol) === 'https:' ? httpsRequest : httpRequest
+    const upstream = send(
+      proxyUrl
+        ? {
+            hostname: proxyUrl.hostname,
+            port: defaultPort(proxyUrl),
+            method: request.method,
+            path: `${routedTarget.origin}${path === '*' ? '' : path}`,
+            headers,
+            ca: this.#parent?.ca ? [...this.#parent.ca] : undefined
+          }
+        : {
+            hostname: decision.address,
+            port,
+            method: request.method,
+            path,
+            headers,
+            ...(target.protocol === 'https:' ? { servername: target.hostname } : {})
+          }
+    )
+    forwardResponse(upstream, request, response, 'Policy gateway could not reach the destination.')
+    request.pipe(upstream)
+  }
+
+  #forwardLocalRpc(
+    request: IncomingMessage,
+    response: ServerResponse,
+    target: URL,
+    path: string
+  ): void {
+    const socketPath = this.#options.localRpcSocketPath
+    if (!socketPath || target.protocol !== 'http:' || defaultPort(target) !== 80) {
+      rejectHttp(response, 'OPEN_SCIENCE_NETWORK_POLICY_BLOCKED: local RPC route unavailable')
+      return
+    }
+    const headers = withoutConnectionHeaders(request.headers)
+    headers.host = 'localhost'
+    const upstream = httpRequest({
+      socketPath,
+      method: request.method,
+      path,
+      headers
+    })
+    forwardResponse(upstream, request, response, 'Policy gateway could not reach the destination.')
+    request.pipe(upstream)
+  }
+
+  async #openConnect(request: IncomingMessage, client: Socket, head: Buffer): Promise<void> {
+    const generation = this.#connectionGeneration
+    if (!this.#authenticated(request.headers['proxy-authorization'])) {
+      rejectSocketAuthentication(client)
+      return
+    }
+    let destination: { host: string; port: number }
+    try {
+      destination = parseAuthority(request.url ?? '', 443)
+    } catch {
+      rejectSocket(client, 'OPEN_SCIENCE_NETWORK_POLICY_BLOCKED: malformed CONNECT target')
+      return
+    }
+    destination.host = isIP(destination.host)
+      ? destination.host
+      : domainToASCII(destination.host.replace(/\.$/, '').toLowerCase())
+    // This acknowledges only the proxy handshake; no upstream is opened before classification.
+    client.write('HTTP/1.1 200 Connection Established\r\n\r\n')
+    await this.#bridgeClassifiedTunnel(
+      client,
+      destination.host,
+      destination.port,
+      head,
+      generation,
+      true,
+      'connect'
+    )
+  }
+
+  #inspectionActive(generation: number, client: Socket): boolean {
+    return (
+      this.#active &&
+      generation === this.#connectionGeneration &&
+      !client.destroyed &&
+      this.#options.inspection?.isExecutionActive() === true
+    )
+  }
+
+  async #inspectConnect(
+    host: string,
+    client: Socket,
+    head: Buffer,
+    generation: number,
+    responseSent = false
+  ): Promise<void> {
+    const inspection = this.#options.inspection!
+    if (!this.#inspectionActive(generation, client)) {
+      rejectSocket(client, 'OPEN_SCIENCE_NETWORK_POLICY_BLOCKED')
+      return
+    }
+    if (this.#inspections >= 4) {
+      client.end(
+        'HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n'
+      )
+      return
+    }
+    this.#inspections += 1
+    let released = false
+    const release = (): void => {
+      if (!released) {
+        released = true
+        this.#inspections -= 1
+      }
+    }
+    client.once('close', release)
+    const lifetime = new AbortController()
+    client.once('close', () => lifetime.abort())
+    let handshakeComplete = false
+    let malformed = false
+    let sawRequest = false
+    let resourceTimeout = false
+    let recordedBlock = false
+    let tls: TLSSocket | undefined
+    const expire = (): void => {
+      resourceTimeout = true
+      tls?.destroy()
+      client.destroy()
+    }
+    let timer = setTimeout(expire, 10_000)
+    client.once('close', () => clearTimeout(timer))
+    const block = async (): Promise<void> => {
+      if (
+        !recordedBlock &&
+        this.#active &&
+        generation === this.#connectionGeneration &&
+        inspection.isExecutionActive()
+      ) {
+        recordedBlock = true
+        await this.#authorize(
+          host,
+          443,
+          generation,
+          'block',
+          () => !client.destroyed && !tls?.destroyed
+        )
+      }
+    }
+    try {
+      const context = await inspection.certificate(host)
+      if (!this.#inspectionActive(generation, client)) {
+        client.destroy()
+        return
+      }
+      if (!responseSent) client.write('HTTP/1.1 200 Connection Established\r\n\r\n')
+      if (head.length) client.unshift(head)
+      tls = new TLSSocket(client, {
+        isServer: true,
+        secureContext: context,
+        ALPNProtocols: ['http/1.1'],
+        SNICallback: (servername, callback) => {
+          if (domainToASCII(servername.replace(/\.$/, '').toLowerCase()) !== host) {
+            malformed = true
+            callback(new Error('TLS authority mismatch'))
+          } else callback(null, context)
+        }
+      })
+      this.#trackConnection(tls)
+      tls.once('error', () => {
+        if (!handshakeComplete && !malformed) void block()
+      })
+      tls.once('close', () => {
+        if (!sawRequest && !malformed && !resourceTimeout) void block()
+        client.destroy()
+        lifetime.abort()
+        clearTimeout(timer)
+      })
+      tls.once('secure', () => {
+        handshakeComplete = true
+        clearTimeout(timer)
+        if (!this.#inspectionActive(generation, client)) {
+          tls!.destroy()
+          return
+        }
+        let buffered = Buffer.alloc(0)
+        let headerBytes = 0
+        let completeHeader = false
+        let extraBytes = false
+        let busy = false
+        let approvedBody = false
+        const parser = createHttpServer({
+          maxHeaderSize: MAX_TARGET_BYTES + MAX_HEADER_BYTES + 1024,
+          insecureHTTPParser: false
+        })
+        const armHeaders = (): void => {
+          clearTimeout(timer)
+          timer = setTimeout(expire, 10_000)
+        }
+        armHeaders()
+        tls!.setTimeout(60_000, expire)
+        // Register before the strict parser to preserve exact wire sizes and detect pipelining.
+        const inspectWire = (chunk: Buffer): void => {
+          if (completeHeader) {
+            extraBytes = true
+            if (busy && !approvedBody) tls!.destroy()
+            return
+          }
+          buffered = Buffer.concat([buffered, chunk])
+          const end = buffered.indexOf('\r\n\r\n')
+          if (end < 0) {
+            if (buffered.length > MAX_TARGET_BYTES + MAX_HEADER_BYTES + 32) tls!.destroy()
+            return
+          }
+          const firstLine = buffered.indexOf('\r\n') + 2
+          headerBytes = end + 4 - firstLine
+          completeHeader = true
+          extraBytes = buffered.length > end + 4
+          buffered = Buffer.alloc(0)
+        }
+        const handle = async (
+          request: IncomingMessage,
+          response: ServerResponse
+        ): Promise<void> => {
+          if (busy || !this.#inspectionActive(generation, client)) {
+            tls!.destroy()
+            return
+          }
+          clearTimeout(timer)
+          sawRequest = true
+          if (
+            request.headers.expect !== undefined &&
+            request.headers.expect.toLowerCase() !== '100-continue'
+          ) {
+            // Reject unsupported expectations locally, including lists that Node routes through
+            // checkContinue. A waiting client must not depend on an upstream handshake.
+            busy = true
+            response.writeHead(417, { connection: 'close' })
+            response.end()
+            return
+          }
+          const verdict = inspectReadRequest(request, host, headerBytes)
+          if (verdict.kind === 'invalid' || verdict.kind === 'limit') {
+            if (verdict.kind === 'limit') {
+              response.writeHead(431, { connection: 'close' })
+              response.end()
+            } else tls!.destroy()
+            return
+          }
+          if (extraBytes && verdict.kind === 'read') {
+            tls!.destroy()
+            return
+          }
+          busy = true
+          approvedBody = verdict.kind === 'approval'
+          response.once('finish', () => {
+            if (approvedBody) {
+              tls!.end()
+              return
+            }
+            busy = false
+            completeHeader = false
+            headerBytes = 0
+            extraBytes = false
+            if (!tls!.destroyed) armHeaders()
+          })
+          try {
+            // Leave request bodies backpressured in the parser until the host commits the human
+            // decision. Pause the ingress timeout while approval is pending, not upstream timeouts.
+            if (approvedBody) tls!.setTimeout(0)
+            const decision = await this.#authorize(
+              host,
+              443,
+              generation,
+              approvedBody ? 'block' : 'probe',
+              () => !client.destroyed && !tls!.destroyed && !response.destroyed
+            )
+            if (approvedBody) tls!.setTimeout(60_000)
+            if (approvedBody && !decision.allowed) {
+              if (!response.destroyed) rejectHttp(response, NETWORK_APPROVAL_REQUIRED)
+              return
+            }
+            if (!this.#inspectionActive(generation, client)) {
+              tls!.destroy()
+              return
+            }
+            const address =
+              decision.allowed || decision.source === 'unknown' ? decision.address : undefined
+            if (!address) {
+              tls!.destroy()
+              return
+            }
+            const parent = selectProxy(this.#parent, host, 443, true)
+            const raw = parent
+              ? await tunnelThroughProxy(parent, address, 443, this.#parent?.ca, lifetime.signal)
+              : await waitForTcpConnection(
+                  connectTcp({ host: address, port: 443, signal: lifetime.signal })
+                )
+            if (!this.#inspectionActive(generation, client)) {
+              raw.destroy()
+              return
+            }
+            this.#trackConnection(raw)
+            const upstream = connectTls({
+              socket: raw,
+              servername: host,
+              ca: inspection.trustedCaCertificates
+                ? [...inspection.trustedCaCertificates]
+                : undefined,
+              rejectUnauthorized: true,
+              ALPNProtocols: ['http/1.1']
+            })
+            this.#trackConnection(upstream)
+            const stop = (): void => {
+              upstream.destroy()
+              raw.destroy()
+            }
+            tls!.once('close', stop)
+            const handshakeTimer = setTimeout(stop, 10_000)
+            try {
+              await new Promise<void>((resolve, reject) => {
+                upstream.once('secureConnect', resolve)
+                upstream.once('error', reject)
+                upstream.once('close', () => reject(new Error('Upstream closed')))
+              })
+            } finally {
+              clearTimeout(handshakeTimer)
+            }
+            if (!this.#inspectionActive(generation, client)) {
+              stop()
+              return
+            }
+            upstream.setTimeout(60_000, stop)
+            const headers =
+              verdict.kind === 'read' ? verdict.headers : withoutConnectionHeaders(request.headers)
+            const continueExpected = request.headers.expect?.toLowerCase() === '100-continue'
+            // We acknowledge the client's expectation below after approval. Do not start a
+            // second continue handshake upstream while already streaming the accepted body.
+            if (continueExpected) delete headers.expect
+            const outgoing = httpRequest({
+              host,
+              port: 443,
+              method: request.method,
+              path: request.url,
+              headers: {
+                ...headers,
+                host,
+                connection: 'close'
+              },
+              createConnection: () => upstream
+            })
+            forwardResponse(
+              outgoing,
+              request,
+              response,
+              NETWORK_UPSTREAM_FAILED,
+              () => {
+                tls!.removeListener('close', stop)
+                stop()
+              },
+              () => this.#inspectionActive(generation, client)
+            )
+            outgoing.once('upgrade', (_res, socket) => {
+              socket.destroy()
+              response.destroy()
+            })
+
+            if (approvedBody) {
+              if (continueExpected) response.writeContinue()
+              request.once('error', () => outgoing.destroy())
+              request.pipe(outgoing)
+            } else outgoing.end()
+          } catch {
+            if (!response.headersSent) response.writeHead(502, { connection: 'close' })
+            response.end(NETWORK_UPSTREAM_FAILED)
+          }
+        }
+        parser.on('request', (request, response) => void handle(request, response))
+        parser.on('checkContinue', (request, response) => void handle(request, response))
+        parser.on('checkExpectation', (request, response) => void handle(request, response))
+        const unsupported = (request: IncomingMessage, innerConnect = false): void => {
+          sawRequest = true
+          const verdict = inspectReadRequest(
+            innerConnect
+              ? ({
+                  rawHeaders: request.rawHeaders,
+                  httpVersion: request.httpVersion,
+                  method: 'GET',
+                  url: '/'
+                } as IncomingMessage)
+              : request,
+            host,
+            headerBytes
+          )
+          if (
+            verdict.kind === 'invalid' ||
+            verdict.kind === 'limit' ||
+            (innerConnect && request.url !== `${host}:443`)
+          ) {
+            tls!.destroy()
+            return
+          }
+          void block().finally(() => tls!.destroy())
+        }
+        parser.on('upgrade', (request) => unsupported(request))
+        parser.on('connect', (request) => unsupported(request, true))
+        parser.on('clientError', (error: NodeJS.ErrnoException) => {
+          // A reset before any HTTP bytes can be a TLS pin rejection, not malformed HTTP.
+          if (error.code !== 'ECONNRESET' || buffered.length > 0 || completeHeader) {
+            malformed = true
+          }
+          tls!.destroy()
+        })
+        parser.emit('connection', tls!)
+        tls!.prependListener('data', inspectWire)
+      })
+    } catch (error) {
+      if (resourceTimeout) {
+        client.destroy()
+        return
+      }
+      if ((error as { code?: string }).code === 'OPEN_SCIENCE_NETWORK_RESOURCE_LIMIT') {
+        client.end(
+          'HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n'
+        )
+        return
+      }
+      await block()
+      client.destroy()
+    }
+  }
+
+  async #serveSocks(client: Socket, initial: Buffer): Promise<void> {
+    const reader = socketReader(client, initial)
+    try {
+      const greeting = await reader.receive(2)
+      if (greeting[0] !== 5) throw new Error('Unsupported SOCKS version.')
+      const methods = await reader.receive(greeting[1]!)
+      if (!methods.includes(2)) {
+        client.end(Buffer.from([5, 0xff]))
+        return
+      }
+      client.write(Buffer.from([5, 2]))
+      const authHeader = await reader.receive(2)
+      if (authHeader[0] !== 1) throw new Error('Unsupported SOCKS authentication version.')
+      const username = (await reader.receive(authHeader[1]!)).toString('utf8')
+      const passwordLength = (await reader.receive(1))[0]!
+      const password = (await reader.receive(passwordLength)).toString('utf8')
+      const authenticated = this.#matchesCredentials(username, password)
+      client.write(Buffer.from([1, authenticated ? 0 : 1]))
+      if (!authenticated) {
+        client.end()
+        return
+      }
+      await this.#serveSocksRequest(client, reader)
+    } catch {
+      if (!client.destroyed) client.end(Buffer.from([5, 1, 0, 1, 0, 0, 0, 0, 0, 0]))
+    }
+  }
+
+  async #serveSocksRequest(client: Socket, reader: SocketReader): Promise<void> {
+    const generation = this.#connectionGeneration
+    const header = await reader.receive(4)
+    if (header[0] !== 5 || header[1] !== 1) throw new Error('Only SOCKS CONNECT is supported.')
+    let host: string
+    if (header[3] === 1) {
+      host = [...(await reader.receive(4))].join('.')
+    } else if (header[3] === 3) {
+      const length = (await reader.receive(1))[0]!
+      host = (await reader.receive(length)).toString('utf8')
+    } else if (header[3] === 4) {
+      const bytes = await reader.receive(16)
+      const words: string[] = []
+      for (let index = 0; index < bytes.length; index += 2) {
+        words.push(bytes.readUInt16BE(index).toString(16))
+      }
+      host = words.join(':')
+    } else {
+      throw new Error('Unsupported SOCKS address type.')
+    }
+    const port = (await reader.receive(2)).readUInt16BE(0)
+    // SOCKS clients wait for this response before sending application bytes. Classification
+    // therefore happens after the handshake, using the actual bytes that follow it.
+    client.write(Buffer.from([5, 0, 0, 1, 0, 0, 0, 0, 0, 0]))
+    await this.#bridgeClassifiedTunnel(
+      client,
+      normalizeRequestedHost(host) ?? host,
+      port,
+      reader.remainder(),
+      generation,
+      true,
+      'socks'
+    )
+  }
+}
+
+export { CommandGateway, LOCAL_RPC_BROKER_HOST, sharedGatewayPortActive, tunnelThroughProxy }
+export type { CommandGatewayOptions, GatewayCredentials, GatewayDecision, ParentProxySettings }
+
+// The host HTTP client and Notebook gateway share proxy selection and credential handling.
+export const resolveParentProxyUrl = (
+  settings: ParentProxySettings,
+  target: URL
+): URL | undefined =>
+  selectProxy(
+    parseProxy(settings),
+    target.hostname.replace(/^\[|\]$/g, ''),
+    Number(target.port || (target.protocol === 'https:' ? 443 : 80)),
+    target.protocol === 'https:'
+  )

@@ -1,0 +1,202 @@
+// Cross-process update types and pure helpers. No Electron/Node I/O so both main and renderer import it.
+
+import type { Locale } from './locale'
+
+export type PlatformDownload = { url: string; size: number; sha256: string }
+export type LocalizedReleaseNotes = Partial<Record<Exclude<Locale, 'en'>, string>>
+
+export type UpdateManifest = {
+  version: string
+  releaseDate: string
+  notes: string
+  localizedNotes?: LocalizedReleaseNotes
+  downloads: Record<string, PlatformDownload>
+}
+
+export type UpdateState =
+  'idle' | 'checking' | 'up-to-date' | 'available' | 'downloading' | 'ready' | 'applying' | 'error'
+
+export type UpdateBlocker = 'agent' | 'delegated' | 'notebook' | 'reviewer' | 'settings-install'
+
+// Call intent stays transient and transport-neutral. Desktop callers omit these options; headless
+// callers use them to avoid native dialogs and desktop relaunches.
+export type UpdateDownloadOptions = { nonInteractive?: boolean }
+// Read-only description of the current, completed update artifact. Paths remain owned by main;
+// revealing this artifact never accepts a renderer-provided path or starts the installer.
+export type UpdateInstaller = {
+  fileName: string
+  format: 'zip' | 'dmg' | 'exe' | 'deb' | 'appimage' | 'unknown'
+  platform: NodeJS.Platform
+}
+export type UpdateInstallerRevealResult = 'revealed' | 'missing' | 'unavailable'
+export type LegacyShellRecovery = { token: string; count: number }
+export type UpdateApplyOptions = {
+  relaunch?: boolean
+  force?: boolean
+  cliConsentToken?: string
+  legacyShellRecoveryToken?: string
+}
+
+// The single status the main process broadcasts and the renderer store mirrors.
+export type UpdateStatus = {
+  state: UpdateState
+  current: string
+  latest?: string
+  notes?: string
+  localizedNotes?: LocalizedReleaseNotes
+  download?: PlatformDownload
+  progress?: number // 0-100 while downloading
+  downloadedBytes?: number // bytes received so far while downloading
+  totalBytes?: number // total installer size in bytes
+  // Full progress detail (speed/ETA/reconnect) mirrored from the last update:progress broadcast so
+  // the dialog can render the shared DownloadProgressLine.
+  downloadProgress?: import('@aipoch/resilient-download').DownloadProgress
+  artifactSha512?: string // provider checksum of the downloaded installer; rechecked before extraction
+  localPath?: string // set when state === 'ready'
+  // A previously confirmed current artifact disappeared or changed. Separate from lifecycle errors
+  // so read-only inspection can report it without hiding an existing install/recovery failure.
+  installerMissing?: boolean
+  // Terminal lifecycle failure, or retryable action feedback while a ready installer remains usable.
+  error?: string
+  canForce?: boolean
+  diagnostics?: string
+  outcome?: 'cancelled' | 'recovered' | 'installed'
+  reason?: UpdateFailureReason
+  recovery?: UpdateRecoveryStatus
+  cliConfirmation?: UpdateCliConfirmation
+  // Active research that prevented an in-place install. This is deliberately not a new UpdateState:
+  // the operation still failed, while callers that need automation can distinguish a safe block.
+  blockedBy?: UpdateBlocker[]
+  blockedTasks?: { sessionId: string; projectId: string; title: string; kind: UpdateBlocker }[]
+  // Transient, exact-snapshot consent for backing up unidentifiable historical Shell launch records.
+  legacyShellRecovery?: LegacyShellRecovery
+  // How the renderer applies a ready update: open the downloaded installer (mac manual reinstall) or
+  // restart into an in-place electron-updater install (win/linux). Set by the active strategy.
+  applyKind?: 'installer' | 'restart'
+}
+
+export type UpdateFailureReason =
+  | 'active-work'
+  | 'runtime-not-controlled'
+  | 'runtime-stop-timeout'
+  | 'runtime-stop-unclean'
+  | 'runtime-configuration-unsupported'
+  | 'installation-busy'
+  | 'install-failed'
+  | 'user-cancelled'
+
+export type UpdatePhase =
+  | 'preparing'
+  | 'stopping'
+  | 'stopped'
+  | 'handoff'
+  | 'recovering'
+  | 'cancelling'
+  | 'checking'
+  | 'install-check'
+export type UpdateRecoveryStatus = {
+  operationId?: string
+  phase: UpdatePhase
+  runtime: 'running' | 'stopped-clean' | 'stopped-unclean' | 'unknown'
+  installation: 'unchanged' | 'pending' | 'verified' | 'incomplete' | 'unknown'
+  canCancel: boolean
+  canRetryInstall: boolean
+  canRecover: boolean
+  detail?:
+    | 'controller-held'
+    | 'operation-pending'
+    | 'other-runtime'
+    | 'foreign-process'
+    | 'occupancy-unknown'
+    | 'unsupported-channel'
+  blockingProcesses?: { pid: number; name?: string }[]
+}
+export type UpdateCliConfirmation = {
+  token: string
+  pid: number
+  port: number
+  source: 'this-installation' | 'another-installation'
+  entryPath: string
+}
+
+export class UpdateLifecycleError extends Error {
+  constructor(
+    readonly reason: UpdateFailureReason,
+    message: string,
+    readonly recovery?: UpdateRecoveryStatus,
+    options?: ErrorOptions
+  ) {
+    super(message, options)
+    this.name = 'UpdateLifecycleError'
+  }
+}
+
+export type AppInfo = { name: string; version: string; copyright: string }
+
+// Numeric dotted-version compare. Missing components count as 0, so '1.0' === '1.0.0'. Non-numeric
+// components (e.g. pre-release tags) degrade to 0 — adequate for the simple x.y.z release manifest.
+export const compareVersions = (a: string, b: string): -1 | 0 | 1 => {
+  const pa = a.split('.').map((n) => parseInt(n, 10) || 0)
+  const pb = b.split('.').map((n) => parseInt(n, 10) || 0)
+  const len = Math.max(pa.length, pb.length)
+  for (let i = 0; i < len; i++) {
+    const da = pa[i] ?? 0
+    const db = pb[i] ?? 0
+    if (da > db) return 1
+    if (da < db) return -1
+  }
+  return 0
+}
+
+// Release eligibility is distinct from the numeric comparison used for runtime compatibility.
+// A stable release supersedes its matching Nightly base; SHA identifiers cannot order Nightlies.
+export const isNewer = (latest: string, current: string): boolean => {
+  const latestVersion = latest.split('+', 1)[0]
+  const currentVersion = current.split('+', 1)[0]
+  const compared = compareVersions(latestVersion.split('-', 1)[0], currentVersion.split('-', 1)[0])
+  if (compared !== 0) return compared > 0
+  return !latestVersion.includes('-') && currentVersion.includes('-')
+}
+
+// Maps the host to its manifest download key. Linux prefers the deb; selectDownload falls back to
+// the AppImage when the deb is absent.
+export const platformDownloadKey = (platform: NodeJS.Platform, arch: string): string | null => {
+  if (platform === 'darwin') {
+    if (arch === 'arm64') return 'mac-arm64'
+    if (arch === 'x64') return 'mac-x64'
+  }
+  if (platform === 'win32' && arch === 'x64') return 'win-x64'
+  if (platform === 'linux' && (arch === 'x64' || arch === 'arm64')) return `linux-${arch}-deb`
+  return null
+}
+
+export const selectDownload = (
+  manifest: UpdateManifest,
+  platform: NodeJS.Platform,
+  arch: string
+): PlatformDownload | null => {
+  const key = platformDownloadKey(platform, arch)
+  if (key && manifest.downloads[key]) return manifest.downloads[key]
+  if (platform === 'linux' && key) {
+    return manifest.downloads[`linux-${arch}-appimage`] ?? null
+  }
+  return null
+}
+
+// Formats a byte count into a human-readable string (e.g. 1234567 → "1.2 MB"). Uses 1024-based
+// binary units, matching the convention most desktop OSes show for file/download sizes.
+const BYTE_UNITS = ['B', 'KB', 'MB', 'GB'] as const
+export const formatBytes = (bytes: number): string => {
+  if (bytes < 1024) return `${bytes} B`
+  let value = bytes
+  let unitIndex = 0
+  while (value >= 1024 && unitIndex < BYTE_UNITS.length - 1) {
+    value /= 1024
+    unitIndex += 1
+  }
+  return `${value.toFixed(1)} ${BYTE_UNITS[unitIndex]}`
+}
+
+// Actionable installation prerequisite, shared by both update strategies and renderer surfaces.
+export const UPDATE_INSTALLATION_REQUIRED =
+  'Open-Science is running on a read-only disk. Drag it to Applications, quit this copy, and reopen it from Applications before updating.'

@@ -1,0 +1,458 @@
+// @vitest-environment jsdom
+// Render tests for the ReviewerLogSection component (issue 13, updated for unified tool entry in issue 15).
+// Verifies:
+// - The "Reviewer log" section is collapsed by default
+// - It renders the log by reusing WorkspaceMessageItem and workspace activity components
+// - An empty/aborted log renders gracefully (collapsed section, no crash)
+// - The old "Full reasoning" prose block is gone
+// - tool entries render as collapsible rows showing real tool name, input, output
+
+import { act } from 'react'
+import { createRoot, type Root } from 'react-dom/client'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+
+import type { ReviewWithChecks } from '../../../../shared/reviewer'
+import type { ReviewerLogEntry } from '../../../../shared/reviewer'
+
+;(globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true
+
+// --- fixtures ---
+
+const makeReview = (
+  overrides: Partial<ReviewWithChecks> & { reviewerLog?: ReviewerLogEntry[] } = {}
+): ReviewWithChecks => ({
+  id: 'review-1',
+  projectId: 'project-1',
+  sessionId: 'session-1',
+  turnMessageId: 'msg-1',
+  scope: { turnMessageId: 'msg-1', blocks: [], artifactVersionIds: [] },
+  lifecycle: 'complete',
+  outcome: 'pass',
+  model: 'claude-opus-4-5',
+  reviewerLog: [],
+  checks: [],
+  createdAt: 1000,
+  updatedAt: 1001,
+  ...overrides
+})
+
+const sampleLog: ReviewerLogEntry[] = [
+  { kind: 'thought', text: 'Let me read the turn first.' },
+  {
+    kind: 'tool',
+    toolName: 'Bash',
+    title: 'python3 -c "host.read_turn()"',
+    rawInput: 'python3 -c "import host, json; print(json.dumps(host.read_turn()))"',
+    rawOutput: '[{"kind": "message"}]',
+    status: 'ok',
+    exitCode: 0
+  },
+  { kind: 'message', text: 'Review complete, submitting findings.' }
+]
+
+// --- helpers ---
+
+let container: HTMLDivElement
+let root: Root
+const getReviewLog = vi.fn()
+
+beforeEach(() => {
+  getReviewLog.mockReset().mockResolvedValue([])
+  vi.stubGlobal('api', { reviewer: { getReviewLog } })
+  container = document.createElement('div')
+  document.body.appendChild(container)
+  root = createRoot(container)
+})
+
+afterEach(() => {
+  act(() => root.unmount())
+  container.remove()
+  vi.unstubAllGlobals()
+})
+
+// Lazy-import the component under test.
+const { SessionReviewerPanel } = await import('./SessionReviewerPanel')
+
+describe('SessionReviewerPanel — Reviewer log section (issue 13/15)', () => {
+  it('loads a persisted log when the detail opens after a cold history load', async () => {
+    getReviewLog.mockResolvedValue(sampleLog)
+    await act(async () =>
+      root.render(<SessionReviewerPanel review={makeReview()} activeFindingId={undefined} />)
+    )
+    expect(getReviewLog).toHaveBeenCalledExactlyOnceWith({
+      projectId: 'project-1',
+      appSessionId: 'session-1',
+      reviewId: 'review-1'
+    })
+    expect(container.querySelector('[data-testid="reviewer-log-toggle"]')).not.toBeNull()
+    await act(async () =>
+      container.querySelector<HTMLButtonElement>('[data-testid="reviewer-log-toggle"]')!.click()
+    )
+    expect(container.textContent).toContain('Let me read the turn first.')
+  })
+
+  it('keeps an empty loaded log settled and retries a failed detail read', async () => {
+    getReviewLog.mockRejectedValueOnce(new Error('offline')).mockResolvedValue([])
+    await act(async () =>
+      root.render(<SessionReviewerPanel review={makeReview()} activeFindingId={undefined} />)
+    )
+    expect(container.textContent).toContain('Could not load Reviewer log.')
+    await act(async () =>
+      Array.from(container.querySelectorAll('button'))
+        .find((button) => button.textContent === 'Retry')!
+        .click()
+    )
+    expect(container.querySelector('[role="alert"]')).toBeNull()
+    expect(container.querySelector('[role="status"]')).toBeNull()
+    expect(container.querySelector('[data-testid="reviewer-log-toggle"]')).toBeNull()
+    await act(async () =>
+      root.render(<SessionReviewerPanel review={makeReview()} activeFindingId={undefined} />)
+    )
+    expect(getReviewLog).toHaveBeenCalledTimes(2)
+  })
+
+  it('discards a delayed log after navigation and prefers a live pushed log', async () => {
+    let finish!: (log: ReviewerLogEntry[]) => void
+    getReviewLog.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve
+        })
+    )
+    await act(async () =>
+      root.render(<SessionReviewerPanel review={makeReview()} activeFindingId={undefined} />)
+    )
+    await act(async () =>
+      root.render(
+        <SessionReviewerPanel
+          review={makeReview({
+            id: 'review-2',
+            reviewerLog: [{ kind: 'message', text: 'live log' }]
+          })}
+          activeFindingId={undefined}
+        />
+      )
+    )
+    await act(async () => finish(sampleLog))
+    await act(async () =>
+      container.querySelector<HTMLButtonElement>('[data-testid="reviewer-log-toggle"]')!.click()
+    )
+    expect(container.textContent).toContain('live log')
+    expect(container.textContent).not.toContain('Let me read the turn first.')
+    expect(getReviewLog).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not fetch live logs or replay evidence', async () => {
+    await act(async () =>
+      root.render(
+        <SessionReviewerPanel
+          review={makeReview({ reviewerLog: sampleLog })}
+          activeFindingId={undefined}
+        />
+      )
+    )
+    await act(async () =>
+      root.render(
+        <SessionReviewerPanel review={makeReview()} historical activeFindingId={undefined} />
+      )
+    )
+    expect(getReviewLog).not.toHaveBeenCalled()
+  })
+
+  it('shows a "Reviewer log" section heading', () => {
+    act(() => {
+      root.render(
+        <SessionReviewerPanel
+          review={makeReview({ reviewerLog: sampleLog })}
+          activeFindingId={undefined}
+        />
+      )
+    })
+
+    expect(container.textContent).toContain('Reviewer log')
+  })
+
+  it('is collapsed by default (log content not visible)', () => {
+    act(() => {
+      root.render(
+        <SessionReviewerPanel
+          review={makeReview({ reviewerLog: sampleLog })}
+          activeFindingId={undefined}
+        />
+      )
+    })
+
+    // The section title is visible but the log entries are not yet expanded.
+    expect(container.textContent).toContain('Reviewer log')
+    // Log thought text should not be visible until expanded.
+    expect(container.textContent).not.toContain('Let me read the turn first.')
+    // The toggle button exists.
+    const toggle = container.querySelector('[data-testid="reviewer-log-toggle"]')
+    expect(toggle).not.toBeNull()
+  })
+
+  it('expands the log when the toggle is clicked', async () => {
+    act(() => {
+      root.render(
+        <SessionReviewerPanel
+          review={makeReview({ reviewerLog: sampleLog })}
+          activeFindingId={undefined}
+        />
+      )
+    })
+
+    const toggle = container.querySelector<HTMLButtonElement>('[data-testid="reviewer-log-toggle"]')
+    await act(async () => {
+      toggle?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+
+    // After expansion, log entries are visible.
+    const logBody = container.querySelector('[data-testid="reviewer-log-body"]')
+    expect(logBody).not.toBeNull()
+    expect(container.textContent).toContain('Let me read the turn first.')
+    // The real tool name "Bash" should appear (not just "Terminal").
+    expect(container.textContent).toContain('Bash')
+    expect(container.textContent).toContain('Review complete, submitting findings.')
+  })
+
+  it('shows a size-limit notice when captured log content was truncated', async () => {
+    const truncatedLog: ReviewerLogEntry[] = [
+      { kind: 'message', text: 'Partial reviewer output', textTruncated: true }
+    ]
+    act(() => {
+      root.render(
+        <SessionReviewerPanel
+          review={makeReview({ reviewerLog: truncatedLog })}
+          activeFindingId={undefined}
+        />
+      )
+    })
+
+    const toggle = container.querySelector<HTMLButtonElement>('[data-testid="reviewer-log-toggle"]')
+    await act(async () => {
+      toggle?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+
+    expect(container.textContent).toContain(
+      'Reviewer log content was truncated to fit the size limit.'
+    )
+  })
+
+  it('renders tool entry as collapsible row with real name visible after log expansion', async () => {
+    act(() => {
+      root.render(
+        <SessionReviewerPanel
+          review={makeReview({ reviewerLog: sampleLog })}
+          activeFindingId={undefined}
+        />
+      )
+    })
+
+    // Expand the log section first.
+    const logToggle = container.querySelector<HTMLButtonElement>(
+      '[data-testid="reviewer-log-toggle"]'
+    )
+    await act(async () => {
+      logToggle?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+
+    // The tool row toggle should be present and show the real tool name.
+    const toolToggle = container.querySelector<HTMLButtonElement>(
+      '[data-testid="tool-log-row-toggle"]'
+    )
+    expect(toolToggle).not.toBeNull()
+    expect(toolToggle?.textContent).toContain('Bash')
+    expect(toolToggle?.tagName).toBe('BUTTON')
+    expect(toolToggle?.getAttribute('type')).toBe('button')
+    expect(toolToggle?.tabIndex).toBe(0)
+    expect(toolToggle?.className).toContain('focus-visible:ring-[3px]')
+    expect(toolToggle?.className).toContain('focus-visible:ring-ring/50')
+    expect(toolToggle?.className).toContain('motion-reduce:transition-none')
+    expect(toolToggle?.querySelector('svg')?.getAttribute('class')).toContain(
+      'motion-reduce:transition-none'
+    )
+    expect(toolToggle?.getAttribute('aria-expanded')).toBe('false')
+    expect(toolToggle?.getAttribute('aria-controls')).toBeTruthy()
+
+    // Tool details should be collapsed by default (no details panel visible).
+    expect(container.querySelector('[data-testid="tool-log-row-details"]')).toBeNull()
+
+    act(() => toolToggle?.focus())
+    expect(document.activeElement).toBe(toolToggle)
+
+    // Expand the tool row.
+    await act(async () => {
+      toolToggle?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+
+    // Now Input and Output should be visible.
+    const details = container.querySelector('[data-testid="tool-log-row-details"]')
+    expect(details).not.toBeNull()
+    expect(toolToggle?.getAttribute('aria-expanded')).toBe('true')
+    expect(details?.id).toBe(toolToggle?.getAttribute('aria-controls'))
+    expect(details?.textContent).toContain('Input')
+    expect(details?.textContent).toContain('python3 -c "import host')
+    expect(details?.textContent).toContain('Output')
+    expect(details?.textContent).toContain('[{"kind": "message"}]')
+  })
+
+  it('shows ok status dot for tool entry with status=ok', async () => {
+    act(() => {
+      root.render(
+        <SessionReviewerPanel
+          review={makeReview({ reviewerLog: sampleLog })}
+          activeFindingId={undefined}
+        />
+      )
+    })
+
+    const logToggle = container.querySelector<HTMLButtonElement>(
+      '[data-testid="reviewer-log-toggle"]'
+    )
+    await act(async () => {
+      logToggle?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+
+    // The ok status dot should be in the tool row.
+    const toolToggle = container.querySelector<HTMLButtonElement>(
+      '[data-testid="tool-log-row-toggle"]'
+    )
+    expect(toolToggle?.textContent).toContain('● ok')
+  })
+
+  it('shows error status dot for tool entry with status=error', async () => {
+    const errorLog: ReviewerLogEntry[] = [
+      {
+        kind: 'tool',
+        toolName: 'Bash',
+        rawInput: 'python3 bad.py',
+        rawOutput: 'SyntaxError: bad syntax',
+        status: 'error',
+        exitCode: 1
+      }
+    ]
+    act(() => {
+      root.render(
+        <SessionReviewerPanel
+          review={makeReview({ reviewerLog: errorLog })}
+          activeFindingId={undefined}
+        />
+      )
+    })
+
+    const logToggle = container.querySelector<HTMLButtonElement>(
+      '[data-testid="reviewer-log-toggle"]'
+    )
+    await act(async () => {
+      logToggle?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+
+    const toolToggle = container.querySelector<HTMLButtonElement>(
+      '[data-testid="tool-log-row-toggle"]'
+    )
+    expect(toolToggle?.textContent).toContain('● error')
+  })
+
+  it('renders tool entry with no output gracefully (aborted mid-call, no crash)', async () => {
+    const partialLog: ReviewerLogEntry[] = [
+      { kind: 'tool', toolName: 'Bash', rawInput: 'python3 host.read_turn()' }
+    ]
+    act(() => {
+      root.render(
+        <SessionReviewerPanel
+          review={makeReview({ reviewerLog: partialLog })}
+          activeFindingId={undefined}
+        />
+      )
+    })
+
+    const logToggle = container.querySelector<HTMLButtonElement>(
+      '[data-testid="reviewer-log-toggle"]'
+    )
+    await act(async () => {
+      logToggle?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+
+    // Should render without crashing. Tool name visible.
+    expect(container.textContent).toContain('Bash')
+  })
+
+  it('hides the toggle when the log is empty (graceful empty state)', () => {
+    act(() => {
+      root.render(
+        <SessionReviewerPanel
+          review={makeReview({ reviewerLog: [] })}
+          activeFindingId={undefined}
+        />
+      )
+    })
+
+    // With no log entries, either the section is hidden or has no expandable content.
+    // Either way it should not crash.
+    expect(() => {
+      void container.textContent
+    }).not.toThrow()
+    // No log body should be visible.
+    const logBody = container.querySelector('[data-testid="reviewer-log-body"]')
+    expect(logBody).toBeNull()
+  })
+
+  it('does NOT render the old "Full reasoning" prose block', () => {
+    act(() => {
+      root.render(
+        <SessionReviewerPanel
+          review={makeReview({ reviewerLog: sampleLog })}
+          activeFindingId={undefined}
+        />
+      )
+    })
+
+    // The old "Full reasoning" toggle should be gone.
+    expect(container.querySelector('[data-testid="reviewer-reasoning-toggle"]')).toBeNull()
+    expect(container.querySelector('[data-testid="reviewer-reasoning-body"]')).toBeNull()
+    // No "Full reasoning" text.
+    expect(container.textContent).not.toContain('Full reasoning')
+  })
+
+  it('does not crash when log has an error-lifecycle review with empty log', () => {
+    const errorReview = makeReview({
+      lifecycle: 'error',
+      outcome: null,
+      errorMessage: 'Reviewer session timed out',
+      reviewerLog: []
+    })
+
+    expect(() => {
+      act(() => {
+        root.render(<SessionReviewerPanel review={errorReview} activeFindingId={undefined} />)
+      })
+    }).not.toThrow()
+  })
+})
+
+describe('SessionReviewerPanel — still shows Checks list (regression)', () => {
+  it('renders the unified checks list unchanged', () => {
+    const check = {
+      id: 'check-1',
+      reviewId: 'review-1',
+      status: 'pass' as const,
+      resolution: 'open' as const,
+      claim: 'Row count verified',
+      evidence: 'Counted 33 rows',
+      sortIndex: 0,
+      reflagCount: 0
+    }
+
+    act(() => {
+      root.render(
+        <SessionReviewerPanel
+          review={makeReview({ checks: [check], reviewerLog: sampleLog })}
+          activeFindingId={undefined}
+        />
+      )
+    })
+
+    expect(container.querySelector('[data-testid="reviewer-checks"]')).not.toBeNull()
+    expect(container.textContent).toContain('Row count verified')
+  })
+})

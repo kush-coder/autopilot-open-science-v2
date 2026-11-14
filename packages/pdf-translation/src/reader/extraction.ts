@@ -1,0 +1,846 @@
+import { readNativeFormClippedText } from './native-form-clipped-text.js'
+import { rememberPdfTranslationSourceParser } from './snapshot.js'
+import { readNativeOccludedText } from './native-occluded-text.js'
+import { createNativeRuledAlgorithmCaptionReader } from './ruled-algorithm-packets.js'
+import { createNativeTaggedReferenceReader } from './tagged-reference-packets.js'
+import { terminalContactSources } from './terminal-contact-source.js'
+import { readNativeCommandAdvances } from './compound-reference-boundary.js'
+import {
+  readNativeAppendixOverview,
+  readNativeOutlineRestart,
+  readNativeOnlineAppendixRestart,
+  readNativeContentsReference,
+  createNativeTerminalCaptionReader,
+  bindNativeTerminalCaptionLayout
+} from './appendix-overview-boundary.js'
+import { getPdfTranslationTextContent } from './text-content.js'
+import { rememberNativeCaptionTerminal } from './caption-terminal.js'
+import { nativeOwnedReferenceRolesCurrent } from './unheaded-reference-packets.js'
+import {
+  readNativeReferenceEvidence,
+  readNativeTableNoteEvidence,
+  readNativeDisplayEquationEvidence,
+  readNativeNumberedPacketEvidence,
+  bindNativeReferenceRolePage,
+  nativeReferenceRolePagesCurrent
+} from './native-reference-evidence.js'
+import { readNativeSectionFontEvidence } from './wrapped-section-prose.js'
+import type { PDFDocumentProxy, PDFPageProxy, getDocument } from 'pdfjs-dist'
+import {
+  createAuxiliaryNativeExclusionReader,
+  createAuxiliaryNativeDisplayInkReader
+} from './auxiliary-native-ink.js'
+import { hasNativeDisplaySequence, nativeScopedDisplayOwners } from './native-display-packets.js'
+import {
+  hasNativeMatrixCandidate,
+  createNativeMatrixReader,
+  nativeMatrixOwners
+} from './native-matrix-packets.js'
+import {
+  hasNativeFunctionDisplay,
+  createNativeFunctionDisplayReader,
+  nativeFunctionDisplayOwners
+} from './native-function-display.js'
+import { nativeTableCaptionOwners } from './native-table-caption.js'
+import { rememberNativeCaptionEligibility } from './caption-eligibility.js'
+import { nativePartialNavigation } from './native-source-geometry.js'
+import { readOutlierFontNavigation, readNativeType3Navigation } from './outlier-font-navigation.js'
+import { createPdfTranslationSource, type PdfTranslationSource } from './source.js'
+import { groupPdfTranslationPages, type PdfLayoutPage, type PdfLayoutTextItem } from './layout.js'
+import {
+  readPdfMathDiagrams,
+  preservePdfMathDiagrams,
+  type PdfMathDiagram
+} from './math-diagram.js'
+
+export type PdfTranslationExclusionReason =
+  'invalid-geometry' | 'unsupported-orientation' | 'outside-page' | 'occluded-native-text'
+
+export type PdfTranslationExtraction = Readonly<{
+  source: PdfTranslationSource
+  /** Source coverage only: included text is not necessarily prose or a correct translation. */
+  coverage: Readonly<{
+    pageCount: number
+    textItemCount: number
+    includedItemCount: number
+    excludedItemCount: number
+    pagesWithoutText: readonly number[]
+    exclusions: readonly Readonly<{
+      unitId?: string
+      reason: PdfTranslationExclusionReason
+      items: readonly Readonly<{ pageNumber: number; index: number; text: string }>[]
+    }>[]
+    /** Advisory grouping or decoding uncertainty; never silently removes source text. */
+    warnings: readonly Readonly<{ unitId: string; reasons: readonly string[] }>[]
+    /** Painted glyphs without a native text owner; does not change translation eligibility. */
+    pageDiagnostics?: readonly Readonly<{ pageNumber: number; reason: 'unreliable-font-unicode' }>[]
+  }>
+}>
+
+type TextStyle = { vertical?: boolean; ascent?: number; descent?: number }
+
+// Text-run navigation bounds, not glyph outlines or regions safe to paint over.
+// PDF.js TextLayer uses a font-height box and falls back to ascent / 1+descent / 0.8.
+function independentRect(
+  item: PdfLayoutTextItem,
+  page: PdfLayoutPage,
+  style: TextStyle | undefined
+): PdfTranslationSource['units'][number]['fragments'][number]['rect'] | undefined {
+  if (item.dir !== 'ltr' || style?.vertical) return undefined
+  const [a, b, c, d, x, y] = item.transform
+  const advance = Math.hypot(a, b),
+    font = Math.hypot(c, d)
+  if (advance <= 0 || font <= 0 || item.width <= 0) return undefined
+  const quarter = ((Math.round(Math.atan2(-b, a) / (Math.PI / 2)) % 4) + 4) % 4
+  let [ux, uy] = [
+    [1, 0],
+    [0, 1],
+    [-1, 0],
+    [0, -1]
+  ][quarter]
+  if (Math.abs((a * c + b * d) / (advance * font)) > 0.0001 || a * d - b * c <= 0) return undefined
+  if (Math.hypot(a / advance - ux, -b / advance - uy) > 0.0001) {
+    // Arbitrary angles have no metric fallback: admit only an explicit native
+    // horizontal font and finite ascent/descent. The result remains a separate
+    // original-only navigation anchor, never a glyph-ink or repaint claim.
+    if (
+      style?.vertical !== false ||
+      !Number.isFinite(style.ascent) ||
+      !Number.isFinite(style.descent) ||
+      style.ascent! <= style.descent! ||
+      style.ascent! <= 0 ||
+      style.ascent! > 1 ||
+      style.descent! > 0 ||
+      style.descent! < -1 ||
+      !item.fontName ||
+      item.height <= 0
+    )
+      return undefined
+    ux = a / advance
+    uy = -b / advance
+  }
+  const ascent = style?.ascent || (style?.descent ? 1 + style.descent : 0.8)
+  const points = [
+    [0, -ascent * font],
+    [item.width, -ascent * font],
+    [item.width, (1 - ascent) * font],
+    [0, (1 - ascent) * font]
+  ].map(([u, v]) => [x + ux * u - uy * v, page.height - y + uy * u + ux * v])
+  const left = Math.min(...points.map(([x]) => x)),
+    top = Math.min(...points.map(([, y]) => y))
+  const rect = {
+    x: left / page.width,
+    y: top / page.height,
+    width: (Math.max(...points.map(([x]) => x)) - left) / page.width,
+    height: (Math.max(...points.map(([, y]) => y)) - top) / page.height
+  }
+  return Object.values(rect).every(Number.isFinite) &&
+    rect.width > 0 &&
+    rect.height > 0 &&
+    rect.x >= 0 &&
+    rect.y >= 0 &&
+    rect.x + rect.width <= 1.000001 &&
+    rect.y + rect.height <= 1.000001
+    ? rect
+    : undefined
+}
+
+type ExtractionInput = {
+  document: Pick<PDFDocumentProxy, 'numPages' | 'fingerprints' | 'getPage'> &
+    Partial<
+      Pick<
+        PDFDocumentProxy,
+        'getData' | 'getMetadata' | 'getOutline' | 'getDestination' | 'getPageIndex'
+      >
+    >
+  resourceRequestKey: string
+  sourceIdentity?: Readonly<{ sourceChecksum: string; sourceSizeBytes: number }>
+  nativeDocumentFactory?: typeof getDocument
+  signal: AbortSignal
+  onProgress?: (pagesRead: number) => void
+}
+
+/** Borrows the viewer PDF; disposes only its own auxiliary loading task. */
+export async function extractPdfTranslationSource(
+  input: ExtractionInput
+): Promise<PdfTranslationExtraction> {
+  const exclusions = createAuxiliaryNativeExclusionReader(input, readNativeFormClippedText)
+  try {
+    return await readPdfTranslationSource({ ...input, nativeExclusions: exclusions })
+  } finally {
+    await exclusions.dispose()
+  }
+}
+
+async function readPdfTranslationSource({
+  document,
+  resourceRequestKey,
+  sourceIdentity,
+  nativeDocumentFactory,
+  signal,
+  onProgress,
+  nativeExclusions
+}: ExtractionInput & {
+  nativeExclusions: ReturnType<typeof createAuxiliaryNativeExclusionReader>
+}): Promise<PdfTranslationExtraction> {
+  signal.throwIfAborted()
+  const fingerprint = document.fingerprints[0]
+  if (!fingerprint || !Number.isInteger(document.numPages) || document.numPages < 1)
+    throw new Error('Invalid PDF source identity')
+  const terminalCaptions = createNativeTerminalCaptionReader({
+    document,
+    sourceIdentity,
+    nativeDocumentFactory,
+    signal
+  })
+  const taggedReferences = createNativeTaggedReferenceReader(document, signal)
+  const algorithmCaptions = createNativeRuledAlgorithmCaptionReader({
+    document,
+    sourceIdentity,
+    nativeDocumentFactory,
+    signal
+  })
+  const occlusionProofs: NonNullable<Awaited<ReturnType<typeof readNativeOccludedText>>>[] = []
+  const checkOcclusions = (): void => {
+    if (
+      occlusionProofs.length &&
+      (document.fingerprints[0] !== fingerprint ||
+        document.numPages !== navigationPageCount ||
+        occlusionProofs.some((proof) => !proof.current()))
+    )
+      throw new Error('PDF source changed during occluded text verification')
+  }
+  const pages: PdfLayoutPage[] = []
+  const captionTerminals: (() => boolean)[] = []
+  const checkCaptionTerminals = (): void => {
+    if (captionTerminals.some((current) => !current()))
+      throw new Error('Native caption sources changed during extraction')
+  }
+  const onlineContexts: Parameters<typeof readNativeOnlineAppendixRestart>[0][] = []
+  const scopedDisplays: {
+    page: PDFPageProxy
+    content: Awaited<ReturnType<PDFPageProxy['getTextContent']>>
+    viewport: ReturnType<PDFPageProxy['getViewport']>
+    pageNumber: number
+  }[] = []
+  const nativeMatrices: typeof scopedDisplays = []
+  const nativeFunctions: typeof scopedDisplays = []
+  const mathDiagrams: PdfMathDiagram[] = []
+  const styles: Record<string, TextStyle>[] = []
+  const pagesWithoutText: number[] = []
+  const exclusions: PdfTranslationExtraction['coverage']['exclusions'][number][] = []
+  const unreliableItems = new Set<string>()
+  const outlierNavigation = new Map<string, NonNullable<ReturnType<typeof independentRect>>>()
+  const navigationPageCount = document.numPages
+  const type3Navigation: NonNullable<Awaited<ReturnType<typeof readNativeType3Navigation>>>[] = []
+  const navigationCurrent = (): boolean =>
+    document.fingerprints[0] === fingerprint && document.numPages === navigationPageCount
+  const checkType3Navigation = (): void => {
+    if (type3Navigation.some((proof) => !proof.current()))
+      throw new Error('PDF source changed during Type3 navigation verification')
+  }
+  const partialNavigation = new Map<
+    string,
+    NonNullable<ReturnType<typeof nativePartialNavigation>>
+  >()
+  const pageDiagnostics: NonNullable<
+    PdfTranslationExtraction['coverage']['pageDiagnostics']
+  >[number][] = []
+  let textItemCount = 0
+  for (let pageNumber = 1; pageNumber <= document.numPages; pageNumber++) {
+    signal.throwIfAborted()
+    const page = await document.getPage(pageNumber)
+    signal.throwIfAborted()
+    const viewport = page.getViewport({ scale: 1 })
+    if (
+      ![viewport.width, viewport.height].every((n) => Number.isFinite(n) && n > 0) ||
+      viewport.transform.length !== 6 ||
+      !viewport.transform.every(Number.isFinite)
+    )
+      throw new Error('Invalid PDF page geometry')
+    const content = await getPdfTranslationTextContent(
+      page,
+      (indexes) => {
+        for (const index of indexes) unreliableItems.add(`${pageNumber}:${index}`)
+      },
+      (proved) => {
+        if (proved)
+          pageDiagnostics.push(Object.freeze({ pageNumber, reason: 'unreliable-font-unicode' }))
+      }
+    )
+    signal.throwIfAborted()
+    const occlusion = await readNativeOccludedText(page, content, viewport, () =>
+      nativeExclusions.readNegativeExclusions({
+        page,
+        content,
+        viewport,
+        pageNumber,
+        selected: new Set(
+          content.items.flatMap((item, index) => ('str' in item && item.str.trim() ? [index] : []))
+        )
+      })
+    )
+    signal.throwIfAborted()
+    if (occlusion) occlusionProofs.push(occlusion)
+    let pageTextItems = 0
+    const items = content.items.map((item, index) => {
+      const empty = {
+        str: '',
+        width: 0,
+        height: 0,
+        dir: 'ltr',
+        transform: [0, 0, 0, 0, 0, 0],
+        hasEOL: 'hasEOL' in item ? item.hasEOL : undefined
+      }
+      if (!('str' in item) || !item.str) return empty
+      const hasText = !!item.str.trim()
+      if (hasText) {
+        textItemCount++
+        pageTextItems++
+      }
+      if (
+        item.transform.length !== 6 ||
+        ![...item.transform, item.width, item.height].every(Number.isFinite) ||
+        item.width < 0 ||
+        item.height < 0
+      ) {
+        if (hasText)
+          exclusions.push({
+            reason: 'invalid-geometry',
+            items: [{ pageNumber, index, text: item.str }]
+          })
+        return empty
+      }
+      if (hasText && occlusion?.indexes.has(index)) {
+        // Complete native ink is hidden by a proved fill or inherited Form clip.
+        exclusions.push({
+          reason: 'occluded-native-text',
+          items: [{ pageNumber, index, text: item.str }]
+        })
+        return empty
+      }
+      // Express PDF coordinates in the reader's default viewport, including CropBox
+      // offsets and UserUnit scaling. Grouping uses a bottom-up virtual PDF axis.
+      const [a, b, c, d, x, y] = item.transform
+      const partial =
+        hasText && nativePartialNavigation(item, content.styles?.[item.fontName], viewport)
+      if (partial) partialNavigation.set(`${pageNumber}:${index}`, partial)
+      const [ma, mb, mc, md, mx, my] = viewport.transform
+      const scale = Math.hypot(ma, mb)
+      return {
+        str: item.str,
+        width: item.width * scale,
+        height: item.height * scale,
+        dir: item.dir,
+        transform: [
+          ma * a + mc * b,
+          -(mb * a + md * b),
+          ma * c + mc * d,
+          -(mb * c + md * d),
+          ma * x + mc * y + mx,
+          viewport.height - (mb * x + md * y + my)
+        ],
+        fontName: item.fontName,
+        fontAscent: content.styles?.[item.fontName]?.ascent,
+        fontDescent: content.styles?.[item.fontName]?.descent,
+        fontVertical: content.styles?.[item.fontName]?.vertical,
+        hasEOL: item.hasEOL
+      }
+    })
+    const nativeReferenceEvidence = await readNativeReferenceEvidence(page, content)
+    const nativeDisplayMathEvidence = await readNativeDisplayEquationEvidence(
+      page,
+      content,
+      nativeReferenceEvidence
+    )
+    if (!nativeDisplayMathEvidence.complete && hasNativeDisplaySequence(content))
+      scopedDisplays.push({ page, content, viewport, pageNumber })
+    if (hasNativeFunctionDisplay(content))
+      nativeFunctions.push({ page, content, viewport, pageNumber })
+    if (hasNativeMatrixCandidate(content))
+      nativeMatrices.push({ page, content, viewport, pageNumber })
+    for (const [index, rect] of readOutlierFontNavigation(page, content, viewport))
+      outlierNavigation.set(`${pageNumber}:${index}`, rect)
+    signal.throwIfAborted()
+    const nativeNavigation = await readNativeType3Navigation(page, content, viewport, {
+      signal,
+      current: navigationCurrent
+    })
+    signal.throwIfAborted()
+    if (nativeNavigation) {
+      if (!nativeNavigation.current())
+        throw new Error('PDF source changed during Type3 navigation verification')
+      type3Navigation.push(nativeNavigation)
+      for (const [index, rect] of nativeNavigation.regions)
+        outlierNavigation.set(pageNumber + ':' + index, rect)
+    }
+    styles.push(content.styles ?? {})
+    mathDiagrams.push(...(await readPdfMathDiagrams(page, pageNumber, content)))
+    signal.throwIfAborted()
+    if (pageTextItems === 0) pagesWithoutText.push(pageNumber)
+    pages.push({
+      page: pageNumber,
+      width: viewport.width,
+      height: viewport.height,
+      // Item coordinates already include the default viewport rotation above. Group
+      // readable horizontal prose in that space; sideways items still remain source-only.
+      rotation: 0,
+      items,
+      nativeTableNoteEvidence: await readNativeTableNoteEvidence(
+        page,
+        content,
+        new Set(
+          [...unreliableItems]
+            .filter((key) => key.startsWith(pageNumber + ':'))
+            .map((key) => Number(key.split(':')[1]))
+        )
+      ),
+      nativeReferenceEvidence,
+      nativeDisplayMathEvidence,
+      nativeNumberedPacketEvidence: await readNativeNumberedPacketEvidence(
+        page,
+        content,
+        nativeReferenceEvidence,
+        nativeDisplayMathEvidence
+      ),
+      nativeFolioFontEvidence: await readNativeSectionFontEvidence(
+        page,
+        {
+          ...content,
+          items: content.items.filter((item) => 'str' in item && item.str === String(pageNumber))
+        },
+        { complete: false, reason: 'native-folio-font-subset' }
+      ),
+      nativeSectionFontEvidence: await readNativeSectionFontEvidence(
+        page,
+        content,
+        nativeReferenceEvidence
+      ),
+      nativeCommandAdvances: await readNativeCommandAdvances(page, content)
+    })
+    await bindNativeReferenceRolePage(
+      pages.at(-1)!,
+      page,
+      content,
+      document,
+      signal,
+      unreliableItems,
+      viewport
+    )
+    pages.at(-1)!.nativeAppendixOverview = await readNativeAppendixOverview({
+      document,
+      page,
+      content,
+      rawPage: pages.at(-1)!,
+      sourceIdentity,
+      signal,
+      unreliable: new Set(
+        [...unreliableItems]
+          .filter((key) => key.startsWith(pageNumber + ':'))
+          .map((key) => Number(key.split(':')[1]))
+      )
+    })
+    const restartInput = {
+      document,
+      page,
+      content,
+      rawPage: pages.at(-1)!,
+      sourceIdentity,
+      signal,
+      unreliable: new Set(
+        [...unreliableItems]
+          .filter((key) => key.startsWith(pageNumber + ':'))
+          .map((key) => Number(key.split(':')[1]))
+      )
+    }
+    pages.at(-1)!.nativeOutlineRestart = await readNativeOutlineRestart(restartInput)
+    pages.at(-1)!.nativeOnlineAppendixRestart = await readNativeOnlineAppendixRestart(
+      restartInput,
+      onlineContexts.slice()
+    )
+    pages.at(-1)!.nativeContentsReference = await readNativeContentsReference(restartInput)
+    onlineContexts.push(restartInput)
+    if (onlineContexts.length > 2) onlineContexts.shift()
+    await taggedReferences.observe({ ...restartInput, viewport })
+    await algorithmCaptions.observe({ ...restartInput, viewport })
+    terminalCaptions.observe({ ...restartInput, viewport })
+    const captionTerminal = await rememberNativeCaptionTerminal({
+      document,
+      page,
+      content,
+      rawPage: pages.at(-1)!,
+      signal
+    })
+    if (captionTerminal) captionTerminals.push(captionTerminal)
+    onProgress?.(pageNumber)
+    // Let the reader paint and deliver cancellation between page reads.
+    await new Promise<void>((resolve) => setTimeout(resolve, 0))
+    signal.throwIfAborted()
+  }
+  checkType3Navigation()
+  checkOcclusions()
+  checkCaptionTerminals()
+  await terminalCaptions.prepare(pages)
+  signal.throwIfAborted()
+  // ponytail: grouping is synchronous; move it to a worker if long-document profiling requires it.
+  const layout = preservePdfMathDiagrams(
+    groupPdfTranslationPages({ pages, pageCount: document.numPages }),
+    mathDiagrams
+  )
+  const terminalSource = bindNativeTerminalCaptionLayout(layout, pages, {
+    resourceRequestKey,
+    fingerprint
+  })
+  const units: PdfTranslationSource['units'][number][] = []
+  const independent: PdfTranslationSource['units'][number][] = []
+  const independentWarnings: PdfTranslationExtraction['coverage']['warnings'][number][] = []
+  const warnings: PdfTranslationExtraction['coverage']['warnings'][number][] = []
+  const accounted = new Set(
+    exclusions.flatMap((entry) => entry.items.map((item) => `${item.pageNumber}:${item.index}`))
+  )
+  for (const unit of layout.units) {
+    signal.throwIfAborted()
+    let reason: PdfTranslationExclusionReason | undefined
+    if (unit.risks.includes('unsupported-orientation')) reason = 'unsupported-orientation'
+    const fragments = unit.fragments.flatMap((fragment) => {
+      const page = layout.pages[fragment.page - 1]
+      const block = page.blocks.find((block) => block.id === fragment.id)!
+      const r = fragment.rect
+      const rect = {
+        x: r.x / page.width,
+        y: r.y / page.height,
+        width: (r.right - r.x) / page.width,
+        height: (r.bottom - r.y) / page.height
+      }
+      if (
+        !reason &&
+        (!Object.values(rect).every(Number.isFinite) || rect.width <= 0 || rect.height <= 0)
+      )
+        reason = 'invalid-geometry'
+      if (
+        !reason &&
+        (rect.x < 0 ||
+          rect.y < 0 ||
+          rect.x + rect.width > 1.000001 ||
+          rect.y + rect.height > 1.000001)
+      )
+        reason = 'outside-page'
+      const items = block.items
+        .map((key, index) => {
+          if (accounted.has(key)) throw new Error('Duplicate PDF source item ownership')
+          accounted.add(key)
+          return { index: Number(key.split(':')[1]), text: block.originalStrings[index] }
+        })
+        .sort((a, b) => a.index - b.index)
+      // A wide caption above a narrow column can create a bounding box containing
+      // another block. Retain the unit identity/text but use its existing line boxes.
+      const overlaps = page.blocks.some(
+        (other) =>
+          other.id !== block.id &&
+          other.rect.x < r.right &&
+          other.rect.right > r.x &&
+          other.rect.y < r.bottom &&
+          other.rect.bottom > r.y
+      )
+      return overlaps && block.lines.length > 1 && !reason
+        ? block.lines.map((line) => ({
+            pageNumber: fragment.page,
+            rect: {
+              x: line.x / page.width,
+              y: line.y / page.height,
+              width: (line.right - line.x) / page.width,
+              height: (line.bottom - line.y) / page.height
+            },
+            items: items.filter((item) => line.items.includes(fragment.page + ':' + item.index))
+          }))
+        : [{ pageNumber: fragment.page, rect, items }]
+    })
+    // Keep the established grouping/IDs unchanged. Recover only isolated original items;
+    // never merge a rotated table's values through the prose grouping heuristic.
+    if (
+      reason === 'unsupported-orientation' &&
+      fragments.length === 1 &&
+      fragments[0].items.length === 1
+    ) {
+      const fragment = fragments[0],
+        original = fragment.items[0]
+      const page = pages[fragment.pageNumber - 1],
+        item = page.items[original.index]
+      const rect =
+        independentRect(item, page, styles[fragment.pageNumber - 1][item.fontName ?? '']) ??
+        outlierNavigation.get(`${fragment.pageNumber}:${original.index}`)
+      if (rect) {
+        const id = `rot-p${fragment.pageNumber}-i${original.index}`
+        independent.push({
+          id,
+          source: original.text,
+          sourceOnly: true,
+          fragments: [{ ...fragment, rect }]
+        })
+        if (unreliableItems.has(`${fragment.pageNumber}:${original.index}`))
+          warnings.push(
+            Object.freeze({ unitId: id, reasons: Object.freeze(['unreliable-font-unicode']) })
+          )
+        continue
+      }
+    }
+    if (reason) {
+      const remaining = fragments.flatMap((fragment) =>
+        fragment.items.flatMap((original) => {
+          if (reason === 'outside-page') {
+            const page = pages[fragment.pageNumber - 1],
+              item = page.items[original.index],
+              style = styles[fragment.pageNumber - 1][item.fontName ?? '']
+            // One overflowing peer must not discard a complete page-in item.
+            // The broken group proves no paragraph contract: retain only a
+            // separately bounded original anchor, using explicit native metrics.
+            const rect =
+              item.fontName &&
+              style?.vertical === false &&
+              Number.isFinite(style.ascent) &&
+              Number.isFinite(style.descent)
+                ? independentRect(item, page, style)
+                : undefined
+            if (rect) {
+              const id = `inpage-p${fragment.pageNumber}-i${original.index}`
+              independent.push({
+                id,
+                source: original.text,
+                sourceOnly: true,
+                fragments: [{ pageNumber: fragment.pageNumber, rect, items: [original] }]
+              })
+              const reasons = [...unit.risks]
+              if (unreliableItems.has(`${fragment.pageNumber}:${original.index}`))
+                reasons.push('unreliable-font-unicode')
+              if (reasons.length)
+                independentWarnings.push(
+                  Object.freeze({ unitId: id, reasons: Object.freeze(reasons) })
+                )
+              return []
+            }
+            const partial = partialNavigation.get(`${fragment.pageNumber}:${original.index}`)
+            if (partial) {
+              const id = `clipped-p${fragment.pageNumber}-i${original.index}`
+              independent.push({
+                id,
+                source: original.text,
+                sourceOnly: true,
+                fragments: [{ pageNumber: fragment.pageNumber, ...partial, items: [original] }]
+              })
+              const reasons = ['partially-outside-page']
+              if (unreliableItems.has(`${fragment.pageNumber}:${original.index}`))
+                reasons.push('unreliable-font-unicode')
+              independentWarnings.push(
+                Object.freeze({ unitId: id, reasons: Object.freeze(reasons) })
+              )
+              return []
+            }
+          }
+          return [{ ...original, pageNumber: fragment.pageNumber }]
+        })
+      )
+      if (remaining.length) exclusions.push({ unitId: unit.id, reason, items: remaining })
+    } else {
+      const unreliable = fragments.some((fragment) =>
+        fragment.items.some((item) => unreliableItems.has(`${fragment.pageNumber}:${item.index}`))
+      )
+      // Keep a proved missing-Unicode symbol on its existing original navigation.
+      // Ordinary words and mixed prose retain their established admission.
+      const sourceOnly =
+        unit.sourceOnly ||
+        (unreliable &&
+          [...unit.source].length <= 32 &&
+          !/[\p{L}\p{M}]{2}/u.test(unit.source) &&
+          [...unit.source].some((character) => {
+            const code = character.codePointAt(0)!
+            return code < 32 && code !== 9 && code !== 10 && code !== 13
+          }) &&
+          fragments.length > 0 &&
+          fragments.reduce((count, fragment) => count + fragment.items.length, 0) <= 4 &&
+          fragments.every(
+            (fragment) =>
+              fragment.pageNumber === fragments[0].pageNumber &&
+              fragment.items.length > 0 &&
+              fragment.items.every((item) => {
+                const native = pages[fragment.pageNumber - 1].items[item.index]
+                return (
+                  native.str === item.text &&
+                  Number.isFinite(native.width) &&
+                  native.width > 0 &&
+                  Number.isFinite(native.height) &&
+                  native.height > 0
+                )
+              })
+          ))
+      units.push({
+        id: unit.id,
+        source: unit.source,
+        ...(sourceOnly ? { sourceOnly: true as const } : {}),
+        ...(unit.preserve ? { preserve: unit.preserve } : {}),
+        ...(unit.figure ? { figure: true as const } : {}),
+        ...(unit.referenceBoundary ? { referenceBoundary: true as const } : {}),
+        fragments
+      })
+      terminalSource?.observe(unit, units.at(-1)!)
+      const reasons = [...unit.risks]
+      if (unreliable) reasons.push('unreliable-font-unicode')
+      if (reasons.length)
+        warnings.push(Object.freeze({ unitId: unit.id, reasons: Object.freeze(reasons) }))
+    }
+  }
+  if (accounted.size !== textItemCount) throw new Error('Incomplete PDF source item coverage')
+  // Retain native item order for independent anchors; this is not inferred table reading order.
+  independent.sort(
+    (a, b) =>
+      a.fragments[0].pageNumber - b.fragments[0].pageNumber ||
+      a.fragments[0].items[0].index - b.fragments[0].items[0].index
+  )
+  warnings.push(...independentWarnings)
+  const excludedItemCount = exclusions.reduce((count, entry) => count + entry.items.length, 0)
+  let finalUnits = terminalContactSources(
+    [...units, ...independent],
+    layout,
+    pages,
+    document.numPages
+  )
+  if (scopedDisplays.length) {
+    const auxiliary = createAuxiliaryNativeDisplayInkReader({
+        document,
+        sourceIdentity,
+        nativeDocumentFactory,
+        signal
+      }),
+      protectedOwners = new Set<string>()
+    try {
+      for (const context of scopedDisplays) {
+        signal.throwIfAborted()
+        for (const id of await nativeScopedDisplayOwners(
+          finalUnits,
+          context.page,
+          context.content,
+          context.viewport,
+          context.pageNumber,
+          auxiliary
+        ))
+          protectedOwners.add(id)
+        signal.throwIfAborted()
+      }
+    } finally {
+      await auxiliary.dispose()
+    }
+    finalUnits = finalUnits.map((unit) =>
+      protectedOwners.has(unit.id) && !unit.sourceOnly && !unit.preserve
+        ? { ...unit, sourceOnly: true as const, preserve: 'formula' as const }
+        : unit
+    )
+  }
+  if (nativeMatrices.length) {
+    const reader = createNativeMatrixReader({
+        document,
+        sourceIdentity,
+        nativeDocumentFactory,
+        signal
+      }),
+      protectedOwners = new Set<string>()
+    try {
+      for (const context of nativeMatrices)
+        for (const id of await nativeMatrixOwners(
+          finalUnits,
+          context.page,
+          context.content,
+          context.viewport,
+          context.pageNumber,
+          reader
+        ))
+          protectedOwners.add(id)
+    } finally {
+      await reader.dispose()
+    }
+    signal.throwIfAborted()
+    finalUnits = finalUnits.map((unit) =>
+      protectedOwners.has(unit.id)
+        ? { ...unit, sourceOnly: true as const, preserve: 'formula' as const }
+        : unit
+    )
+  }
+  if (nativeFunctions.length) {
+    const reader = createNativeFunctionDisplayReader({
+        document,
+        sourceIdentity,
+        nativeDocumentFactory,
+        signal
+      }),
+      protectedOwners = new Set<string>()
+    try {
+      for (const context of nativeFunctions)
+        for (const id of await nativeFunctionDisplayOwners(
+          finalUnits,
+          context.page,
+          context.content,
+          context.viewport,
+          context.pageNumber,
+          reader
+        ))
+          protectedOwners.add(id)
+    } finally {
+      await reader.dispose()
+    }
+    signal.throwIfAborted()
+    finalUnits = finalUnits.map((unit) =>
+      protectedOwners.has(unit.id)
+        ? { ...unit, sourceOnly: true as const, preserve: 'formula' as const }
+        : unit
+    )
+  }
+  await taggedReferences.owners(finalUnits, pages)
+  const taggedOwners = taggedReferences.currentOwners(finalUnits, pages)
+  finalUnits = finalUnits.map((unit) => {
+    const role = taggedOwners.get(unit.id)
+    return role === 'reference'
+      ? { ...unit, sourceOnly: true as const, preserve: 'reference' as const }
+      : role === 'original-only-url'
+        ? { ...unit, sourceOnly: true as const }
+        : unit
+  })
+  const tableCaptionOwners = await nativeTableCaptionOwners(finalUnits, document, signal)
+  finalUnits = finalUnits.map((unit) => {
+    if (!tableCaptionOwners.has(unit.id)) return unit
+    const restored = { ...unit }
+    delete restored.sourceOnly
+    delete restored.preserve
+    return restored
+  })
+  signal.throwIfAborted()
+  checkType3Navigation()
+  checkOcclusions()
+  checkCaptionTerminals()
+  if (
+    !nativeReferenceRolePagesCurrent(pages, unreliableItems) ||
+    !nativeOwnedReferenceRolesCurrent(pages)
+  )
+    throw new Error('Native reference sources changed during extraction')
+  const sourceInput = { resourceRequestKey, fingerprint, pages, units: finalUnits }
+  const source = terminalSource?.create(sourceInput) ?? createPdfTranslationSource(sourceInput)
+  rememberNativeCaptionEligibility(source, tableCaptionOwners)
+  rememberPdfTranslationSourceParser(source)
+  return Object.freeze({
+    source,
+    coverage: Object.freeze({
+      pageCount: pages.length,
+      textItemCount,
+      includedItemCount: textItemCount - excludedItemCount,
+      excludedItemCount,
+      pagesWithoutText: Object.freeze(pagesWithoutText),
+      ...(pageDiagnostics.length ? { pageDiagnostics: Object.freeze(pageDiagnostics) } : {}),
+      exclusions: Object.freeze(
+        exclusions.map((entry) =>
+          Object.freeze({
+            ...entry,
+            items: Object.freeze(entry.items.map((item) => Object.freeze(item)))
+          })
+        )
+      ),
+      warnings: Object.freeze(warnings)
+    })
+  })
+}

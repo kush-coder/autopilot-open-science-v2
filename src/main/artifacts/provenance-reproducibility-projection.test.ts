@@ -1,0 +1,93 @@
+import { expect, it } from 'vitest'
+import { projectCapturedArtifactReproducibility } from '@aipoch/reproducibility'
+import type { PersistedArtifactExecutionSnapshot } from '../../shared/artifact-provenance'
+import { projectPublicArtifactExecutionSnapshot } from './provenance-execution-projection'
+
+const snapshot = (): PersistedArtifactExecutionSnapshot => ({
+  schemaVersion: 2,
+  rootFrameId: 'root',
+  agentFrameId: 'agent',
+  messageBranchId: 'branch',
+  terminalPromptMessageId: 'prompt',
+  producerRunId: 'run',
+  producerRunIndex: 0,
+  createdAt: '2026-09-02T00:00:00.000Z',
+  inputFiles: [],
+  runs: [],
+  reproducibilityRecipe: {
+    schemaVersion: 1,
+    recipeId: 'b'.repeat(64),
+    targetVersionId: 'v1',
+    targetEntityId: 'artifact-version:v1',
+    targetChecksum: 'a'.repeat(64),
+    graphChecksum: 'c'.repeat(64),
+    steps: [],
+    environmentRequirements: [],
+    frontiers: [
+      {
+        frontierId: 'original-inputs',
+        claimScope: 'end-to-end',
+        stepIds: [],
+        crossingFiles: [
+          {
+            entityId: 'private-input',
+            checksum: 'd'.repeat(64),
+            sizeBytes: 1,
+            contentStorageKey: 'private/blob',
+            materializationPath: 'input.csv'
+          }
+        ],
+        reasonCodes: []
+      }
+    ],
+    capture: { state: 'sealed', reasonCodes: [] }
+  },
+  provenanceGraph: {
+    schemaVersion: 1,
+    targetEntityId: 'artifact-version:v1',
+    completeness: 'complete',
+    reasonCodes: [],
+    activities: [],
+    edges: [],
+    entities: [
+      {
+        entityId: 'artifact-version:v1',
+        kind: 'artifact-version',
+        versionId: 'v1',
+        filename: 'result.csv',
+        checksum: 'a'.repeat(64),
+        sizeBytes: 1
+      }
+    ]
+  }
+})
+
+it('assembles the package projection with host identity and public inputs without leaking captured internals', () => {
+  const persisted = snapshot()
+  const publicInputs: Parameters<typeof projectPublicArtifactExecutionSnapshot>[1] = []
+  const projected = projectPublicArtifactExecutionSnapshot(persisted, publicInputs)
+  expect(projected.reproducibility).toEqual(projectCapturedArtifactReproducibility(persisted))
+  expect(projected.reproducibility).toBeDefined()
+  expect(projected).toMatchObject({
+    rootFrameId: 'root',
+    agentFrameId: 'agent',
+    messageBranchId: 'branch',
+    terminalPromptMessageId: 'prompt',
+    producerRunId: 'run',
+    producerRunIndex: 0,
+    createdAt: persisted.createdAt
+  })
+  expect(projected.inputFiles).toBe(publicInputs)
+  expect(projected.runs).toBe(persisted.runs)
+  expect(projected).not.toHaveProperty('provenanceGraph')
+  expect(projected).not.toHaveProperty('reproducibilityRecipe')
+  expect(JSON.stringify(projected)).not.toContain('private/blob')
+})
+
+it('preserves a historical snapshot without graph evidence instead of inventing a projection', () => {
+  const persisted = snapshot()
+  delete persisted.provenanceGraph
+  expect(projectPublicArtifactExecutionSnapshot(persisted, [])).not.toHaveProperty(
+    'reproducibility'
+  )
+})

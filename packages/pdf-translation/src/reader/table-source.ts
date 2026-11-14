@@ -1,0 +1,1878 @@
+import { verifiedPdfTableRegions, structureRegionContains } from './structure-regions.js'
+import { getPdfTranslationTextContent } from './text-content.js'
+import { nativePartialNavigation } from './native-source-geometry.js'
+import type { PDFDocumentProxy, PDFPageProxy, getDocument } from 'pdfjs-dist'
+import type { TextItem, TextStyle } from 'pdfjs-dist/types/src/display/api.js'
+import { parsePdfStructureResult, type PdfStructureResult } from '@aipoch/pdf-structure/result'
+import { createPdfTranslationSource, type PdfTranslationFragment } from './source.js'
+import type { PdfTranslationExtraction } from './extraction.js'
+
+export type PdfTranslationSourceIdentity = Readonly<{
+  sourceChecksum: string
+  sourceSizeBytes: number
+}>
+type Document = Pick<PDFDocumentProxy, 'numPages' | 'fingerprints' | 'getPage'>
+type Viewport = ReturnType<PDFPageProxy['getViewport']>
+type Rect = PdfTranslationFragment['rect']
+type TableRect = Rect & { page: number }
+type SourcePiece = { text: string; rect: Rect; range?: { start: number; end: number } }
+type NativeClaimText = {
+  originText: string
+  native: TextItem
+  pageNumber: number
+  index: number
+  split: boolean
+  measured: boolean
+}
+
+// Reuse only a complete, anchored original-unit literal alignment. Duplicate
+// native identities have already been rejected by the ownership inventory.
+function originalNativeJoins(source: PdfTranslationExtraction['source']): Set<string> {
+  const joins = new Set<string>()
+  for (const unit of source.units) {
+    const items = unit.fragments.flatMap((f) => f.items.map((i) => ({ ...i, page: f.pageNumber })))
+    let offset = 0,
+      previous: (typeof items)[number] | undefined,
+      valid = true
+    const proposed: string[] = []
+    for (const item of items) {
+      if (!item.text || item.text.trim() !== item.text) {
+        valid = false
+        break
+      }
+      const priorEnd = offset
+      while (/\s/u.test(unit.source[offset] ?? '') && offset < unit.source.length) offset++
+      if (!unit.source.startsWith(item.text, offset)) {
+        valid = false
+        break
+      }
+      if (
+        previous &&
+        offset === priorEnd &&
+        previous.page === item.page &&
+        item.index === previous.index + 1
+      )
+        proposed.push(`${item.page}:${previous.index}:${item.index}`)
+      offset += item.text.length
+      previous = item
+    }
+    if (valid && !unit.source.slice(offset).trim()) for (const key of proposed) joins.add(key)
+  }
+  return joins
+}
+function nativeWitnessJoin(
+  previous: NativeClaimText,
+  claim: NativeClaimText,
+  joins: ReadonlySet<string>
+): boolean {
+  const a = previous.native,
+    b = claim.native
+  return (
+    !(/^\p{L}$/u.test(a.str) && /^\p{L}$/u.test(b.str)) &&
+    !!a.fontName &&
+    !!b.fontName &&
+    joins.has(`${claim.pageNumber}:${previous.index}:${claim.index}`) &&
+    previous.pageNumber === claim.pageNumber &&
+    claim.index === previous.index + 1 &&
+    a.hasEOL === false &&
+    a.dir === 'ltr' &&
+    b.dir === 'ltr' &&
+    a.width > 0 &&
+    b.width > 0 &&
+    a.transform[0] > 0 &&
+    a.transform[3] > 0 &&
+    [a, b].every(
+      (i) =>
+        i.transform.every(Number.isFinite) &&
+        Math.abs(i.transform[1]) <= 1e-6 &&
+        Math.abs(i.transform[2]) <= 1e-6
+    ) &&
+    [0, 1, 2, 3, 5].every((axis) => Math.abs(a.transform[axis] - b.transform[axis]) <= 1e-6) &&
+    b.transform[4] - a.transform[4] - a.width <= a.transform[0] / 1000 &&
+    b.transform[4] > a.transform[4] &&
+    b.transform[4] + b.width > a.transform[4] + a.width
+  )
+}
+
+function nativeCellText(
+  claims: readonly NativeClaimText[],
+  cellText: string,
+  originCount: number,
+  originalJoins: ReadonlySet<string>
+): string {
+  const original = claims.map(({ originText }) => originText).join(' ')
+  // Shared or clipped parents retain the existing ownership/text contract.
+  if (claims.length !== originCount || claims.some((claim) => claim.split || claim.measured))
+    return original
+  const candidate = claims
+    .map((claim, index) => {
+      if (!index) return claim.originText
+      const previous = claims[index - 1],
+        a = previous.native,
+        b = claim.native,
+        gap = b.transform[4] - a.transform[4] - a.width
+      // A thousandth-em advance rounding allowance is permitted, not a word gap.
+      // Consecutive PDF.js items exclude omitted whitespace/marked-content ink.
+      const contiguous =
+        /^\p{L}$/u.test(a.str) &&
+        /^\p{L}$/u.test(b.str) &&
+        previous.pageNumber === claim.pageNumber &&
+        claim.index === previous.index + 1 &&
+        a.hasEOL === false &&
+        !!a.fontName &&
+        a.fontName === b.fontName &&
+        a.transform[0] > 0 &&
+        a.transform[3] > 0 &&
+        Math.abs(a.transform[1]) <= 1e-6 &&
+        Math.abs(a.transform[2]) <= 1e-6 &&
+        [0, 1, 2, 3, 5].every((axis) => Math.abs(a.transform[axis] - b.transform[axis]) <= 1e-6) &&
+        Math.abs(gap) <= a.transform[0] / 1000
+      return (
+        (contiguous || nativeWitnessJoin(previous, claim, originalJoins) ? '' : ' ') +
+        claim.originText
+      )
+    })
+    .join('')
+  // Geometry never supplies missing letters or overrides a cell's word breaks.
+  return candidate.trim().replace(/\s+/gu, ' ') === cellText.trim().replace(/\s+/gu, ' ')
+    ? candidate
+    : original
+}
+
+// Keep the extractor's canonical spelling only when the whole native owner and
+// the worker's independent script runs agree on the same scientific number.
+function canonicalScientificSource(
+  source: string,
+  claims: readonly NativeClaimText[],
+  runs: readonly { text: string; position: string }[] | undefined
+): boolean {
+  const normalRuns = runs?.slice(0, -1) ?? [],
+    exponent = runs?.at(-1),
+    normalText = normalRuns.map((run) => run.text).join('')
+  if (
+    !normalRuns.length ||
+    normalRuns.some((run) => run.position !== 'normal' || !run.text.trim()) ||
+    exponent?.position !== 'superscript' ||
+    !/^[+−-]?\d+(?:\.\d+)?\s*×\s*10$/u.test(normalText) ||
+    !/^[+−-]?\d+$/u.test(exponent.text)
+  )
+    return false
+  const script = [...exponent.text]
+    .map((c) => ('0123456789'.includes(c) ? '⁰¹²³⁴⁵⁶⁷⁸⁹'[Number(c)] : c === '+' ? '⁺' : '⁻'))
+    .join('')
+  if (normalizeSourceText(source) !== normalizeSourceText(normalText + script)) return false
+  let start = claims.length,
+    suffixLength = 0
+  while (start > 0 && suffixLength < exponent.text.length)
+    suffixLength += normalizeSourceText(claims[--start].originText).length
+  if (
+    suffixLength !== exponent.text.length ||
+    normalizeSourceText(
+      claims
+        .slice(start)
+        .map((c) => c.originText)
+        .join('')
+    ) !== exponent.text
+  )
+    return false
+  const base = claims[start - 1]?.native,
+    suffix = claims.slice(start)
+  if (
+    start < 1 ||
+    claims[start - 1].originText !== '10' ||
+    !base ||
+    !suffix.length ||
+    normalizeSourceText(claims.map((c) => c.originText).join('')) !==
+      normalizeSourceText(normalText + exponent.text)
+  )
+    return false
+  const h = base.height,
+    first = suffix[0].native
+  return (
+    claims.every(
+      ({ native: n }) =>
+        !!n.fontName &&
+        n.dir === 'ltr' &&
+        [...n.transform, n.width, n.height].every(Number.isFinite) &&
+        n.width > 0 &&
+        n.height > 0 &&
+        n.transform[0] > 0 &&
+        n.transform[3] > 0 &&
+        n.transform[1] === 0 &&
+        n.transform[2] === 0
+    ) &&
+    claims
+      .slice(0, start)
+      .every(({ native: n }) => Math.abs(n.transform[5] - base.transform[5]) < h * 0.01) &&
+    first.transform[4] >= base.transform[4] + base.width - h * 0.1 &&
+    first.transform[4] <= base.transform[4] + base.width + h * 0.25 &&
+    suffix.every(
+      ({ native: n }) =>
+        n.height >= h * 0.5 &&
+        n.height < h * 0.85 &&
+        n.transform[5] - base.transform[5] > h * 0.1 &&
+        n.transform[5] - base.transform[5] < h * 0.8 &&
+        Math.abs(n.transform[5] - first.transform[5]) < h * 0.01
+    )
+  )
+}
+
+// Independent native advance boxes, not glyph masks or regions safe to paint over.
+function nativeRect(
+  item: TextItem,
+  style: TextStyle | undefined,
+  viewport: Viewport
+): Rect | undefined {
+  if (
+    item.dir !== 'ltr' ||
+    style?.vertical ||
+    item.transform.length !== 6 ||
+    ![...item.transform, item.width, item.height].every(Number.isFinite)
+  )
+    return undefined
+  const [a, b, c, d, x, y] = item.transform,
+    advance = Math.hypot(a, b)
+  if (advance <= 0 || item.width <= 0 || item.height <= 0 || a * d - b * c <= 0) return undefined
+  const ux = a / advance,
+    uy = b / advance
+  if (
+    Math.min(Math.abs(ux), Math.abs(uy)) > 0.0001 ||
+    Math.abs(a * c + b * d) > advance * Math.hypot(c, d) * 0.5
+  )
+    return undefined
+  const points = [
+    [x, y],
+    [x + ux * item.width, y + uy * item.width],
+    [x - uy * item.height, y + ux * item.height],
+    [x + ux * item.width - uy * item.height, y + uy * item.width + ux * item.height]
+  ].map(([x, y]) => viewport.convertToViewportPoint(x, y))
+  const left = Math.min(...points.map((p) => p[0])),
+    top = Math.min(...points.map((p) => p[1]))
+  const rect = {
+    x: left / viewport.width,
+    y: top / viewport.height,
+    width: (Math.max(...points.map((p) => p[0])) - left) / viewport.width,
+    height: (Math.max(...points.map((p) => p[1])) - top) / viewport.height
+  }
+  return Object.values(rect).every(Number.isFinite) &&
+    rect.width > 0 &&
+    rect.height > 0 &&
+    rect.x >= -1e-9 &&
+    rect.y >= -1e-9 &&
+    rect.x + rect.width <= 1 + 1e-9 &&
+    rect.y + rect.height <= 1 + 1e-9
+    ? rect
+    : undefined
+}
+
+// Preserve maximal canonical numeric script literals already emitted by the
+// native layout. This detects loss only; it neither infers a script from runs
+// nor changes the original source or the existing scientific-number keeper.
+function canonicalScriptLiterals(text: string): Map<string, number> {
+  const counts = new Map<string, number>()
+  for (const literal of text.match(/[⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁼⁽⁾₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎]+/gu) ?? [])
+    counts.set(literal, (counts.get(literal) ?? 0) + 1)
+  return counts
+}
+
+function normalizeSourceText(text: string): string {
+  return text.replace(/\s+/gu, '')
+}
+
+function countSubstring(haystack: string, needle: string): number {
+  if (!needle) return 0
+  let count = 0,
+    offset = 0
+  while (true) {
+    const index = haystack.indexOf(needle, offset)
+    if (index < 0) return count
+    count++
+    offset = index + 1
+  }
+}
+
+const REGION_EPSILON = 1e-6
+
+function sameRect(a: Rect, b: Rect): boolean {
+  return (['x', 'y', 'width', 'height'] as const).every(
+    (axis) => Math.abs(a[axis] - b[axis]) <= REGION_EPSILON
+  )
+}
+
+function envelope(rects: readonly Rect[]): Rect {
+  const x = Math.min(...rects.map((rect) => rect.x)),
+    y = Math.min(...rects.map((rect) => rect.y)),
+    right = Math.max(...rects.map((rect) => rect.x + rect.width)),
+    bottom = Math.max(...rects.map((rect) => rect.y + rect.height))
+  return { x, y, width: right - x, height: bottom - y }
+}
+
+// A source item can be represented by several glyph runs (for example a word
+// split around a marked-content boundary). Keep all of those regions together
+// only when they form one horizontal native advance box. The caller still
+// consumes every matched region, so an unaccounted run cannot disappear.
+function findNativeRegionGroup(
+  regions: readonly { region: TableRect; index: number }[],
+  native: Rect,
+  page: number
+): number[] | undefined {
+  const exact = regions.filter(({ region }) => region.page === page && sameRect(region, native))
+  if (exact.length === 1) return [exact[0].index]
+  if (exact.length > 1) return undefined
+  const candidates = regions
+    .filter(
+      ({ region }) =>
+        region.page === page &&
+        region.x >= native.x - REGION_EPSILON &&
+        region.x + region.width <= native.x + native.width + REGION_EPSILON &&
+        Math.abs(region.y - native.y) <= REGION_EPSILON &&
+        Math.abs(region.height - native.height) <= REGION_EPSILON
+    )
+    .sort((a, b) => a.region.x - b.region.x)
+  if (candidates.length < 2) return undefined
+  const groups: number[][] = []
+  for (let start = 0; start < candidates.length; start++) {
+    for (let end = start + 1; end <= candidates.length; end++) {
+      const group = candidates.slice(start, end),
+        boxes = group.map(({ region }) => region),
+        indexes = group.map(({ index }) => index)
+      if (
+        indexes.at(-1)! - indexes[0] !== indexes.length - 1 ||
+        group[0].region.x > native.x + REGION_EPSILON ||
+        group.at(-1)!.region.x + group.at(-1)!.region.width <
+          native.x + native.width - REGION_EPSILON ||
+        boxes.some(
+          (box, index) =>
+            index > 0 && box.x < boxes[index - 1].x + boxes[index - 1].width - REGION_EPSILON
+        )
+      )
+        continue
+      if (sameRect(envelope(boxes), native)) groups.push(group.map(({ index }) => index))
+    }
+  }
+  return groups.length === 1 ? groups[0] : undefined
+}
+
+// A table cell may contain clipped pieces from several PDF.js text items.  The
+// structure cache keeps those origins in the same order as the cell regions;
+// recover each piece only when a unique, whitespace-normalized partition exists.
+function partitionCellText(cellText: string, origins: readonly string[]): string[] | undefined {
+  const trimmed = cellText.trim(),
+    tokens = trimmed ? trimmed.split(/\s+/u) : []
+  if (!tokens.length || !origins.length) return undefined
+  if (origins.length === 1 && normalizeSourceText(trimmed) === normalizeSourceText(origins[0]))
+    return [trimmed]
+  const solutions: string[][] = []
+  const visit = (originIndex: number, tokenIndex: number, pieces: string[]): void => {
+    if (solutions.length > 1) return
+    if (originIndex === origins.length) {
+      if (tokenIndex === tokens.length) solutions.push(pieces)
+      return
+    }
+    const origin = normalizeSourceText(origins[originIndex])
+    for (let end = tokenIndex + 1; end <= tokens.length; end++) {
+      const piece = tokens.slice(tokenIndex, end).join(' '),
+        normalized = normalizeSourceText(piece)
+      if (!normalized || !origin.includes(normalized) || countSubstring(origin, normalized) !== 1)
+        continue
+      visit(originIndex + 1, end, [...pieces, piece])
+    }
+  }
+  visit(0, 0, [])
+  return solutions.length === 1 ? solutions[0] : undefined
+}
+
+type TableOriginalRetention = Readonly<{
+  retainedUnitIds: readonly string[]
+  retainedSourcePageNumbers: readonly number[]
+}>
+const tableRetention = new WeakMap<
+  PdfTranslationExtraction,
+  TableOriginalRetention & { current: () => boolean }
+>()
+export function getPdfTableOriginalRetention(
+  extraction: PdfTranslationExtraction
+): TableOriginalRetention | undefined {
+  const proof = tableRetention.get(extraction)
+  return proof?.current()
+    ? Object.freeze({
+        retainedUnitIds: proof.retainedUnitIds,
+        retainedSourcePageNumbers: proof.retainedSourcePageNumbers
+      })
+    : undefined
+}
+export function isCurrentPdfTableSources(extraction: PdfTranslationExtraction): boolean {
+  return tableRetention.get(extraction)?.current() ?? true
+}
+
+/** Before publication only. Invalid provenance fails closed; known structural conflicts retain native units. */
+export async function applyCachedPdfTableSources({
+  extraction,
+  document,
+  sourceId,
+  sourceIdentity,
+  nativeDocumentFactory,
+  signal,
+  readCached
+}: {
+  extraction: PdfTranslationExtraction
+  document: Document
+  sourceId: string
+  sourceIdentity: PdfTranslationSourceIdentity
+  nativeDocumentFactory?: typeof getDocument
+  signal: AbortSignal
+  readCached: (
+    request: Readonly<{ sourceId: string; page: number }>
+  ) => Promise<PdfStructureResult | undefined>
+}): Promise<PdfTranslationExtraction> {
+  signal.throwIfAborted()
+  const identity = { ...sourceIdentity },
+    source = extraction.source
+  let warningOnly = extraction
+  const retainOriginal = (): PdfTranslationExtraction =>
+    warningOnly !== extraction &&
+    source.fingerprint === document.fingerprints[0] &&
+    source.pages.length === document.numPages
+      ? warningOnly
+      : extraction
+  if (
+    !/^[a-f0-9]{64}$/.test(identity.sourceChecksum) ||
+    !Number.isSafeInteger(identity.sourceSizeBytes) ||
+    identity.sourceSizeBytes <= 0 ||
+    !source.fingerprint ||
+    source.fingerprint !== document.fingerprints[0] ||
+    source.pages.length !== document.numPages
+  )
+    return extraction
+  const current = (): void => {
+    signal.throwIfAborted()
+    if (
+      source.fingerprint !== document.fingerprints[0] ||
+      source.pages.length !== document.numPages
+    )
+      throw new Error('PDF source changed during table verification')
+  }
+  try {
+    const batches = new Map<string, string>(),
+      results: PdfStructureResult[] = []
+    let bytes = 0,
+      elements = 0
+    for (let page = 1; page <= document.numPages; page++) {
+      current()
+      const cached = await readCached({ sourceId, page })
+      current()
+      if (!cached) continue
+      // Schema decoding copies the response before any further await. Identity comes from the lease.
+      const result = parsePdfStructureResult(cached, { ...cached, ...identity })
+      if (result.pageCount !== document.numPages || !result.processedPages.includes(page))
+        return extraction
+      const serialized = JSON.stringify(result),
+        prior = batches.get(result.extractionId)
+      if (prior !== undefined) {
+        if (prior !== serialized) return extraction
+        continue
+      }
+      bytes += serialized.length * 2
+      elements += result.elements.length
+      // Same bounded cache inventory as the existing figures reader; never publish a partial replacement.
+      if (bytes > 32 * 1024 ** 2 || elements > 512) return extraction
+      batches.set(result.extractionId, serialized)
+      results.push(result)
+    }
+    const owners = new Map<string, string>(),
+      originalUnits = new Map<string, (typeof source.units)[number]>(),
+      // A PDF.js text item can contain two visually separate table values.  Keep
+      // one ownership claim for the native item, while allowing strictly clipped
+      // pieces from the same table to contribute to the one source-only unit.
+      claims = new Map<
+        string,
+        {
+          tableKey: string
+          row: number
+          rowSpan: number
+          replacementIndex: number
+          nativeRect: Rect
+          originText: string
+          rects: Rect[]
+          pieces: SourcePiece[]
+          split: boolean
+          measured: boolean
+        }
+      >()
+    const ids = new Set<string>(),
+      removed = new Set<string>(),
+      boundaryConflicts = new Set<string>()
+    const clippedOwners = new Map<string, PdfTranslationFragment>()
+    const replacements: PdfTranslationExtraction['source']['units'][number][] = []
+    for (const unit of source.units) {
+      if (ids.has(unit.id)) return extraction
+      ids.add(unit.id)
+      for (const fragment of unit.fragments)
+        for (const item of fragment.items) {
+          const key = `${fragment.pageNumber}:${item.index}`
+          if (owners.has(key)) return extraction
+          owners.set(key, item.text)
+          originalUnits.set(key, unit)
+          if (fragment.unclippedRect) {
+            if (
+              !unit.sourceOnly ||
+              unit.fragments.length !== 1 ||
+              fragment.items.length !== 1 ||
+              unit.source !== item.text
+            )
+              return extraction
+            clippedOwners.set(key, fragment)
+          }
+        }
+    }
+    // The worker may omit all optional origins when their decoding budget is
+    // exceeded. Nothing on those pages may be consumed without evidence, but
+    // this absence says nothing about a separate, fully verified page batch.
+    // Partial proofs still take the transactional validation path below.
+    const sourceFreePages = new Set<number>()
+    for (const result of results) {
+      const tables = result.elements.flatMap(
+        (element) =>
+          element.tableParts?.map((part) => part.table) ?? (element.table ? [element.table] : [])
+      )
+      if (
+        tables.some((table) => table.cells.some((cell) => cell.text.trim())) &&
+        result.elements.every((element) => !element.sourceItems && !element.nativeBody) &&
+        tables.every((table) =>
+          table.cells.every((cell) => !cell.sourceItems && !cell.sourceSegments)
+        )
+      )
+        for (const page of result.processedPages) sourceFreePages.add(page)
+    }
+    if (sourceFreePages.size) {
+      // A native unit and a worker batch are indivisible. Auxiliary pages only
+      // provide read-only context; schema-checked table origins belong to the
+      // processed pages. Including context would connect every adjacent batch.
+      const groups = [
+        ...source.units.map((unit) => unit.fragments.map((fragment) => fragment.pageNumber)),
+        ...results.map((result) => result.processedPages)
+      ]
+      let expanded = true
+      while (expanded) {
+        expanded = false
+        for (const pages of groups) {
+          if (!pages.some((page) => sourceFreePages.has(page))) continue
+          for (const page of pages)
+            if (!sourceFreePages.has(page)) {
+              sourceFreePages.add(page)
+              expanded = true
+            }
+        }
+      }
+      const independent = results.filter(
+        (result) => !result.processedPages.some((page) => sourceFreePages.has(page))
+      )
+      results.splice(0, results.length, ...independent)
+      if (!results.length) return retainOriginal()
+    }
+    const originalJoins = originalNativeJoins(source)
+    // Structural uncertainty is not a source failure. Keep the image/cache and
+    // original native units for those tables, while independently proved tables
+    // may still supply source-only cell units. A unit cannot be partly consumed:
+    // tables sharing even one original unit belong to the same fallback group.
+    const conflictCodes = new Set([
+      'overlapping-predicted-columns',
+      'conflicting-spanning-cells',
+      'unresolved-spanning-cells',
+      'span-conflicts-with-source-rows',
+      'span-conflicts-with-source-columns',
+      'native-table-structure-ambiguous'
+    ])
+    const tableOrigins = new Map<string, Set<string>>()
+    const blockedTables = new Set<string>(),
+      unreliableMathUnits = new Set<string>(),
+      incompleteOriginalUnits = new Set<string>()
+    for (const result of results)
+      for (const element of result.elements) {
+        const tables =
+          element.tableParts?.map((part) => part.table) ?? (element.table ? [element.table] : [])
+        for (const [part, table] of tables.entries()) {
+          const tableKey = `${result.extractionId}:${element.id}:${part}`
+          tableOrigins.set(
+            tableKey,
+            new Set(
+              table.cells.flatMap((cell) =>
+                [...(cell.sourceItems ?? []), ...(cell.sourceSegments ?? [])].map(
+                  (origin) => `${origin.pageNumber}:${origin.index}`
+                )
+              )
+            )
+          )
+          if ([...element.issues, ...table.issues].some((issue) => conflictCodes.has(issue.code)))
+            blockedTables.add(tableKey)
+          // A visible navigation intersection is not a complete cell boundary.
+          // Block before linked-owner propagation, retaining every whole native claim.
+          if ([...tableOrigins.get(tableKey)!].some((key) => clippedOwners.has(key)))
+            blockedTables.add(tableKey)
+          // A shared native string can cross cell boundaries without carrying
+          // measured ranges. If its cell text has no unique partition, the
+          // structure is uncertain; it is not evidence that the PDF changed.
+          // Whole native identities are still checked by proveBlockedUnits.
+          const occurrences = new Map<string, number>()
+          for (const cell of table.cells)
+            for (const origin of cell.sourceItems ?? []) {
+              const key = `${origin.pageNumber}:${origin.index}`
+              occurrences.set(key, (occurrences.get(key) ?? 0) + 1)
+            }
+          if (
+            table.cells.some((cell) => {
+              const origins = cell.sourceItems
+              // Several word boxes do not prove a character split of a shared
+              // native parent. Retain its whole connected component rather
+              // than treating that structural ambiguity as a document failure.
+              // proveBlockedUnits still checks every original native identity.
+              if (
+                !cell.sourceSegments &&
+                origins?.length === 1 &&
+                cell.regions.length > 1 &&
+                (occurrences.get(`${origins[0].pageNumber}:${origins[0].index}`) ?? 0) > 1 &&
+                normalizeSourceText(cell.text) !== normalizeSourceText(origins[0].text) &&
+                countSubstring(
+                  normalizeSourceText(origins[0].text),
+                  normalizeSourceText(cell.text)
+                ) === 1
+              )
+                return true
+              if (cell.sourceSegments || !origins || origins.length < 2) return false
+              // Two unmeasured native parents consumed by multiple cells do not
+              // establish unique character boundaries. Retain the connected
+              // whole-source component; proveBlockedUnits still validates every
+              // parent against the actual PDF before assigning a warning.
+              if (
+                origins.filter(
+                  (origin) => (occurrences.get(`${origin.pageNumber}:${origin.index}`) ?? 0) > 1
+                ).length >= 2 &&
+                !partitionCellText(
+                  cell.text,
+                  origins.map((origin) => origin.text)
+                )
+              )
+                return true
+
+              const first = origins[0],
+                tail = normalizeSourceText(
+                  origins
+                    .slice(1)
+                    .map((origin) => origin.text)
+                    .join('')
+                ),
+                text = normalizeSourceText(cell.text)
+              if (!tail || !text.endsWith(tail) || text.length <= tail.length) return false
+              const prefix = text.slice(0, -tail.length),
+                parent = normalizeSourceText(first.text)
+              return (
+                (occurrences.get(`${first.pageNumber}:${first.index}`) ?? 0) > 1 &&
+                prefix.length < parent.length &&
+                countSubstring(parent, prefix) === 1 &&
+                !partitionCellText(
+                  cell.text,
+                  origins.map((origin) => origin.text)
+                )
+              )
+            })
+          )
+            blockedTables.add(tableKey)
+        }
+      }
+    const unitTables = new Map<string, Set<string>>()
+    for (const unit of source.units) {
+      const keys = unit.fragments.flatMap((fragment) =>
+        fragment.items.map((item) => `${fragment.pageNumber}:${item.index}`)
+      )
+      unitTables.set(
+        unit.id,
+        new Set(
+          [...tableOrigins]
+            .filter(([, origins]) => keys.some((key) => origins.has(key)))
+            .map(([key]) => key)
+        )
+      )
+    }
+    let changed = true
+    while (changed) {
+      changed = false
+      for (const tables of unitTables.values()) {
+        if (![...tables].some((key) => blockedTables.has(key))) continue
+        for (const key of tables)
+          if (!blockedTables.has(key)) {
+            blockedTables.add(key)
+            changed = true
+          }
+      }
+    }
+    const blockedUnits = new Set(
+      [...unitTables]
+        .filter(([, tables]) => [...tables].some((key) => blockedTables.has(key)))
+        .map(([id]) => id)
+    )
+    const pages = new Map<
+      number,
+      {
+        proxy: PDFPageProxy
+        viewport: Viewport
+        rotation: number
+        content: Awaited<ReturnType<PDFPageProxy['getTextContent']>>
+      }
+    >()
+    // Warning attribution verifies whole native identities, never a cell partition.
+    // Keep every result/page declaration: shared origins must not overwrite earlier metadata.
+    const proveOrigin = async (
+      origin: { pageNumber: number; index: number; text: string },
+      result?: PdfStructureResult
+    ): Promise<boolean> => {
+      if (owners.get(`${origin.pageNumber}:${origin.index}`) !== origin.text) return false
+      current()
+      let page = pages.get(origin.pageNumber)
+      if (!page) {
+        const proxy = await document.getPage(origin.pageNumber)
+        current()
+        const viewport = proxy.getViewport({ scale: 1 }),
+          content = await getPdfTranslationTextContent(proxy)
+        current()
+        page = { proxy, viewport, content, rotation: proxy.rotate }
+        pages.set(origin.pageNumber, page)
+      }
+      const expected = result?.pages.find((p) => p.page === origin.pageNumber),
+        sourcePage = source.pages[origin.pageNumber - 1],
+        raw = page.content.items[origin.index]
+      const clipped = clippedOwners.get(`${origin.pageNumber}:${origin.index}`)
+      if (clipped) {
+        if (!raw || !('str' in raw)) return false
+        const proof = nativePartialNavigation(
+          raw,
+          page.content.styles?.[raw.fontName],
+          page.viewport
+        )
+        if (
+          !proof ||
+          (['rect', 'unclippedRect'] as const).some((key) =>
+            (['x', 'y', 'width', 'height'] as const).some(
+              (axis) => proof[key][axis] !== clipped[key]![axis]
+            )
+          )
+        )
+          return false
+      }
+      return !!(
+        sourcePage &&
+        (!result ||
+          (expected &&
+            page.rotation === expected.rotation &&
+            Math.abs(page.viewport.width - expected.width) <= 0.01 &&
+            Math.abs(page.viewport.height - expected.height) <= 0.01)) &&
+        [page.viewport.width, page.viewport.height].every((n) => Number.isFinite(n) && n > 0) &&
+        Math.abs(page.viewport.width - sourcePage.width) <= 0.01 &&
+        Math.abs(page.viewport.height - sourcePage.height) <= 0.01 &&
+        raw &&
+        'str' in raw &&
+        raw.str === origin.text
+      )
+    }
+    if (blockedUnits.size) {
+      const proveBlockedUnits = async (): Promise<boolean> => {
+        for (const result of results)
+          for (const element of result.elements) {
+            const tables =
+              element.tableParts?.map((part) => part.table) ??
+              (element.table ? [element.table] : [])
+            for (const [part, table] of tables.entries()) {
+              if (!blockedTables.has(`${result.extractionId}:${element.id}:${part}`)) continue
+              for (const cell of table.cells) {
+                const origins = [...(cell.sourceItems ?? []), ...(cell.sourceSegments ?? [])]
+                if (cell.text.trim() && !origins.length) return false
+                for (const origin of origins) if (!(await proveOrigin(origin, result))) return false
+              }
+            }
+          }
+        for (const unit of source.units) {
+          if (!blockedUnits.has(unit.id)) continue
+          for (const fragment of unit.fragments)
+            for (const item of fragment.items)
+              if (!(await proveOrigin({ pageNumber: fragment.pageNumber, ...item }))) return false
+        }
+        return true
+      }
+      const proved = await proveBlockedUnits()
+      current()
+      if (!proved) return retainOriginal()
+      // A captioned native record grid can be uncertain without becoming prose.
+      // Only complete owners inside its proved cells lose eligibility; this
+      // evidence never authorizes a crop, a cell replacement or local painting.
+      for (const result of results)
+        for (const element of result.elements) {
+          const caption = element.caption,
+            captionOwner =
+              caption &&
+              source.units.find(
+                (unit) =>
+                  normalizeSourceText(unit.source.normalize('NFKC')) ===
+                  normalizeSourceText(caption.text.normalize('NFKC'))
+              )
+          if (
+            !caption ||
+            !captionOwner ||
+            !/^(?:Table|TABLE|Tab\.)\s+(?:[1-9]\d*|[IVXLCDM]+)[.:]\s/u.test(caption.text) ||
+            captionOwner.fragments.length !== 1 ||
+            !captionOwner.fragments.every((fragment) =>
+              caption.regions.some(
+                (region) =>
+                  region.page === fragment.pageNumber &&
+                  Math.abs(region.x - fragment.rect.x) < 1e-6 &&
+                  Math.abs(region.width - fragment.rect.width) < 1e-6 &&
+                  Math.min(region.y + region.height, fragment.rect.y + fragment.rect.height) -
+                    Math.max(region.y, fragment.rect.y) >
+                    Math.min(region.height, fragment.rect.height) * 0.5
+              )
+            )
+          )
+            continue
+          let captionProved = true
+          for (const fragment of captionOwner.fragments)
+            for (const item of fragment.items)
+              if (!(await proveOrigin({ pageNumber: fragment.pageNumber, ...item }, result)))
+                captionProved = false
+          if (!captionProved) continue
+          const tables =
+            element.tableParts?.map((part) => part.table) ?? (element.table ? [element.table] : [])
+          for (const [part, table] of tables.entries()) {
+            const key = `${result.extractionId}:${element.id}:${part}`,
+              origins = tableOrigins.get(key)!
+            if (
+              !blockedTables.has(key) ||
+              table.rowCount < 3 ||
+              table.columnCount < 2 ||
+              table.cells.filter((cell) => cell.row === 0 && /[A-Za-z]{3,}/u.test(cell.text))
+                .length < 2 ||
+              table.cells.some(
+                (cell) =>
+                  cell.sourceSegments ||
+                  (cell.text.trim()
+                    ? !cell.sourceItems?.length ||
+                      normalizeSourceText(
+                        cell.sourceItems.map((origin) => origin.text).join('')
+                      ) !== normalizeSourceText(cell.text)
+                    : !!cell.sourceItems?.length || !!cell.regions.length)
+              )
+            )
+              continue
+            let geometryProved = true
+            for (const cell of table.cells) {
+              const remaining = [...cell.regions]
+              for (const origin of cell.sourceItems ?? []) {
+                const page = pages.get(origin.pageNumber)!,
+                  raw = page.content.items[origin.index]
+                const rect =
+                    raw &&
+                    'str' in raw &&
+                    nativeRect(raw, page.content.styles[raw.fontName], page.viewport),
+                  matched = rect
+                    ? findNativeRegionGroup(
+                        remaining.map((region, index) => ({ region, index })),
+                        rect,
+                        origin.pageNumber
+                      )
+                    : undefined
+                if (!matched?.length) {
+                  geometryProved = false
+                  break
+                }
+                for (const index of [...matched].sort((a, b) => b - a)) remaining.splice(index, 1)
+              }
+              if (remaining.length) geometryProved = false
+            }
+            if (!geometryProved) continue
+            const simpleGrid = table.cells.every(
+              (cell) => cell.sourceItems?.length && cell.rowSpan === 1 && cell.columnSpan === 1
+            )
+            // Spanning headers do not prove a body grid. Protect only a complete
+            // native header row crossing cells above independently aligned numeric records.
+            const sameNativeRow = (
+              items: readonly { pageNumber: number; index: number }[]
+            ): boolean => {
+              if (!items.length) return false
+              const native = items.map(
+                  (origin) => pages.get(origin.pageNumber)!.content.items[origin.index] as TextItem
+                ),
+                first = native[0]
+              return native.every(
+                (item, index) =>
+                  items[index].pageNumber === items[0].pageNumber &&
+                  item.fontName === first.fontName &&
+                  Math.abs(item.height - first.height) < 1e-6 &&
+                  [0, 1, 2, 3, 5].every(
+                    (axis) => Math.abs(item.transform[axis] - first.transform[axis]) < 1e-6
+                  ) &&
+                  item.transform[0] > 0 &&
+                  item.transform[3] > 0 &&
+                  Math.abs(item.transform[1]) < 1e-6 &&
+                  Math.abs(item.transform[2]) < 1e-6 &&
+                  (!index ||
+                    item.transform[4] >= native[index - 1].transform[4] + native[index - 1].width)
+              )
+            }
+            const numericByRow = new Map<number, (typeof table.cells)[number][]>()
+            if (!simpleGrid)
+              for (const cell of table.cells) {
+                if (
+                  cell.rowSpan !== 1 ||
+                  cell.columnSpan !== 1 ||
+                  cell.sourceItems?.length !== 1 ||
+                  !/^[+−-]?\d[\d,.]*%?$/u.test(cell.text)
+                )
+                  continue
+                const row = numericByRow.get(cell.row) ?? []
+                row.push(cell)
+                numericByRow.set(cell.row, row)
+              }
+            const numericRows = [...numericByRow.values()].filter(
+              (row) =>
+                new Set(row.map((cell) => cell.column)).size >= 2 &&
+                sameNativeRow(row.flatMap((cell) => cell.sourceItems!))
+            )
+            const rowItem = (row: (typeof numericRows)[number]): TextItem => {
+              const origin = row[0].sourceItems![0]
+              return pages.get(origin.pageNumber)!.content.items[origin.index] as TextItem
+            }
+            if (
+              !simpleGrid &&
+              (numericRows.length < 2 ||
+                numericRows.some(
+                  (row) =>
+                    row[0].sourceItems![0].pageNumber !==
+                    numericRows[0][0].sourceItems![0].pageNumber
+                ) ||
+                numericRows.some((row, index) =>
+                  numericRows
+                    .slice(index + 1)
+                    .some(
+                      (other) =>
+                        Math.abs(rowItem(row).transform[5] - rowItem(other).transform[5]) <=
+                        rowItem(row).height * 0.75
+                    )
+                ))
+            )
+              continue
+            for (const unit of source.units) {
+              if (
+                !blockedUnits.has(unit.id) ||
+                !unit.fragments.every(
+                  (fragment) =>
+                    element.regions.some((region) =>
+                      structureRegionContains(region, {
+                        page: fragment.pageNumber,
+                        ...fragment.rect
+                      })
+                    ) &&
+                    fragment.items.every((item) =>
+                      origins.has(`${fragment.pageNumber}:${item.index}`)
+                    )
+                )
+              )
+                continue
+              if (!simpleGrid) {
+                const items = unit.fragments.flatMap((fragment) =>
+                    fragment.items.map((item) => ({ pageNumber: fragment.pageNumber, ...item }))
+                  ),
+                  selected = new Set(items.map((item) => `${item.pageNumber}:${item.index}`)),
+                  headerCells = items.map((item) =>
+                    table.cells.filter(
+                      (cell) =>
+                        cell.row < Math.min(...numericRows.map((row) => row[0].row)) &&
+                        /[A-Za-z]{3,}/u.test(cell.text) &&
+                        cell.sourceItems?.some(
+                          (origin) =>
+                            origin.pageNumber === item.pageNumber && origin.index === item.index
+                        )
+                    )
+                  ),
+                  cells = [...new Set(headerCells.flat())]
+                if (
+                  unit.fragments.length !== 1 ||
+                  unit.fragments[0].pageNumber !== numericRows[0][0].sourceItems![0].pageNumber ||
+                  !sameNativeRow(items) ||
+                  headerCells.some((matches) => matches.length !== 1) ||
+                  new Set(cells.map((cell) => cell.column)).size < 2 ||
+                  cells.some((cell) =>
+                    cell.sourceItems!.some(
+                      (origin) => !selected.has(`${origin.pageNumber}:${origin.index}`)
+                    )
+                  ) ||
+                  normalizeSourceText(items.map((item) => item.text).join(' ')) !==
+                    normalizeSourceText(unit.source) ||
+                  (pages.get(items[0].pageNumber)!.content.items[items[0].index] as TextItem)
+                    .transform[5] <=
+                    Math.max(...numericRows.map((row) => rowItem(row).transform[5])) +
+                      rowItem(numericRows[0]).height * 0.5
+                )
+                  continue
+              }
+              incompleteOriginalUnits.add(unit.id)
+            }
+          }
+        }
+      current()
+      // Typed cell evidence identifies only the affected mathematical sources.
+      // Verify their complete native geometry before protecting whole owners;
+      // ordinary structural conflicts retain their existing eligibility.
+      for (const result of results)
+        for (const element of result.elements) {
+          const tables =
+            element.tableParts?.map((part) => part.table) ?? (element.table ? [element.table] : [])
+          for (const [part, table] of tables.entries()) {
+            if (!table.unreliableMathSourceItems) continue
+            if (!blockedTables.has(`${result.extractionId}:${element.id}:${part}`))
+              return extraction
+            const evidence = new Set(
+              table.unreliableMathSourceItems.map(
+                (origin) => `${origin.pageNumber}:${origin.index}`
+              )
+            )
+            for (const cell of table.cells) {
+              if (
+                !cell.sourceItems?.some((origin) =>
+                  evidence.has(`${origin.pageNumber}:${origin.index}`)
+                )
+              )
+                continue
+              const remaining = [...cell.regions]
+              for (const origin of cell.sourceItems) {
+                if (!(await proveOrigin(origin, result))) return extraction
+                const page = pages.get(origin.pageNumber)!,
+                  raw = page.content.items[origin.index]
+                if (!raw || !('str' in raw)) return extraction
+                const rect = nativeRect(raw, page.content.styles[raw.fontName], page.viewport),
+                  matched =
+                    rect &&
+                    findNativeRegionGroup(
+                      remaining.map((region, index) => ({ region, index })),
+                      rect,
+                      origin.pageNumber
+                    )
+                if (!matched?.length) return extraction
+                for (const index of [...matched].sort((a, b) => b - a)) remaining.splice(index, 1)
+                if (!evidence.has(`${origin.pageNumber}:${origin.index}`)) continue
+                const unit = originalUnits.get(`${origin.pageNumber}:${origin.index}`)
+                if (!unit || !blockedUnits.has(unit.id)) return extraction
+                unreliableMathUnits.add(unit.id)
+              }
+              if (remaining.length) return extraction
+            }
+          }
+        }
+      for (const unit of source.units) {
+        if (!unreliableMathUnits.has(unit.id)) continue
+        for (const fragment of unit.fragments)
+          for (const item of fragment.items) {
+            const page = pages.get(fragment.pageNumber)!,
+              raw = page.content.items[item.index]
+            if (
+              !raw ||
+              !('str' in raw) ||
+              !nativeRect(raw, page.content.styles[raw.fontName], page.viewport)
+            )
+              return extraction
+          }
+      }
+      current()
+      const warnings = new Map(
+        extraction.coverage.warnings.map((warning) => [warning.unitId, new Set(warning.reasons)])
+      )
+      for (const id of blockedUnits) {
+        if (!warnings.has(id)) warnings.set(id, new Set())
+        warnings.get(id)!.add('table-structure-unreliable')
+      }
+      warningOnly = Object.freeze({
+        ...extraction,
+        ...(unreliableMathUnits.size || incompleteOriginalUnits.size
+          ? {
+              source: createPdfTranslationSource({
+                ...source,
+                units: source.units.map((unit) =>
+                  unreliableMathUnits.has(unit.id) || incompleteOriginalUnits.has(unit.id)
+                    ? { ...unit, sourceOnly: true as const }
+                    : unit
+                )
+              })
+            }
+          : {}),
+        coverage: Object.freeze({
+          ...extraction.coverage,
+          warnings: Object.freeze(
+            [...warnings].map(([unitId, reasons]) =>
+              Object.freeze({ unitId, reasons: Object.freeze([...reasons]) })
+            )
+          )
+        })
+      })
+      if (incompleteOriginalUnits.size) {
+        // This exclusion must survive an independent cell-replacement failure,
+        // including a saved snapshot that already contains those cell IDs.
+        const native = await verifiedPdfTableRegions(source, [], new Map(pages), [], {
+          document,
+          nativeDocumentFactory,
+          sourceIdentity: identity,
+          signal
+        })
+        current()
+        if (!native.current()) return extraction
+        tableRetention.set(warningOnly, {
+          current: native.current,
+          retainedUnitIds: Object.freeze([...incompleteOriginalUnits]),
+          retainedSourcePageNumbers: Object.freeze(
+            [
+              ...new Set(
+                source.units
+                  .filter((unit) => incompleteOriginalUnits.has(unit.id))
+                  .flatMap((unit) => unit.fragments.map((fragment) => fragment.pageNumber))
+              )
+            ].sort((a, b) => a - b)
+          )
+        })
+      }
+    }
+    for (const result of results)
+      for (const element of result.elements) {
+        const tables =
+          element.tableParts?.map((part) => part.table) ?? (element.table ? [element.table] : [])
+        for (const [part, table] of tables.entries()) {
+          const tableKey = `${result.extractionId}:${element.id}:${part}`
+          if (blockedTables.has(tableKey)) continue
+          for (const cell of [...table.cells].sort(
+            (a, b) => a.row - b.row || a.column - b.column
+          )) {
+            const segments = cell.sourceSegments,
+              origins = segments ?? cell.sourceItems
+            if (!cell.text.trim() && !cell.regions.length && !origins?.length) continue
+            if (!origins?.length || cell.regions.length < origins.length) return retainOriginal()
+            if (
+              segments &&
+              normalizeSourceText(segments.map((s) => s.text.slice(s.start, s.end)).join('')) !==
+                normalizeSourceText(cell.text)
+            )
+              return retainOriginal()
+            const remaining = [...cell.regions] as TableRect[],
+              fragments = new Map<
+                number,
+                { items: { index: number; text: string }[]; rects: Rect[] }
+              >()
+            const primaryClaims: {
+              key: string
+              rects: Rect[]
+              nativeRect: Rect
+              originText: string
+              native: TextItem
+              pageNumber: number
+              index: number
+              split: boolean
+              measured: boolean
+              pieces: SourcePiece[]
+            }[] = []
+            const pieces = segments
+              ? segments.map((s) => s.text.slice(s.start, s.end))
+              : partitionCellText(
+                  cell.text,
+                  origins.map((origin) => origin.text)
+                )
+            for (const [originIndex, origin] of origins.entries()) {
+              const segment = segments?.[originIndex],
+                range = segment ? { start: segment.start, end: segment.end } : undefined
+              const piece = pieces?.[originIndex] ?? cell.text.trim()
+              const key = `${origin.pageNumber}:${origin.index}`
+              if (owners.get(key) !== origin.text) return retainOriginal()
+              const prior = claims.get(key)
+              if (prior && (prior.tableKey !== tableKey || prior.measured !== !!segment))
+                return retainOriginal()
+              let page = pages.get(origin.pageNumber)
+              if (!page) {
+                current()
+                const proxy = await document.getPage(origin.pageNumber)
+                current()
+                const viewport = proxy.getViewport({ scale: 1 }),
+                  content = await getPdfTranslationTextContent(proxy)
+                current()
+                page = { proxy, viewport, content, rotation: proxy.rotate }
+                pages.set(origin.pageNumber, page)
+              }
+              const expectedPage = result.pages.find((p) => p.page === origin.pageNumber)
+              const sourcePage = source.pages[origin.pageNumber - 1]
+              if (
+                !expectedPage ||
+                !sourcePage ||
+                page.rotation !== expectedPage.rotation ||
+                ![page.viewport.width, page.viewport.height].every(
+                  (n) => Number.isFinite(n) && n > 0
+                ) ||
+                Math.abs(page.viewport.width - expectedPage.width) > 0.01 ||
+                Math.abs(page.viewport.height - expectedPage.height) > 0.01 ||
+                Math.abs(page.viewport.width - sourcePage.width) > 0.01 ||
+                Math.abs(page.viewport.height - sourcePage.height) > 0.01
+              )
+                return retainOriginal()
+              const raw = page.content.items[origin.index]
+              if (!raw || !('str' in raw) || raw.str !== origin.text) return retainOriginal()
+              const rect = nativeRect(raw, page.content.styles[raw.fontName], page.viewport)
+              if (!rect) return retainOriginal()
+              let matchedIndexes = segment
+                ? remaining.flatMap((region, index) =>
+                    region.page === segment.region.page && sameRect(region, segment.region)
+                      ? [index]
+                      : []
+                  )
+                : findNativeRegionGroup(
+                    remaining.map((region, index) => ({ region, index })),
+                    rect,
+                    origin.pageNumber
+                  )
+              if (
+                segment &&
+                (matchedIndexes?.length !== 1 ||
+                  segment.region.x < rect.x - REGION_EPSILON ||
+                  segment.region.x + segment.region.width > rect.x + rect.width + REGION_EPSILON ||
+                  Math.abs(segment.region.y - rect.y) > REGION_EPSILON ||
+                  Math.abs(segment.region.height - rect.height) > REGION_EPSILON)
+              )
+                return retainOriginal()
+              let clipped = false
+              // A fused native item has no exact region for either visual value.
+              // Permit only a strict horizontal clip whose cell text is one unique
+              // substring of the original item.  Ambiguous text or geometry keeps
+              // the old all-or-nothing behavior.
+              if (!segment && !matchedIndexes && origin.text !== piece) {
+                if (!pieces) return retainOriginal()
+                clipped = true
+                const first = origin.text.indexOf(piece)
+                if (!piece || first < 0 || origin.text.indexOf(piece, first + 1) >= 0)
+                  return retainOriginal()
+                const matches = remaining
+                  .map((region, index) => ({ region, index }))
+                  .filter(
+                    ({ region }) =>
+                      region.page === origin.pageNumber &&
+                      region.x >= rect.x - 1e-6 &&
+                      region.x + region.width <= rect.x + rect.width + 1e-6 &&
+                      (region.width < rect.width - 1e-6 || region.height < rect.height - 1e-6) &&
+                      Math.abs(region.y - rect.y) <= 1e-6 &&
+                      Math.abs(region.height - rect.height) <= 1e-6 &&
+                      origin.text.includes(piece)
+                  )
+                if (matches.length !== 1) return retainOriginal()
+                matchedIndexes = [matches[0].index]
+              }
+              if (!matchedIndexes?.length) return retainOriginal()
+              const matchedRects = matchedIndexes
+                .sort((a, b) => a - b)
+                .map((index) => remaining[index])
+              if (matchedRects.some((item) => !item)) return retainOriginal()
+              for (const index of [...matchedIndexes].sort((a, b) => b - a))
+                remaining.splice(index, 1)
+              const matched = envelope(matchedRects)
+              const pending = primaryClaims.find((claim) => claim.key === key),
+                existingClaim = prior ?? pending
+              if (existingClaim) {
+                if (
+                  existingClaim.measured !== !!segment ||
+                  (!segment && existingClaim.pieces.some((entry) => entry.text === piece))
+                )
+                  return retainOriginal()
+                if (
+                  existingClaim.rects.some((other) =>
+                    matchedRects.some(
+                      (region) =>
+                        other.x < region.x + region.width - REGION_EPSILON &&
+                        region.x < other.x + other.width - REGION_EPSILON &&
+                        other.y < region.y + region.height - REGION_EPSILON &&
+                        region.y < other.y + other.height - REGION_EPSILON
+                    )
+                  )
+                )
+                  return retainOriginal()
+                existingClaim.rects.push(...matchedRects)
+                existingClaim.pieces.push({
+                  text: piece,
+                  rect: matched,
+                  ...(range ? { range } : {})
+                })
+                existingClaim.split = true
+                if (!prior) {
+                  fragments.get(origin.pageNumber)!.rects.push(...matchedRects)
+                  continue
+                }
+                const existing = replacements[prior.replacementIndex]
+                if (!existing) return retainOriginal()
+                const existingFragment = existing.fragments.find(
+                  (fragment) => fragment.pageNumber === origin.pageNumber
+                )
+                if (!existingFragment) return retainOriginal()
+                const x = Math.min(existingFragment.rect.x, matched.x),
+                  y = Math.min(existingFragment.rect.y, matched.y),
+                  right = Math.max(
+                    existingFragment.rect.x + existingFragment.rect.width,
+                    matched.x + matched.width
+                  ),
+                  bottom = Math.max(
+                    existingFragment.rect.y + existingFragment.rect.height,
+                    matched.y + matched.height
+                  )
+                replacements[prior.replacementIndex] = {
+                  ...existing,
+                  fragments: existing.fragments.map((fragment) =>
+                    fragment === existingFragment
+                      ? {
+                          ...fragment,
+                          rect: { x, y, width: right - x, height: bottom - y }
+                        }
+                      : fragment
+                  )
+                }
+                continue
+              }
+              const fragment = fragments.get(origin.pageNumber) ?? { items: [], rects: [] }
+              fragment.items.push({ index: origin.index, text: origin.text })
+              fragment.rects.push(...matchedRects)
+              fragments.set(origin.pageNumber, fragment)
+              primaryClaims.push({
+                key,
+                rects: matchedRects,
+                nativeRect: rect,
+                originText: origin.text,
+                native: raw,
+                pageNumber: origin.pageNumber,
+                index: origin.index,
+                split: clipped,
+                measured: !!segment,
+                pieces: [{ text: piece, rect: matched, ...(range ? { range } : {}) }]
+              })
+            }
+            // Every region must have a verified native owner. Extra geometry
+            // cannot be silently dropped when a source item owns multiple runs.
+            if (remaining.length) return retainOriginal()
+            if (!fragments.size) continue
+            const id = `table-source:${tableKey}:${cell.row}:${cell.column}`
+            if (ids.has(id)) return retainOriginal()
+            ids.add(id)
+            const replacementIndex = replacements.length
+            let replacementText = nativeCellText(
+              primaryClaims,
+              cell.text,
+              origins.length,
+              originalJoins
+            )
+            const originalUnit = originalUnits.get(primaryClaims[0]?.key),
+              originalKeys = originalUnit?.fragments.flatMap((fragment) =>
+                fragment.items.map((item) => `${fragment.pageNumber}:${item.index}`)
+              )
+            if (
+              originalUnit?.sourceOnly &&
+              origins.length === primaryClaims.length &&
+              originalKeys?.length === primaryClaims.length &&
+              primaryClaims.every(
+                (claim, index) =>
+                  !claim.split && !claim.measured && claim.key === originalKeys[index]
+              ) &&
+              canonicalScientificSource(originalUnit.source, primaryClaims, cell.textRuns)
+            )
+              replacementText = originalUnit.source
+            // Preserve a complete already canonical mathematical accent owner.
+            // Native paint order must not replace its agreed base/accent order.
+            if (
+              originalUnit?.sourceOnly &&
+              originalUnit.source === cell.text &&
+              normalizeSourceText(replacementText) !== normalizeSourceText(originalUnit.source) &&
+              originalKeys?.length === primaryClaims.length &&
+              primaryClaims.every(
+                (claim, index) =>
+                  !claim.split && !claim.measured && claim.key === originalKeys[index]
+              ) &&
+              primaryClaims.some((claim, index) => {
+                const base = primaryClaims[index + 1],
+                  a = claim.native,
+                  b = base?.native
+                return (
+                  b &&
+                  /^[˜ˆˉ¯]$/u.test(claim.originText) &&
+                  /^\p{L}$/u.test(base.originText) &&
+                  base.pageNumber === claim.pageNumber &&
+                  base.index === claim.index + 1 &&
+                  !!a.fontName &&
+                  !!b.fontName &&
+                  a.transform[0] === b.transform[0] &&
+                  a.transform[3] === b.transform[3] &&
+                  a.transform[1] === 0 &&
+                  a.transform[2] === 0 &&
+                  b.transform[1] === 0 &&
+                  b.transform[2] === 0 &&
+                  a.transform[5] > b.transform[5] &&
+                  a.transform[5] < b.transform[5] + b.height &&
+                  a.transform[4] >= b.transform[4] &&
+                  (a.transform[4] + a.width <= b.transform[4] + b.width ||
+                    // An advance may slightly overhang the base without changing
+                    // its already agreed source spelling. Require a bounded,
+                    // overlapping mark and prove that this single adjacent swap
+                    // explains the whole canonical owner; do not infer new text.
+                    (a.width > 0 &&
+                      a.width <= b.width &&
+                      a.transform[4] + a.width / 2 < b.transform[4] + b.width &&
+                      primaryClaims.filter((part) => /^[˜ˆˉ¯]$/u.test(part.originText)).length ===
+                        1 &&
+                      replacementText.replace(/\s/gu, '') ===
+                        primaryClaims
+                          .map((part) => part.originText)
+                          .join('')
+                          .replace(/\s/gu, '') &&
+                      originalUnit.source.replace(/\s/gu, '') ===
+                        primaryClaims
+                          .map((part, at) =>
+                            at === index
+                              ? base.originText
+                              : at === index + 1
+                                ? claim.originText
+                                : part.originText
+                          )
+                          .join('')
+                          .replace(/\s/gu, ''))) &&
+                  countSubstring(
+                    normalizeSourceText(originalUnit.source),
+                    base.originText + claim.originText
+                  ) === 1
+                )
+              })
+            )
+              boundaryConflicts.add(tableKey)
+            // The original extractor can prove a stacked fraction from native
+            // layout. A table's space-joined digit stream does not carry that
+            // expression. Keep its complete original component rather than
+            // silently turning a fraction into two adjacent numbers.
+            if (
+              originalUnit &&
+              /^[+\-−]?\s*\d+\s*\/\s*\d+$/u.test(originalUnit.source.trim()) &&
+              !replacementText.includes('/') &&
+              normalizeSourceText(originalUnit.source.replace('/', '')) ===
+                normalizeSourceText(replacementText) &&
+              originalKeys?.length === primaryClaims.length &&
+              primaryClaims.every(
+                (claim, index) =>
+                  !claim.split && !claim.measured && claim.key === originalKeys[index]
+              )
+            )
+              boundaryConflicts.add(tableKey)
+            // Do not replace a complete native-backed literal with newly
+            // inserted word spaces. If geometry cannot prove that same cell
+            // boundary, retain the original component instead of guessing a
+            // wider spacing tolerance. All native guards still run below.
+            if (
+              originalUnit?.source === cell.text &&
+              replacementText !== originalUnit.source &&
+              normalizeSourceText(replacementText) === normalizeSourceText(originalUnit.source) &&
+              originalKeys?.length === primaryClaims.length &&
+              primaryClaims.some((claim, index) => {
+                const previous = primaryClaims[index - 1]
+                return (
+                  previous &&
+                  /\p{Ll}{2}$/u.test(previous.originText) &&
+                  /^\p{Ll}{2}/u.test(claim.originText) &&
+                  originalJoins.has(`${claim.pageNumber}:${previous.index}:${claim.index}`) &&
+                  !nativeWitnessJoin(previous, claim, originalJoins)
+                )
+              }) &&
+              primaryClaims.every(
+                (claim, index) =>
+                  !claim.split && !claim.measured && claim.key === originalKeys[index]
+              )
+            )
+              boundaryConflicts.add(tableKey)
+            replacements.push({
+              id,
+              sourceOnly: true,
+              // Earlier cells retain shared fused origins. Only the native
+              // items added to this replacement may contribute its text.
+              source: replacementText,
+              fragments: [...fragments].map(([pageNumber, { items, rects }]) => {
+                const x = Math.min(...rects.map((r) => r.x)),
+                  y = Math.min(...rects.map((r) => r.y))
+                return {
+                  pageNumber,
+                  items,
+                  rect: {
+                    x,
+                    y,
+                    width: Math.max(...rects.map((r) => r.x + r.width)) - x,
+                    height: Math.max(...rects.map((r) => r.y + r.height)) - y
+                  }
+                }
+              })
+            })
+            for (const {
+              key,
+              rects: claimRects,
+              nativeRect: originalRect,
+              originText,
+              split,
+              measured,
+              pieces: sourcePieces
+            } of primaryClaims)
+              claims.set(key, {
+                tableKey,
+                row: cell.row,
+                rowSpan: cell.rowSpan,
+                replacementIndex,
+                nativeRect: originalRect,
+                originText,
+                rects: claimRects,
+                pieces: sourcePieces,
+                split,
+                measured
+              })
+          }
+        }
+      }
+    for (const claim of claims.values()) {
+      if (!claim.split && !claim.measured) continue
+      const pieces = [...claim.pieces].sort((a, b) => a.rect.x - b.rect.x)
+      // Measured ranges account for the original string without guessing which
+      // occurrence a repeated value denotes. Only whitespace may lie between
+      // ranges; its measured advance may leave a real horizontal gap.
+      if (
+        claim.measured &&
+        pieces.some((piece, index) => {
+          const range = piece.range,
+            previous = pieces[index - 1]?.range
+          return (
+            !range ||
+            (index === 0 && !!claim.originText.slice(0, range.start).trim()) ||
+            (index === pieces.length - 1 && !!claim.originText.slice(range.end).trim()) ||
+            (previous &&
+              (range.start < previous.end ||
+                !!claim.originText.slice(previous.end, range.start).trim())) ||
+            piece.text !== claim.originText.slice(range.start, range.end)
+          )
+        })
+      )
+        return retainOriginal()
+      if (
+        normalizeSourceText(pieces.map((piece) => piece.text).join('')) !==
+          normalizeSourceText(claim.originText) ||
+        (!claim.measured && pieces.length < 2) ||
+        pieces.some(
+          (piece) =>
+            Math.abs(piece.rect.y - claim.nativeRect.y) > 1e-6 ||
+            Math.abs(piece.rect.height - claim.nativeRect.height) > 1e-6
+        ) ||
+        pieces[0].rect.x > claim.nativeRect.x + 1e-6 ||
+        pieces.at(-1)!.rect.x + pieces.at(-1)!.rect.width <
+          claim.nativeRect.x + claim.nativeRect.width - 1e-6 ||
+        pieces.some(
+          (piece, index) =>
+            index > 0 &&
+            (piece.rect.x < pieces[index - 1].rect.x + pieces[index - 1].rect.width - 1e-6 ||
+              (piece.rect.x > pieces[index - 1].rect.x + pieces[index - 1].rect.width + 1e-6 &&
+                (!claim.measured || piece.range!.start === pieces[index - 1].range!.end)))
+        )
+      )
+        return retainOriginal()
+    }
+    // Cell/native and shared-parent proofs above remain transactional. Only an
+    // otherwise valid plan that cannot replace whole original units may fall
+    // back by component; invalid provenance still returns before this point.
+    const incompleteTables = new Set(boundaryConflicts)
+    const canonicalByTable = new Map<
+      string,
+      { literals: Map<string, number>; replacements: Set<number> }
+    >()
+    for (const unit of source.units) {
+      const keys = unit.fragments.flatMap((fragment) =>
+        fragment.items.map((item) => `${fragment.pageNumber}:${item.index}`)
+      )
+      const claimed = keys.filter((key) => claims.has(key))
+      if (!claimed.length) continue
+      const tableKeys = new Set(claimed.map((key) => claims.get(key)!.tableKey))
+      if (claimed.length === keys.length && tableKeys.size === 1) {
+        const literals = canonicalScriptLiterals(unit.source)
+        if (literals.size) {
+          const key = [...tableKeys][0]
+          let required = canonicalByTable.get(key)
+          if (!required) {
+            required = { literals: new Map(), replacements: new Set() }
+            canonicalByTable.set(key, required)
+          }
+          for (const [literal, count] of literals)
+            required.literals.set(literal, (required.literals.get(literal) ?? 0) + count)
+          for (const item of claimed) required.replacements.add(claims.get(item)!.replacementIndex)
+        }
+      }
+      if (claimed.length !== keys.length || tableKeys.size !== 1)
+        for (const key of tableKeys) incompleteTables.add(key)
+    }
+    for (const [key, required] of canonicalByTable) {
+      const represented = new Map<string, number>()
+      for (const index of required.replacements)
+        for (const [literal, count] of canonicalScriptLiterals(replacements[index].source))
+          represented.set(literal, (represented.get(literal) ?? 0) + count)
+      if (
+        [...required.literals].some(([literal, count]) => (represented.get(literal) ?? 0) < count)
+      )
+        incompleteTables.add(key)
+    }
+    if (incompleteTables.size) {
+      let expanded = true
+      while (expanded) {
+        expanded = false
+        for (const tables of unitTables.values()) {
+          if (![...tables].some((key) => incompleteTables.has(key))) continue
+          for (const key of tables)
+            if (!incompleteTables.has(key)) {
+              incompleteTables.add(key)
+              expanded = true
+            }
+        }
+      }
+      const incompleteUnits = source.units.filter((unit) =>
+        [...(unitTables.get(unit.id) ?? [])].some((key) => incompleteTables.has(key))
+      )
+      // A warning on a retained unit also needs the original omitted items to
+      // agree with this document; successful cell proofs cover only claims.
+      for (const unit of incompleteUnits)
+        for (const fragment of unit.fragments)
+          for (const item of fragment.items)
+            if (!(await proveOrigin({ pageNumber: fragment.pageNumber, ...item })))
+              return retainOriginal()
+      current()
+      for (const unit of incompleteUnits) incompleteOriginalUnits.add(unit.id)
+      const rejectedReplacements = new Set<number>()
+      for (const [key, claim] of claims)
+        if (incompleteTables.has(claim.tableKey)) {
+          rejectedReplacements.add(claim.replacementIndex)
+          claims.delete(key)
+        }
+      const indices = new Map<number, number>()
+      const kept = replacements.filter((_, index) => {
+        if (rejectedReplacements.has(index)) return false
+        indices.set(index, indices.size)
+        return true
+      })
+      for (const claim of claims.values())
+        claim.replacementIndex = indices.get(claim.replacementIndex)!
+      replacements.splice(0, replacements.length, ...kept)
+      for (const key of incompleteTables) blockedTables.add(key)
+      for (const unit of incompleteUnits) blockedUnits.add(unit.id)
+    }
+    if (!replacements.length && !blockedUnits.size) return retainOriginal()
+    const regionProof = await verifiedPdfTableRegions(
+      source,
+      results.flatMap((result) =>
+        result.elements.flatMap((element) => {
+          const tables =
+            element.tableParts?.map((part) => part.table) ?? (element.table ? [element.table] : [])
+          const key = (part: number): string => `${result.extractionId}:${element.id}:${part}`
+          // A grouped preview can include prose between its parts. New manifests
+          // preserve each original crop and prove it only against that part's owners.
+          // Legacy manifests retain their existing whole-element crop checks.
+          const groups = element.tableParts?.every((part) => part.regions)
+            ? element.tableParts.map((part, index) => ({
+                regions: part.regions!,
+                keys: new Set([key(index)])
+              }))
+            : [{ regions: element.regions, keys: new Set(tables.map((_, part) => key(part))) }]
+          return groups.map(({ regions, keys }) => ({
+            regions,
+            owners: new Set(
+              [...claims].filter(([, claim]) => keys.has(claim.tableKey)).map(([key]) => key)
+            )
+          }))
+        })
+      ),
+      pages,
+      results.flatMap((result) =>
+        result.elements.flatMap((element) => element.caption?.regions ?? [])
+      ),
+      { document, nativeDocumentFactory, sourceIdentity: identity, signal }
+    )
+    current()
+    if (!regionProof.current()) return retainOriginal()
+    const originalRegions = regionProof.regions
+    const leadingTables = new Set<string>()
+    for (const key of new Set([...claims.values()].map((claim) => claim.tableKey))) {
+      const entries = [...claims].filter(([, claim]) => claim.tableKey === key),
+        first = entries.filter(([, claim]) => claim.row === 0),
+        later = entries.filter(([, claim]) => claim.row > 0)
+      // This proves a separate leading native band, not semantic header status.
+      // A spanning, split or interleaved first row cannot retain this position.
+      if (
+        first.length &&
+        later.length &&
+        first.every(
+          ([origin, claim]) =>
+            claim.rowSpan === 1 &&
+            !claim.split &&
+            !claim.measured &&
+            later.every(
+              ([other, next]) =>
+                origin.split(':')[0] === other.split(':')[0] &&
+                claim.nativeRect.y + claim.nativeRect.height <= next.nativeRect.y + 1e-6
+            )
+        )
+      )
+        leadingTables.add(key)
+    }
+    const retainedReplacements = new Map<number, { id: string; tableKey: string }>()
+    for (const unit of source.units) {
+      const keys = unit.fragments.flatMap((f) => f.items.map((i) => `${f.pageNumber}:${i.index}`))
+      const claimed = keys.filter((key) => claims.has(key))
+      if (!claimed.length) continue
+      if (
+        claimed.length !== keys.length ||
+        new Set(claimed.map((key) => claims.get(key)?.tableKey)).size !== 1
+      )
+        return retainOriginal()
+      const index = claims.get(keys[0])!.replacementIndex,
+        replacement = replacements[index],
+        replacementKeys = replacement.fragments.flatMap((f) =>
+          f.items.map((i) => `${f.pageNumber}:${i.index}`)
+        )
+      // Do not replace an unchanged, already protected leading formula with a
+      // smaller cell crop or move it behind prose when no complete verified
+      // table crop already preserves it. Claims still prove crop ownership;
+      // only this redundant replacement is omitted.
+      if (
+        unit.sourceOnly &&
+        unit.preserve === 'formula' &&
+        !unit.fragments.every((f) =>
+          originalRegions.some((r) =>
+            structureRegionContains(
+              { page: r.pageNumber, ...r.rect },
+              { page: f.pageNumber, ...f.rect }
+            )
+          )
+        ) &&
+        unit.source === replacement.source &&
+        leadingTables.has(claims.get(keys[0])!.tableKey) &&
+        keys.every(
+          (key) => claims.get(key)!.row === 0 && claims.get(key)!.replacementIndex === index
+        ) &&
+        keys.length === replacementKeys.length &&
+        keys.every((key, at) => key === replacementKeys[at])
+      ) {
+        retainedReplacements.set(index, { id: unit.id, tableKey: claims.get(keys[0])!.tableKey })
+        continue
+      }
+      removed.add(unit.id)
+    }
+    // Retain the leading row atomically. Keeping only its formula cells would
+    // move them ahead of ordinary header cells that still follow the table plan.
+    for (const [index, retained] of retainedReplacements) {
+      if (
+        [...claims.values()].some(
+          (claim) =>
+            claim.tableKey === retained.tableKey &&
+            claim.row === 0 &&
+            !retainedReplacements.has(claim.replacementIndex)
+        )
+      ) {
+        retainedReplacements.delete(index)
+        removed.add(retained.id)
+      }
+    }
+    current()
+    let coverage = extraction.coverage
+    if (blockedUnits.size) {
+      const warnings = new Map(
+        coverage.warnings.map((warning) => [warning.unitId, new Set(warning.reasons)])
+      )
+      for (const id of blockedUnits) {
+        if (!warnings.has(id)) warnings.set(id, new Set())
+        warnings.get(id)!.add('table-structure-unreliable')
+      }
+      coverage = Object.freeze({
+        ...coverage,
+        warnings: Object.freeze(
+          [...warnings].map(([unitId, reasons]) =>
+            Object.freeze({ unitId, reasons: Object.freeze([...reasons]) })
+          )
+        )
+      })
+    }
+    if (coverage.warnings.some((warning) => removed.has(warning.unitId))) {
+      // Warnings describe original units, which may split or coalesce here.
+      // Forward their reasons only to replacements that actually own those
+      // native items; unit-level diagnostics cannot identify a finer glyph.
+      const replacementOwners = new Map<string, Set<string>>()
+      for (const unit of source.units) {
+        if (!removed.has(unit.id)) continue
+        replacementOwners.set(
+          unit.id,
+          new Set(
+            unit.fragments.flatMap((fragment) =>
+              fragment.items.map((item) => {
+                const claim = claims.get(`${fragment.pageNumber}:${item.index}`)!
+                return replacements[claim.replacementIndex].id
+              })
+            )
+          )
+        )
+      }
+      const forwarded = new Map<string, Set<string>>()
+      for (const warning of coverage.warnings) {
+        for (const id of replacementOwners.get(warning.unitId) ?? []) {
+          if (!forwarded.has(id)) forwarded.set(id, new Set())
+          for (const reason of warning.reasons) forwarded.get(id)!.add(reason)
+        }
+      }
+      coverage = Object.freeze({
+        ...coverage,
+        warnings: Object.freeze([
+          ...coverage.warnings.filter((warning) => !removed.has(warning.unitId)),
+          ...[...forwarded].map(([unitId, reasons]) =>
+            Object.freeze({ unitId, reasons: Object.freeze([...reasons]) })
+          )
+        ])
+      })
+    }
+    // Exact owners were consumed once above; only whole units move, so no text can disappear.
+    const result = Object.freeze({
+      ...extraction,
+      coverage,
+      source: createPdfTranslationSource({
+        ...source,
+        ...(originalRegions.length
+          ? { originalRegions: [...(source.originalRegions ?? []), ...originalRegions] }
+          : {}),
+        units: [
+          ...source.units
+            .filter((u) => !removed.has(u.id))
+            .map((unit) =>
+              unreliableMathUnits.has(unit.id) || incompleteOriginalUnits.has(unit.id)
+                ? { ...unit, sourceOnly: true as const }
+                : unit
+            ),
+          ...replacements.filter((_, index) => !retainedReplacements.has(index))
+        ]
+      })
+    })
+    if (!regionProof.current()) return retainOriginal()
+    // Negative eligibility only: no crop or authority to repaint these owners.
+    tableRetention.set(
+      result,
+      Object.freeze({
+        current: regionProof.current,
+        retainedUnitIds: Object.freeze([...incompleteOriginalUnits]),
+        retainedSourcePageNumbers: Object.freeze(
+          [
+            ...new Set(
+              source.units
+                .filter((unit) => incompleteOriginalUnits.has(unit.id))
+                .flatMap((unit) => unit.fragments.map((fragment) => fragment.pageNumber))
+            )
+          ].sort((a, b) => a - b)
+        )
+      })
+    )
+    return result
+  } catch {
+    signal.throwIfAborted()
+    return retainOriginal()
+  }
+}

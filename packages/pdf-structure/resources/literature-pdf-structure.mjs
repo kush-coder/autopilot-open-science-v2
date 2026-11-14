@@ -1,0 +1,264 @@
+/* eslint-disable @typescript-eslint/explicit-function-return-type */
+
+// Read-only feasibility probe, not a production layout parser.
+// Usage: node resources/pdf-structure/literature-pdf-structure.mjs input.pdf output-directory [render-pages]
+import { installPdfCanvasReset } from './literature-pdf-canvas-reset.mjs'
+import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
+import { mkdir, open, readFile, stat, writeFile } from 'node:fs/promises'
+import { createRequire } from 'node:module'
+import { dirname, join, resolve } from 'node:path'
+import { performance } from 'node:perf_hooks'
+import { createCanvas } from '@napi-rs/canvas'
+import {
+  captionKind,
+  nativeConditionalFigureReferenceStarts,
+  excludePdfLineNumbers,
+  projectPdfTextLines
+} from './literature-pdf-caption-group.mjs'
+import { collectGraphicsBounds } from './literature-pdf-graphics.mjs'
+import {
+  recordPaintedOperationBounds,
+  captureNativeFigureRenderContext,
+  attachNativeCaptionLaneRaster,
+  attachNativeDualApiEvidence,
+  nativeLigatureDualApiCaptureRequired,
+  attachNativeCompositingResources,
+  sealNativeMesh4RenderContext
+} from './literature-pdf-render-bounds.mjs'
+import { getDocument, OPS, version } from 'pdfjs-dist/legacy/build/pdf.mjs'
+import { repairPdfSymbolText } from './literature-pdf-symbol-text.mjs'
+import { readingRotation } from './literature-pdf-orientation.mjs'
+import { normalizePageLineOrder } from './literature-pdf-reading-order.mjs'
+
+const [inputPath, outputDirectory, renderPageList, adjacent, mode, optionalEvidence] =
+  process.argv.slice(2)
+assert(inputPath && outputDirectory, 'Supply a local PDF and an output directory.')
+const renderPages = renderPageList?.split(',').map(Number)
+if (renderPages)
+  assert(
+    renderPages.length <= 5 && renderPages.every((page) => Number.isSafeInteger(page) && page > 0),
+    'Supply at most five positive render page numbers.'
+  )
+assert((await stat(inputPath)).size <= 50 * 1024 * 1024, 'Probe input exceeds 50 MiB.')
+let bytes = await readFile(inputPath)
+const sourceSha256 = createHash('sha256').update(bytes).digest('hex')
+// Requested-page evidence survives only until the extractor consumes this batch.
+// The existing renderPages contract, not a second truncation, bounds the batch.
+export const nativeFigureRenderContexts = new Map()
+export const nativePageRasterFiles = new Set()
+const assetRoot = dirname(createRequire(import.meta.url).resolve('pdfjs-dist/package.json'))
+const task = getDocument({
+  // PDF.js needs a Uint8Array, but copying the whole source duplicates large PDFs.
+  data: new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength),
+  standardFontDataUrl: `${join(assetRoot, 'standard_fonts')}/`,
+  cMapUrl: `${join(assetRoot, 'cmaps')}/`,
+  wasmUrl: `${join(assetRoot, 'wasm')}/`,
+  cMapPacked: true,
+  isEvalSupported: false,
+  fontExtraProperties: true,
+  useSystemFonts: false,
+  verbosity: 0
+})
+bytes = undefined
+const started = performance.now()
+const document = await task.promise
+installPdfCanvasReset(document.canvasFactory)
+const pages = []
+let rendered = 0
+try {
+  // Production requests are bounded page batches, independent of document length.
+  if (!renderPages) assert(document.numPages <= 100, 'Supply explicit pages for long documents.')
+  if (renderPages) assert(renderPages.every((page) => page <= document.numPages))
+  const geometryPages =
+    renderPages && adjacent === 'adjacent'
+      ? // A continuation can have one intervening captionless table page. Keep
+        // native look-back bounded; auxiliary failures still cannot fail the job.
+        [...new Set(renderPages.flatMap((page) => [page - 2, page - 1, page, page + 1]))]
+          .filter((page) => page > 0 && page <= document.numPages)
+          .sort((a, b) => a - b)
+      : renderPages
+  const outline = await document.getOutline()
+  await mkdir(outputDirectory, { recursive: true })
+  for (const pageNumber of geometryPages ??
+    Array.from({ length: document.numPages }, (_, i) => i + 1)) {
+    let page
+    let canvas
+    const auxiliary = renderPages && !renderPages.includes(pageNumber)
+    try {
+      page = await document.getPage(pageNumber)
+      let content = await page.getTextContent({ includeMarkedContent: true })
+      const renderRotation = readingRotation(page, content)
+      const viewport = page.getViewport({ scale: 1, rotation: renderRotation })
+      const structure = await page.getStructTree()
+      let operators = await page.getOperatorList()
+      content = excludePdfLineNumbers(await repairPdfSymbolText(page, content, operators), viewport)
+      const roles = {}
+      const visit = (node) => {
+        if (node?.role) roles[node.role] = (roles[node.role] ?? 0) + 1
+        node?.children?.forEach(visit)
+      }
+      visit(structure)
+      const lines = projectPdfTextLines(content, viewport)
+      // PDF text streams may paint the right column before the left column.
+      // Normalize only pages with clear two-column evidence; ambiguous pages
+      // retain their source order for downstream spatial ownership checks.
+      const orderedLines = normalizePageLineOrder({ width: viewport.width, lines })
+      // Deliberately expose false positives instead of claiming caption association.
+      const captionStarts = orderedLines.filter(({ text }) => captionKind(text))
+      const headingCandidates = orderedLines.filter(
+        ({ text, fontSize }) =>
+          text.length < 110 &&
+          fontSize >= 10 &&
+          /^(?:\d+(?:\.\d+)*\.?\s+[A-Z]|Abstract$|References$)/.test(text)
+      )
+      const counts = {}
+      for (const [name, code] of Object.entries(OPS)) {
+        if (/paint.*Image|constructPath/.test(name)) {
+          const count = operators.fnArray.filter((op) => op === code).length
+          if (count) counts[name] = count
+        }
+      }
+      pages.push({
+        pageNumber,
+        width: viewport.width,
+        height: viewport.height,
+        rotation: page.rotate,
+        renderRotation,
+        structureRoles: roles,
+        graphicsOperators: counts,
+        captionStarts,
+        headingCandidates,
+        lines: orderedLines
+      })
+      if (
+        geometryPages ? geometryPages.includes(pageNumber) : captionStarts.length && rendered < 2
+      ) {
+        // Drop the raw operator-list owner before creating the genuine render
+        // program. Real PDF.js pages expose the intent cache; the lightweight
+        // probe page used by lifecycle tests does not and is cleaned in finally.
+        operators = undefined
+        if (page?._intentStates instanceof Map)
+          assert(page.cleanup(), 'PDF operator cache cleanup is incomplete.')
+        const scaled = page.getViewport({ scale: 1.5, rotation: renderRotation })
+        if (Math.ceil(scaled.width) * Math.ceil(scaled.height) > 4_000_000)
+          throw new Error('PDF render pixel budget exceeded')
+        canvas = createCanvas(Math.ceil(scaled.width), Math.ceil(scaled.height))
+        const context = canvas.getContext('2d')
+        const rendering = page.render({
+          canvas,
+          canvasContext: context,
+          viewport: scaled,
+          recordOperations: true
+        })
+        recordPaintedOperationBounds(rendering)
+        await rendering.promise
+        Object.assign(pages.at(-1), collectGraphicsBounds(rendering, page.recordedBBoxes))
+        const conditionalReferences = nativeConditionalFigureReferenceStarts(pages.at(-1))
+        pages.at(-1).captionStarts = captionStarts.filter(
+          (line) => !conditionalReferences.has(line)
+        )
+        if (mode === 'production' && renderPages?.includes(pageNumber)) {
+          const defaultContent = await page.getTextContent()
+          const proof = captureNativeFigureRenderContext(
+            rendering,
+            pageNumber,
+            defaultContent,
+            viewport,
+            pages.at(-1).graphicsBounds,
+            sourceSha256,
+            page.commonObjs
+          )
+          if (proof) {
+            let encodedCaptionBytes = 0
+            let evidence =
+              defaultContent.items.some((item) => item.str === 'μ') ||
+              nativeLigatureDualApiCaptureRequired(proof)
+                ? attachNativeDualApiEvidence(
+                    proof,
+                    defaultContent,
+                    await page.getTextContent({ disableNormalization: true })
+                  )
+                : proof
+            if (optionalEvidence === 'caption-raster') {
+              try {
+                const png = await canvas.encode('png'),
+                  path = resolve(outputDirectory, `page-${pageNumber}.png`),
+                  withRaster = attachNativeCaptionLaneRaster(evidence, rendering, png, path)
+                if (withRaster) {
+                  const file = await open(path, 'wx')
+                  nativePageRasterFiles.add(path)
+                  try {
+                    await file.writeFile(png)
+                  } finally {
+                    await file.close()
+                  }
+                  evidence = withRaster
+                  encodedCaptionBytes = png.byteLength
+                }
+              } catch (error) {
+                // Optional evidence may abstain; an existing path still violates
+                // the extractor's fresh-output ownership contract.
+                if (error?.code === 'EEXIST') throw error
+              }
+            }
+            evidence = attachNativeCompositingResources(evidence, rendering, encodedCaptionBytes)
+            nativeFigureRenderContexts.set(pageNumber, evidence)
+            sealNativeMesh4RenderContext(evidence, rendering)
+          }
+        }
+        if (mode !== 'production') {
+          await writeFile(
+            join(outputDirectory, `page-${pageNumber}.png`),
+            await canvas.encode('png')
+          )
+          context.strokeStyle = '#c026d3'
+          context.lineWidth = 2
+          for (const rect of captionStarts)
+            context.strokeRect(rect.x * 1.5, rect.y * 1.5, rect.width * 1.5, rect.height * 1.5)
+          await writeFile(
+            join(outputDirectory, `page-${pageNumber}-candidates.png`),
+            await canvas.encode('png')
+          )
+        }
+        rendered++
+      }
+    } catch (error) {
+      if (!auxiliary) throw error
+      // Optional geometry must not turn a valid requested page into a failed extraction.
+      const index = pages.findIndex((entry) => entry.pageNumber === pageNumber)
+      if (index !== -1) pages.splice(index, 1)
+    } finally {
+      if (canvas) canvas.width = canvas.height = 1
+      page?.cleanup()
+      // Page cleanup leaves shared decoded images in the document cache.
+      await document.cleanup().catch((error) => {
+        if (!auxiliary) throw error
+      })
+    }
+  }
+  const summary = {
+    pdfjsVersion: version,
+    checksum: sourceSha256,
+    pageCount: document.numPages,
+    nativeOutlineRoots: outline?.length ?? 0,
+    taggedPages: pages.filter((page) => Object.keys(page.structureRoles).length).length,
+    captionStartCandidates: pages.reduce((sum, page) => sum + page.captionStarts.length, 0),
+    headingCandidates: pages.reduce((sum, page) => sum + page.headingCandidates.length, 0),
+    elapsedMs: Math.round(performance.now() - started)
+  }
+  await writeFile(
+    join(outputDirectory, 'probe.json'),
+    JSON.stringify({ summary, outline, pages }, null, 2) + '\n'
+  )
+  console.log(JSON.stringify(summary, null, 2))
+  pages.length = 0
+} catch (error) {
+  nativeFigureRenderContexts.clear()
+  throw error
+} finally {
+  await task.destroy().catch((error) => {
+    nativeFigureRenderContexts.clear()
+    throw error
+  })
+}

@@ -1,0 +1,48 @@
+import { useOverlayLayer } from './overlay-layer'
+import * as React from 'react'
+import { Popover as PopoverPrimitive } from 'radix-ui'
+
+import { cn } from '@/lib/utils'
+import { useChildLayerDismissalGuard } from './use-child-layer-dismissal-guard'
+
+const Popover = PopoverPrimitive.Root
+const PopoverAnchor = PopoverPrimitive.Anchor
+const PopoverClose = PopoverPrimitive.Close
+const PopoverTrigger = PopoverPrimitive.Trigger
+
+function PopoverContent({
+  className,
+  style,
+  sideOffset = 4,
+  collisionPadding = 8,
+  ref,
+  onInteractOutside,
+  container,
+  ...props
+}: React.ComponentProps<typeof PopoverPrimitive.Content> &
+  Pick<React.ComponentProps<typeof PopoverPrimitive.Portal>, 'container'>): React.JSX.Element {
+  const layer = useOverlayLayer()
+  const { setContentRef, onInteractOutside: guardChildDismissal } = useChildLayerDismissalGuard(ref)
+
+  return (
+    <PopoverPrimitive.Portal container={container}>
+      <PopoverPrimitive.Content
+        ref={setContentRef}
+        sideOffset={sideOffset}
+        collisionPadding={collisionPadding}
+        className={cn(
+          'z-50 max-w-[calc(100vw-1rem)] rounded-md border border-border bg-popover p-2 text-xs text-popover-foreground shadow-menu outline-none',
+          className
+        )}
+        {...props}
+        style={layer > 40 ? { ...style, zIndex: layer + 10 } : style}
+        onInteractOutside={(event) => {
+          guardChildDismissal(event)
+          onInteractOutside?.(event)
+        }}
+      />
+    </PopoverPrimitive.Portal>
+  )
+}
+
+export { Popover, PopoverAnchor, PopoverClose, PopoverContent, PopoverTrigger }

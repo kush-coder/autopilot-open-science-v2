@@ -1,0 +1,867 @@
+import { ProviderRuntimeProjectionOwner } from './provider-runtime-projection'
+import type { StoredProvider } from './types'
+import { randomUUID } from 'node:crypto'
+import { join } from 'node:path'
+
+import type { GrantedLocalRoot } from '../../shared/local-fs'
+import type { ReasoningEffort } from '../../shared/model-preference-contract'
+import type { ReasoningEffortProfile } from '../../shared/reasoning-effort'
+import type { ResolvedReasoningEffort } from '@aipoch/providers'
+
+import {
+  buildActiveModelIncompatibleMessage,
+  CODEX_BRIDGE_UNSUPPORTED_MESSAGE,
+  NO_ACTIVE_PROVIDER_MESSAGE
+} from '../../shared/failure/messages'
+import type { CodexSubscriptionTransport } from '../../shared/settings'
+import {
+  DEFAULT_CONVERSATION_SKILL_IMPORT_ENABLED,
+  DEFAULT_REASONING_EFFORT,
+  isCodexSubscriptionProvider,
+  usesAppProviderTransport
+} from '../../shared/settings'
+import {
+  getAgentFramework,
+  releaseResolvedAgentBackendLeases,
+  type AgentFrameworkId,
+  type AgentModelChangeTarget,
+  type AgentModelRoute,
+  type ResolvedAgentBackend
+} from '../agent-framework'
+import { codeBuddyStorageDir } from '../agent-framework/codebuddy'
+import { codexStorageDir, codexSubscriptionStorageDir } from '../agent-framework/codex'
+import { opencodeConfigDir } from '../agent-framework/opencode'
+import { renderConnectorInstructions } from '../connectors/skill-document-renderer'
+import { OPEN_SCIENCE_SKILL_RUNTIME_SESSION_OPTION } from '../skills/runtime-mcp-server'
+import type { AgentRuntimeManager } from './agent-runtime-manager'
+import { BackendRoutePlanner } from './backend-route-planner'
+import {
+  BackendSelectionOwner,
+  type AgentBackendSelection,
+  type BackendSelectionResolution,
+  type ExplicitAgentBackendTarget
+} from './backend-selection-owner'
+import type { ClaudeRuntimeModelConfig } from './claude-config-provision'
+import { ensureCodexAuthHome, resolveEffectiveCodexSubscriptionTransport } from './codex-auth'
+import type { ConnectorSettingsModule } from './connector-settings'
+import {
+  CLAUDE_SHARED_DISCONNECTED_MESSAGE,
+  type ProviderAccountsModule,
+  type ProviderRuntimeTarget,
+  type RuntimeProviderModelSelection
+} from './provider-accounts'
+import type { ResolvedProvider } from './provider-env'
+import { buildProviderEnv } from './provider-env'
+import {
+  ProviderTransportOwner,
+  type ProviderTransportOwnerOptions
+} from './provider-transport-owner'
+import type { StoredSettings } from './types'
+
+export type { AgentBackendSelection, ExplicitAgentBackendTarget } from './backend-selection-owner'
+
+export type AdmittedAgentBackendTarget = ExplicitAgentBackendTarget &
+  Readonly<{
+    expectedBackendId: string
+    expectedModelRoute: AgentModelRoute
+  }>
+
+export type AgentBackendResolutionContext = {
+  forcedSkillIds?: string[]
+  skillWhitelist?: string[]
+  systemPromptAppends?: string[]
+  grantedLocalRoots?: readonly Pick<GrantedLocalRoot, 'path' | 'access'>[]
+  includeSkillAndConnectorContext?: boolean
+  forceCodexNativeResponsesCompatibility?: boolean
+  isolateConfiguration?: boolean
+}
+
+const userSkillDirectorySystemPromptAppend = (storageRoot: string): string =>
+  [
+    '<open_science_user_skill_directories>',
+    `When the user explicitly asks you to author a new Skill, write its complete \`<name>/SKILL.md\` package under \`${join(storageRoot, 'skills', 'personal')}\`.`,
+    `Externally obtained Skill packages that the user or application has directly copied are discovered under \`${join(storageRoot, 'skills', 'imported')}\`. This path is informational; do not download, unpack, or copy an external Skill there yourself.`,
+    'For a GitHub URL, eligible attachment, Skill name or keywords, or any source requiring preview or confirmation, use `request_skill_import` when it is available; otherwise direct the user to the application import flow.',
+    'Use a stable name of 1–64 lowercase letters or numbers separated by single hyphens.',
+    'Changes in either directory are discovered automatically.',
+    '</open_science_user_skill_directories>'
+  ].join('\n')
+
+export type AgentSpawnConfig = {
+  envOverrides: Record<string, string>
+  executablePath: string
+  contextWindow?: number
+  sessionOptions?: Record<string, unknown>
+}
+
+export type AgentBackendRuntimePort = Pick<
+  AgentRuntimeManager,
+  | 'resolveClaudeExecutable'
+  | 'resolveOpencodeExecutable'
+  | 'probeOpencodeVersion'
+  | 'resolveCodeBuddyExecutable'
+  | 'resolveCodexExecutable'
+  | 'probeCodexNativeVersion'
+  | 'provisionClaudeRuntimeConfig'
+  | 'prepareAgentSkillDiscovery'
+  | 'materializeAgentConfigFiles'
+  | 'reserveOpenCodeUsagePort'
+  | 'resolveCodexProxyEnvironment'
+> & { resolvePiExecutable?: () => Promise<string> }
+
+export type AgentBackendProviderPort = Pick<
+  ProviderAccountsModule,
+  'resolveRuntimeTarget' | 'resolveRuntimeModelCatalog' | 'resolveRuntimeReasoningEffortProfile'
+>
+
+export type AgentBackendConnectorPort = Pick<ConnectorSettingsModule, 'connectorSkillNames'>
+
+export type AgentBackendResolverOptions = ProviderTransportOwnerOptions & {
+  readSettings: () => Promise<StoredSettings>
+  providers: AgentBackendProviderPort
+  runtime: AgentBackendRuntimePort
+  connectors: AgentBackendConnectorPort
+  storageRoot: string
+  userClaudeDir: string
+  skillRuntimeMcpEntryPath: string
+  readFrameworkOverride?: () => string | undefined
+  ensureCodexSubscriptionHome?: (transport: CodexSubscriptionTransport) => Promise<void>
+}
+
+// Coordinates stable backend decisions while ProviderTransportOwner owns every live generation.
+// The constructor is intentionally side-effect free; runtime resources start only inside resolve calls.
+export class AgentBackendResolver {
+  private readonly readSettings: () => Promise<StoredSettings>
+  private readonly providers: AgentBackendProviderPort
+  private readonly runtime: AgentBackendRuntimePort
+  private readonly connectors: AgentBackendConnectorPort
+  private readonly storageRoot: string
+  private readonly userClaudeDir: string
+  private readonly skillRuntimeMcpEntryPath: string
+  private readonly selection: BackendSelectionOwner
+  private readonly planner: BackendRoutePlanner
+  private readonly transports: ProviderTransportOwner
+  private readonly ensureCodexSubscriptionHome: (
+    transport: CodexSubscriptionTransport
+  ) => Promise<void>
+
+  constructor(private readonly options: AgentBackendResolverOptions) {
+    this.readSettings = options.readSettings
+    this.providers = options.providers
+    this.runtime = options.runtime
+    this.connectors = options.connectors
+    this.storageRoot = options.storageRoot
+    this.userClaudeDir = options.userClaudeDir
+    this.skillRuntimeMcpEntryPath = options.skillRuntimeMcpEntryPath
+    this.selection = new BackendSelectionOwner({
+      readSettings: this.readSettings,
+      readFrameworkOverride:
+        options.readFrameworkOverride ?? (() => process.env.OPEN_SCIENCE_AGENT_FRAMEWORK),
+      resolveRuntimeReasoningEffortProfile: (provider, model) =>
+        this.providers.resolveRuntimeReasoningEffortProfile(provider, model)
+    })
+    this.planner = new BackendRoutePlanner({ providers: this.providers })
+    this.transports = new ProviderTransportOwner(options)
+    this.ensureCodexSubscriptionHome =
+      options.ensureCodexSubscriptionHome ??
+      ((transport) => ensureCodexAuthHome('isolated', this.storageRoot, transport))
+  }
+
+  async resolveActiveSpawnConfig(
+    context: AgentBackendResolutionContext = {}
+  ): Promise<AgentSpawnConfig> {
+    const settings = await this.readSettings()
+    const executablePath = await this.runtime.resolveClaudeExecutable(settings.claude?.resolvedPath)
+    const target = this.resolveConfiguredProviderTarget(settings, getAgentFramework('claude-code'))
+    if (target.providerType === 'claude-shared' && target.disconnectedAt !== undefined) {
+      throw new Error(CLAUDE_SHARED_DISCONNECTED_MESSAGE)
+    }
+    const plan = this.planner.planBackend({
+      settings,
+      frameworkId: 'claude-code',
+      target,
+      effortIntent: settings.reasoningEffort ?? DEFAULT_REASONING_EFFORT,
+      conversationSkillImportEnabled:
+        settings.conversationSkillImportEnabled ?? DEFAULT_CONVERSATION_SKILL_IMPORT_ENABLED
+    })
+    return this.resolveClaudeSpawnConfig(
+      settings,
+      target,
+      new Set(context.forcedSkillIds ?? []),
+      executablePath,
+      plan.claudeModelConfig,
+      context.includeSkillAndConnectorContext !== false,
+      context.skillWhitelist
+    )
+  }
+
+  async resolveActiveBackend(
+    context: AgentBackendResolutionContext = {}
+  ): Promise<ResolvedAgentBackend> {
+    return this.resolveBackendSelection(await this.selection.resolveActiveSelection(), context)
+  }
+
+  async resolveActiveModelChangeTarget(): Promise<AgentModelChangeTarget | undefined> {
+    const selection = await this.selection.resolveActiveModelChangeSelection()
+    if (!selection) return undefined
+    const { settings, frameworkId, providerId, modelSelection, reasoningEffort } = selection
+    const framework = getAgentFramework(frameworkId)
+    const storedProvider = settings.providers.find((provider) => provider.id === providerId)
+    if (!storedProvider) return undefined
+
+    const target = this.providers.resolveRuntimeTarget(storedProvider, modelSelection, framework)
+    if (!target.frameworkCompatible || (frameworkId === 'codex' && !target.modelBridgeSupported)) {
+      return undefined
+    }
+    return this.planner.projectModelChange({
+      settings,
+      frameworkId,
+      target,
+      effortIntent: reasoningEffort
+    })
+  }
+
+  async captureConfiguredSelection(): Promise<AgentBackendSelection> {
+    return this.selection.captureConfiguredSelection()
+  }
+
+  async captureExplicitTarget(): Promise<ExplicitAgentBackendTarget> {
+    return this.selection.captureExplicitTarget()
+  }
+
+  async resolveSelection(
+    selection: AgentBackendSelection,
+    context: AgentBackendResolutionContext = {}
+  ): Promise<ResolvedAgentBackend> {
+    return this.resolveBackendSelection(await this.selection.resolveSelection(selection), context)
+  }
+
+  async resolveExplicitTarget(
+    target: ExplicitAgentBackendTarget,
+    context: AgentBackendResolutionContext = {}
+  ): Promise<ResolvedAgentBackend> {
+    return this.resolveBackendSelection(await this.selection.resolveExplicitTarget(target), context)
+  }
+
+  // Resolve a draft in disposable storage without publishing it or observing live account health.
+  async resolveValidationTarget(
+    provider: ResolvedProvider,
+    settings: StoredSettings,
+    storageRoot: string
+  ): Promise<ResolvedAgentBackend> {
+    if (provider.type !== 'custom' && provider.type !== 'official')
+      throw new Error('ACP provider validation requires an API-key provider.')
+    const configuration = { ...provider }
+    delete configuration.key
+    const candidate: StoredProvider = {
+      ...configuration,
+      id: 'validation',
+      name: 'Validation',
+      apiEndpoints: [...(provider.apiEndpoints ?? ['messages'])]
+    }
+    const projection = new ProviderRuntimeProjectionOwner()
+    const providers: AgentBackendProviderPort = {
+      resolveRuntimeTarget: (stored, selection, framework) => {
+        const target = projection.resolveRuntimeTarget(stored, selection, framework)
+        return { ...target, provider: { ...target.provider, ...provider } }
+      },
+      resolveRuntimeModelCatalog: (stored, framework) => [
+        providers.resolveRuntimeTarget(stored, { kind: 'provider-default' }, framework)
+      ],
+      resolveRuntimeReasoningEffortProfile: (stored, model) =>
+        projection.resolveRuntimeReasoningEffortProfile(stored, model)
+    }
+    const snapshot: StoredSettings = {
+      ...settings,
+      providers: [candidate],
+      activeProviderId: candidate.id,
+      activeModel: provider.model
+    }
+    const resolver = new AgentBackendResolver({
+      ...this.options,
+      storageRoot,
+      providers,
+      onProviderFailure: undefined,
+      readSettings: async () => snapshot
+    })
+    const backend = await resolver.resolveExplicitTarget(
+      {
+        frameworkId: settings.agentFrameworkId ?? 'open-science-agent',
+        providerId: candidate.id,
+        model: provider.model
+          ? { kind: 'required', id: provider.model }
+          : { kind: 'provider-default' },
+        reasoningEffort: DEFAULT_REASONING_EFFORT
+      },
+      {
+        includeSkillAndConnectorContext: false,
+        isolateConfiguration: true,
+        skillWhitelist: [],
+        systemPromptAppends: []
+      }
+    )
+    return { ...backend, ...(backend.sessionModel ? { sessionModelRequired: true } : {}) }
+  }
+
+  // Direct, tool-less features need the same admitted provider/model as an Agent session, but do
+  // not need a framework process. Resolve the provider through the existing runtime projection so
+  // credentials and vendor endpoints are still derived in one main-process-only seam.
+  async resolveExplicitDirectProvider(target: ExplicitAgentBackendTarget): Promise<{
+    providerId: string
+    provider: ResolvedProvider
+    reasoningEffortProfile: ReasoningEffortProfile
+  }> {
+    const selection = await this.selection.resolveExplicitTarget(target)
+    const stored = selection.settings.providers.find(({ id }) => id === selection.providerId)
+    if (!stored) throw new Error(NO_ACTIVE_PROVIDER_MESSAGE)
+    const runtime = this.providers.resolveRuntimeTarget(
+      stored,
+      selection.modelSelection,
+      getAgentFramework('opencode')
+    )
+    return {
+      providerId: selection.providerId,
+      provider: runtime.provider,
+      // Direct calls have no framework to negotiate an unknown gateway's capabilities.
+      reasoningEffortProfile:
+        stored.type === 'custom' && stored.reasoningEffortPreset === undefined
+          ? { supported: false }
+          : runtime.reasoningEffortProfile
+    }
+  }
+
+  async resolveAdmittedTarget(
+    target: AdmittedAgentBackendTarget,
+    context: AgentBackendResolutionContext = {}
+  ): Promise<ResolvedAgentBackend> {
+    const backend = await this.resolveExplicitTarget(target, context)
+    if (
+      backend.framework.id === target.frameworkId &&
+      backend.backendId === target.expectedBackendId &&
+      backend.modelRoute === target.expectedModelRoute
+    ) {
+      return backend
+    }
+    await releaseResolvedAgentBackendLeases(backend)
+    throw new Error('The configured Subagent backend route changed since admission.')
+  }
+
+  async resolveActiveReasoningEffort(intent: ReasoningEffort): Promise<ResolvedReasoningEffort> {
+    return this.selection.resolveActiveReasoningEffort(intent)
+  }
+
+  private resolveBackendSelection(
+    selection: BackendSelectionResolution,
+    context: AgentBackendResolutionContext
+  ): Promise<ResolvedAgentBackend> {
+    return this.resolveBackendFromSettings(
+      selection.settings,
+      selection.frameworkId,
+      selection.providerId,
+      selection.modelSelection,
+      selection.reasoningEffort,
+      context,
+      selection.resolvedReasoningEffort
+    )
+  }
+
+  private resolveConfiguredProviderTarget(
+    settings: StoredSettings,
+    framework: ReturnType<typeof getAgentFramework>
+  ): ProviderRuntimeTarget {
+    const activeProvider = settings.activeProviderId
+      ? settings.providers.find((provider) => provider.id === settings.activeProviderId)
+      : undefined
+    if (!activeProvider) throw new Error(NO_ACTIVE_PROVIDER_MESSAGE)
+    return this.providers.resolveRuntimeTarget(
+      activeProvider,
+      { kind: 'configured', requestedModel: settings.activeModel },
+      framework
+    )
+  }
+
+  private async resolveBackendFromSettings(
+    settings: StoredSettings,
+    frameworkId: AgentFrameworkId,
+    providerId: string | undefined,
+    modelSelection: RuntimeProviderModelSelection,
+    effortIntent: ReasoningEffort,
+    context: AgentBackendResolutionContext,
+    resolvedEffort?: ResolvedReasoningEffort
+  ): Promise<ResolvedAgentBackend> {
+    const framework = getAgentFramework(frameworkId)
+    const storedProvider = providerId
+      ? settings.providers.find((provider) => provider.id === providerId)
+      : undefined
+    if (!storedProvider) throw new Error(NO_ACTIVE_PROVIDER_MESSAGE)
+
+    const target = this.providers.resolveRuntimeTarget(storedProvider, modelSelection, framework)
+    if (!target.frameworkCompatible) {
+      throw new Error(buildActiveModelIncompatibleMessage(framework.displayName))
+    }
+    if (framework.id === 'codex' && !target.modelBridgeSupported) {
+      throw new Error(CODEX_BRIDGE_UNSUPPORTED_MESSAGE)
+    }
+    if (framework.id === 'open-science-agent') {
+      // The host owns credential revocation and process lifetime; the child receives only a bridge token.
+      const lease = await this.transports.acquireHarness(target, new AbortController().signal)
+      try {
+        const includeSkills = context.includeSkillAndConnectorContext !== false
+        const skillRoot = join(this.storageRoot, 'open-science-agent', 'skill-runtime')
+        const discovery = includeSkills
+          ? await this.runtime.prepareAgentSkillDiscovery(
+              settings,
+              skillRoot,
+              new Set(context.forcedSkillIds ?? []),
+              context.skillWhitelist
+            )
+          : undefined
+        const provider = {
+          ...target.provider,
+          apiEndpoints: [lease.route.protocol],
+          model: lease.route.model,
+          agentProviderId: JSON.stringify([
+            'open-science-agent',
+            target.providerId,
+            target.configRevision,
+            lease.route.model
+          ])
+        }
+        const executablePath = this.skillRuntimeMcpEntryPath
+        const effort =
+          resolvedEffort ??
+          this.planner.projectModelChange({ settings, frameworkId, target, effortIntent })
+            ?.reasoningEffort
+        const config = framework.prepareModelConfig(provider, {
+          storageRoot: this.storageRoot,
+          executablePath,
+          responsesConnection: lease.connection,
+          reasoningEffort: effort === 'default' ? undefined : effort
+        })
+        return {
+          framework,
+          providerId: target.providerId,
+          providerName: target.providerName,
+          backendId: `open-science-agent:${target.providerId}`,
+          modelRoute: 'open-science-agent',
+          executablePath,
+          env: config.env ?? {},
+          args: config.args,
+          authentication: config.authentication,
+          sessionModel: config.sessionModel,
+          sessionEffort: effort === 'default' ? undefined : effort,
+          contextWindow: provider.contextWindow ?? 32_768,
+          contextUsageModel: provider.model,
+          supportsImageInput: provider.supportsImageInput === true,
+          systemPromptAppends: [
+            ...(context.systemPromptAppends ?? []),
+            ...(includeSkills ? [renderConnectorInstructions()] : [])
+          ],
+          ...(discovery
+            ? {
+                sessionOptions: {
+                  [OPEN_SCIENCE_SKILL_RUNTIME_SESSION_OPTION]: {
+                    command: process.execPath,
+                    entryPath: executablePath,
+                    root: skillRoot,
+                    skillsDirectory: join(skillRoot, 'skills'),
+                    mainAllowedNames: discovery.mainAllowedNames
+                  }
+                }
+              }
+            : {}),
+          providerTransportLease: { setTarget: () => false, release: lease.release }
+        }
+      } catch (error) {
+        await lease.release()
+        throw error
+      }
+    }
+    const forceNativeResponsesCompatibility =
+      context.forceCodexNativeResponsesCompatibility === true &&
+      framework.id === 'codex' &&
+      !target.needsChatResponsesToChatCompletionsBridge &&
+      !target.needsNativeResponsesCompatibility
+    if (forceNativeResponsesCompatibility && isCodexSubscriptionProvider(target.provider.type)) {
+      throw new Error(
+        'Artifact code reconstruction is unavailable with Codex subscription authentication.'
+      )
+    }
+    const forcedSkillIds = new Set(context.forcedSkillIds ?? [])
+    const includeSkillAndConnectorContext = context.includeSkillAndConnectorContext !== false
+    const codeBuddySkillRuntimeRoot = join(codeBuddyStorageDir(this.storageRoot), 'skill-runtime')
+    const piSkillRuntimeRoot = join(this.storageRoot, 'pi', 'skill-runtime')
+    const codexSkillRuntimeRoot = isCodexSubscriptionProvider(target.provider.type)
+      ? codexSubscriptionStorageDir(this.storageRoot)
+      : codexStorageDir(this.storageRoot)
+    const userSkillDirectoryGuidance =
+      includeSkillAndConnectorContext && framework.supportsSkills
+        ? userSkillDirectorySystemPromptAppend(this.storageRoot)
+        : undefined
+    let connectorInstructions =
+      includeSkillAndConnectorContext && framework.id === 'claude-code'
+        ? renderConnectorInstructions()
+        : ''
+    const executablePath =
+      framework.id === 'claude-code'
+        ? await this.runtime.resolveClaudeExecutable(settings.claude?.resolvedPath)
+        : framework.id === 'codex'
+          ? await this.runtime.resolveCodexExecutable(
+              settings.codex?.resolvedPath,
+              settings.codex?.nativePath
+            )
+          : framework.id === 'codebuddy'
+            ? await this.runtime.resolveCodeBuddyExecutable(settings.codebuddyPath)
+            : framework.id === 'pi'
+              ? await this.runtime.resolvePiExecutable?.()
+              : await this.runtime.resolveOpencodeExecutable(settings.opencodePath)
+    if (!executablePath) throw new Error('The selected agent executable is unavailable.')
+    const codexNativeVersion =
+      framework.id === 'codex'
+        ? await this.runtime.probeCodexNativeVersion(settings.codex?.nativePath)
+        : undefined
+    const opencodeVersion =
+      framework.id === 'opencode'
+        ? await this.runtime.probeOpencodeVersion(executablePath).catch((cause: unknown) => {
+            throw new Error('OpenCode CLI version check failed.', { cause })
+          })
+        : undefined
+    const opencodeMajorVersion = opencodeVersion?.startsWith('2.') ? 2 : 1
+    if (framework.id === 'opencode' && !/^[12]\.\d+\./.test(opencodeVersion ?? '')) {
+      throw new Error(
+        'Could not identify a supported OpenCode CLI version. Re-detect OpenCode in Settings.'
+      )
+    }
+    if (
+      framework.id === 'claude-code' &&
+      target.providerType === 'claude-shared' &&
+      target.disconnectedAt !== undefined
+    ) {
+      throw new Error(CLAUDE_SHARED_DISCONNECTED_MESSAGE)
+    }
+    const plan = this.planner.planBackend({
+      settings,
+      frameworkId,
+      target,
+      effortIntent,
+      resolvedEffort,
+      conversationSkillImportEnabled:
+        settings.conversationSkillImportEnabled ?? DEFAULT_CONVERSATION_SKILL_IMPORT_ENABLED,
+      forceNativeResponsesCompatibility
+    })
+    const modelRoute = plan.modelRoute
+    const sessionEffort = plan.sessionEffort
+    const supportedReasoningEfforts = plan.supportedReasoningEfforts
+    if (framework.id === 'claude-code') {
+      const {
+        envOverrides,
+        executablePath: claudeExecutablePath,
+        sessionOptions,
+        contextWindow
+      } = await this.resolveClaudeSpawnConfig(
+        settings,
+        target,
+        forcedSkillIds,
+        executablePath,
+        plan.claudeModelConfig,
+        includeSkillAndConnectorContext,
+        context.skillWhitelist,
+        context.isolateConfiguration
+      )
+      const transport = await this.transports.acquire({ activeTarget: target, plan })
+      return {
+        framework,
+        providerId: target.providerId,
+        providerName: target.providerName,
+        backendId: `${framework.id}:${target.providerId}`,
+        modelRoute,
+        executablePath: claudeExecutablePath,
+        env: { ...envOverrides, ...(transport.environment ?? {}) },
+        sessionOptions,
+        sessionEffort,
+        contextWindow,
+        ...(target.provider.supportsImageInput ? { supportsImageInput: true } : {}),
+        contextUsageModel: target.effectiveModel,
+        providerConfiguration: transport.providerConfiguration,
+        systemPromptAppends: [userSkillDirectoryGuidance, connectorInstructions].filter(
+          (append): append is string => Boolean(append)
+        ),
+        ...(transport.messagesBridgeLease
+          ? { messagesBridgeLease: transport.messagesBridgeLease }
+          : {})
+      }
+    }
+
+    const codexSubscriptionTransport =
+      framework.id === 'codex' && isCodexSubscriptionProvider(target.provider.type)
+        ? resolveEffectiveCodexSubscriptionTransport(target.provider)
+        : undefined
+    if (codexSubscriptionTransport) {
+      await this.ensureCodexSubscriptionHome(codexSubscriptionTransport)
+    }
+    const backendProviderId = plan.backendProviderId
+    let skillDiscovery: Awaited<ReturnType<AgentRuntimeManager['prepareAgentSkillDiscovery']>> = {
+      connectorSkillNames: [],
+      allowedNames: [],
+      mainAllowedNames: [],
+      allowedPaths: []
+    }
+    if (framework.supportsSkills || framework.id === 'codebuddy') {
+      const skillsRoot =
+        framework.id === 'codebuddy'
+          ? join(codeBuddySkillRuntimeRoot, '.claude')
+          : framework.id === 'codex'
+            ? codexSkillRuntimeRoot
+            : framework.id === 'pi'
+              ? piSkillRuntimeRoot
+              : opencodeConfigDir(this.storageRoot)
+      skillDiscovery = includeSkillAndConnectorContext
+        ? await this.runtime.prepareAgentSkillDiscovery(
+            settings,
+            skillsRoot,
+            forcedSkillIds,
+            context.skillWhitelist,
+            ...(framework.id === 'codebuddy' ? [{ directoryLayout: 'agent-facing' as const }] : [])
+          )
+        : skillDiscovery
+      connectorInstructions = includeSkillAndConnectorContext ? renderConnectorInstructions() : ''
+    } else if (includeSkillAndConnectorContext) {
+      connectorInstructions = renderConnectorInstructions(
+        this.connectors.connectorSkillNames(settings.connectors, context.skillWhitelist)
+      )
+    }
+
+    const transport = await this.transports.acquire({ activeTarget: target, plan })
+    const provider = transport.provider ?? target.provider
+    const providerModelCatalog = transport.providerModelCatalog ?? plan.providerModelCatalog
+    const responsesConnection = transport.responsesConnection
+    const persistentSystemPromptAppends = [
+      ...(context.systemPromptAppends ?? []),
+      ...(userSkillDirectoryGuidance ? [userSkillDirectoryGuidance] : []),
+      ...(framework.id !== 'opencode' && connectorInstructions ? [connectorInstructions] : [])
+    ]
+
+    try {
+      if (framework.id === 'pi' && !transport.piModelBridge) {
+        throw new Error('The Pi model bridge is unavailable.')
+      }
+      const modelConfig = framework.prepareModelConfig(provider, {
+        storageRoot: this.storageRoot,
+        executablePath,
+        ...(skillDiscovery ? { skillDiscovery } : {}),
+        ...(context.grantedLocalRoots?.length
+          ? { grantedLocalRoots: context.grantedLocalRoots }
+          : {}),
+        ...(codexNativeVersion || opencodeVersion
+          ? { nativeVersion: codexNativeVersion ?? opencodeVersion }
+          : {}),
+        responsesConnection,
+        ...(transport.piModelBridge ? { piModelBridge: transport.piModelBridge } : {}),
+        reasoningEffort: sessionEffort,
+        reasoningEfforts: supportedReasoningEfforts,
+        providerModelCatalog,
+        instructions: connectorInstructions,
+        ...(persistentSystemPromptAppends.length > 0
+          ? { systemPromptAppends: persistentSystemPromptAppends }
+          : {})
+      })
+      await this.runtime.materializeAgentConfigFiles(modelConfig.configFiles)
+      const opencodeUsagePort =
+        framework.id === 'opencode' && opencodeMajorVersion === 1
+          ? await this.runtime.reserveOpenCodeUsagePort()
+          : undefined
+      const opencodeUsagePassword = opencodeUsagePort === undefined ? undefined : randomUUID()
+      const usesCodexSystemProxy =
+        framework.id === 'codex' && isCodexSubscriptionProvider(provider.type)
+      const proxyEnv = usesCodexSystemProxy
+        ? await this.runtime.resolveCodexProxyEnvironment()
+        : undefined
+      const sessionModel = modelConfig.sessionModel ?? provider.model
+
+      return {
+        framework,
+        providerId: target.providerId,
+        providerName: target.providerName,
+        ...(codexSubscriptionTransport ? { codexSubscriptionTransport } : {}),
+        backendId: `${framework.id}:${backendProviderId}`,
+        modelRoute,
+        ...(modelRoute === 'codex-bridge' && responsesConnection?.continuityToken
+          ? { providerContinuityToken: responsesConnection.continuityToken }
+          : {}),
+        executablePath,
+        ...(framework.id === 'opencode'
+          ? {
+              opencodeMajorVersion,
+              opencodeConfigFiles: modelConfig.configFiles?.map((file) => ({ ...file }))
+            }
+          : {}),
+        env: {
+          ...(modelConfig.env ?? {}),
+          ...(opencodeUsagePassword ? { OPENCODE_SERVER_PASSWORD: opencodeUsagePassword } : {}),
+          ...(proxyEnv ?? {}),
+          ...(transport.environment ?? {}),
+          ...(framework.id === 'codex' && settings.codex?.nativePath
+            ? { CODEX_PATH: settings.codex.nativePath }
+            : {})
+        },
+        args:
+          opencodeUsagePort === undefined
+            ? modelConfig.args
+            : [
+                ...(modelConfig.args ?? []),
+                '--port',
+                String(opencodeUsagePort),
+                '--hostname',
+                '127.0.0.1'
+              ],
+        ...(usesCodexSystemProxy
+          ? { proxyEnvironmentMode: proxyEnv === undefined ? 'inherit' : 'replace' }
+          : {}),
+        sessionModel,
+        ...((framework.id === 'pi' ||
+          (framework.id === 'codex' && isCodexSubscriptionProvider(provider.type))) &&
+        sessionModel
+          ? { sessionModelRequired: true }
+          : {}),
+        sessionEffort,
+        ...(includeSkillAndConnectorContext
+          ? {
+              sessionOptions: {
+                [OPEN_SCIENCE_SKILL_RUNTIME_SESSION_OPTION]: {
+                  mainAllowedNames: skillDiscovery.mainAllowedNames,
+                  ...(framework.id === 'opencode'
+                    ? { nativeAllowedNames: skillDiscovery.allowedNames }
+                    : {
+                        command: process.execPath,
+                        entryPath: this.skillRuntimeMcpEntryPath
+                      }),
+                  ...(framework.id === 'codebuddy'
+                    ? { root: codeBuddySkillRuntimeRoot }
+                    : framework.id === 'codex'
+                      ? {
+                          root: codexSkillRuntimeRoot,
+                          skillsDirectory: join(codexSkillRuntimeRoot, 'skills')
+                        }
+                      : framework.id === 'pi'
+                        ? {
+                            root: piSkillRuntimeRoot,
+                            skillsDirectory: join(piSkillRuntimeRoot, 'skills')
+                          }
+                        : {})
+                }
+              }
+            }
+          : {}),
+        contextWindow: provider.contextWindow,
+        ...(provider.supportsImageInput ? { supportsImageInput: true } : {}),
+        contextUsageModel: provider.model,
+        authentication: modelConfig.authentication,
+        providerConfiguration: modelConfig.providerConfiguration,
+        persistentSystemPrompt: modelConfig.persistentSystemPrompt,
+        ...(opencodeUsagePort === undefined || !opencodeUsagePassword
+          ? {}
+          : {
+              opencodeUsageApi: {
+                baseUrl: `http://127.0.0.1:${opencodeUsagePort}`,
+                authorization: `Basic ${Buffer.from(`opencode:${opencodeUsagePassword}`).toString('base64')}`
+              }
+            }),
+        responsesTransportLease: responsesConnection?.lease,
+        providerTransportLease: transport.providerTransportLease
+      }
+    } catch (error) {
+      await transport.release()
+      throw error
+    }
+  }
+
+  private async resolveClaudeSpawnConfig(
+    settings: StoredSettings,
+    target: ProviderRuntimeTarget,
+    forcedSkillIds: ReadonlySet<string>,
+    resolvedExecutablePath?: string,
+    modelConfig?: ClaudeRuntimeModelConfig,
+    includeSkillAndConnectorContext = true,
+    allowedNames?: readonly string[],
+    isolateConfiguration = false
+  ): Promise<AgentSpawnConfig> {
+    const executablePath =
+      resolvedExecutablePath ??
+      (await this.runtime.resolveClaudeExecutable(settings.claude?.resolvedPath))
+    if (target.providerType === 'claude-shared' && target.disconnectedAt !== undefined) {
+      throw new Error(CLAUDE_SHARED_DISCONNECTED_MESSAGE)
+    }
+    const provider = target.provider
+    if (isolateConfiguration && usesAppProviderTransport(provider.type)) {
+      return {
+        executablePath,
+        envOverrides: buildProviderEnv(provider, {
+          storageRoot: this.storageRoot,
+          claudeExecutablePath: executablePath,
+          userClaudeConfigDir: this.userClaudeDir
+        }),
+        sessionOptions: { settings: { ...(modelConfig ?? {}) }, settingSources: [] },
+        contextWindow: provider.contextWindow
+      }
+    }
+    const runtimeConfig = await this.runtime.provisionClaudeRuntimeConfig(
+      settings,
+      forcedSkillIds,
+      modelConfig ?? null,
+      includeSkillAndConnectorContext,
+      allowedNames
+    )
+    const envOverrides = buildProviderEnv(provider, {
+      storageRoot: this.storageRoot,
+      claudeExecutablePath: executablePath,
+      userClaudeConfigDir: this.userClaudeDir
+    })
+    const skillProjectionOptions = {
+      // The additional directory makes the immutable Skill package and its supporting files
+      // readable without enabling the workspace `project` settings source. Session presentation
+      // grants primary Agents a scoped loader that preserves the native `Skill` call shape.
+      additionalDirectories: [runtimeConfig.skillProjection.root],
+      sandbox: {
+        filesystem: {
+          allowRead: [runtimeConfig.skillProjection.root],
+          denyWrite: [runtimeConfig.skillProjection.root]
+        }
+      },
+      [OPEN_SCIENCE_SKILL_RUNTIME_SESSION_OPTION]: {
+        command: process.execPath,
+        entryPath: this.skillRuntimeMcpEntryPath,
+        root: runtimeConfig.skillProjection.root,
+        mainAllowedNames: runtimeConfig.mainAllowedNames
+      }
+    }
+    const sessionOptions =
+      target.providerType === 'claude-shared'
+        ? {
+            // The SDK rejects a settings file path combined with a session sandbox. Pass the exact
+            // app-owned settings snapshot instead; settingsPath remains the CLI probe seam.
+            settings: runtimeConfig.privateSettings,
+            // Share login and transcript storage, not personal instructions, tools or permissions.
+            settingSources: [],
+            strictMcpConfig: true,
+            permissionMode: 'default',
+            ...skillProjectionOptions
+          }
+        : usesAppProviderTransport(provider.type)
+          ? {
+              settings: {
+                skipWebFetchPreflight: true,
+                permissions: { ask: ['WebFetch'] },
+                ...(modelConfig ?? {})
+              },
+              ...skillProjectionOptions
+            }
+          : skillProjectionOptions
+
+    return {
+      envOverrides,
+      executablePath,
+      sessionOptions,
+      contextWindow: provider.contextWindow
+    }
+  }
+}

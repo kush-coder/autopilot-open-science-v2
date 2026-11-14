@@ -1,0 +1,1006 @@
+import type { AuthorizedDirectoryNotices } from '../local-fs/authorized-directories'
+import type { ActiveSession, PromptResponse, SessionNotification } from '@agentclientprotocol/sdk'
+
+import { createLogger, errorLogFields } from '@aipoch/diagnostics/node'
+import type { AcpPromptRequest } from '../../shared/acp'
+import {
+  DEFAULT_PERMISSION_PROFILE,
+  type PermissionProfileId
+} from '../../shared/permission-profiles'
+import type { MessageAttribution } from '../../shared/session-message-contract'
+import type {
+  ActivePlanProjection,
+  PlanProtectedContextSource
+} from '../../shared/session-plan/contract'
+import { formatPlanProtectedContext } from '../../shared/session-plan/contract'
+import type { AgentFramework } from '../agent-framework/types'
+import type { RuntimeSessionContinuationAdmission } from '../session-persistence/runtime-session-owner'
+import { OPEN_SCIENCE_SKILL_RUNTIME_SESSION_OPTION } from '../skills/runtime-mcp-server'
+import { DelegateMessagePreAcceptanceError } from '../delegation/execution-port'
+import { PLAN_FIRST_TURN_PROMPT_REMINDER } from '../session-plan/guidance'
+import {
+  NotebookWorkingFileObserver,
+  type NotebookWorkingFile
+} from './artifact-publication-continuation'
+import type { ArtifactTurnHandle } from './artifact-turn-owner'
+import type { AcpBackendGenerationView } from './backend-generation-owner'
+import type {
+  ContextUsageTracker,
+  ContextWindowTurnHandle,
+  SessionEstimateInput
+} from './context-usage-tracker'
+import type { AcpPermissionContext } from './permission-context'
+import { PlanToolWaitObserver } from './plan-review-provider-stop'
+import {
+  AcpPromptOutcomeFinalizer,
+  type AcpPromptFinalizationHandles,
+  type AcpPromptFinalizationOutcome
+} from './prompt-outcome-finalizer'
+import type { AcpPromptPreparationOwner, PreparedPromptHandle } from './prompt-preparation-owner'
+import type { AcpProviderPromptExecutor, ProviderPromptOutcome } from './provider-prompt-executor'
+import { combineProviderPromptFacts } from './provider-prompt-facts'
+import type { AcpProviderPromptSerializationOwner } from './provider-prompt-serialization-owner'
+import type { AcpProviderTurnResult } from './provider-turn-adapter'
+import type { SessionCapabilityPolicy } from './session-capability-owner'
+import type {
+  AcpPromptSessionInteractionScope,
+  AcpSessionInteractionOwner
+} from './session-interaction-owner'
+import type { AcpSessionToolingAvailability } from './session-presentation-policy'
+import type { AcpSessionRegistry } from './session-registry'
+import type { AcpTurnSkillOwner, TurnSkillHandle } from './turn-skill-owner'
+
+const log = createLogger('acp-prompt-turn-workflow')
+
+type AcpPromptTurnMode =
+  | Readonly<{
+      kind: 'user'
+      promptAttemptId?: string
+      runtimeReviewOwner?: 'task' | 'renderer'
+    }>
+  | Readonly<{
+      kind: 'application'
+      attribution: MessageAttribution
+      promptAttemptId?: string
+    }>
+  | Readonly<{
+      kind: 'app-continuation'
+      promptAttemptId?: string
+      planDelivery?: Readonly<{ projectId: string; commandId: string }>
+      delegatedMessageId?: string
+      onProviderDispatched?: () => void
+    }>
+
+type AcpReloadStartupRelease = (reason: 'prompt-activated' | 'cancelled' | 'failed') => void
+
+type AcpPromptRequestState = {
+  cancelled: boolean
+  releaseReloadStartup?: AcpReloadStartupRelease
+}
+
+type AcpPromptTurnPlanContext = Readonly<{
+  active?: ActivePlanProjection
+  protectedPending?: ActivePlanProjection
+  protectedRejected?: ActivePlanProjection
+  source?: PlanProtectedContextSource
+}>
+
+type AcpActivatedPromptTurn = Readonly<{
+  request: AcpPromptRequest
+  connectionGeneration: number
+  mode: AcpPromptTurnMode
+  session: ActiveSession
+  interaction: AcpPromptSessionInteractionScope
+  skill: TurnSkillHandle
+  plan: AcpPromptTurnPlanContext
+}>
+
+type AcpPromptTurnEnvironment = Readonly<{
+  authorizedDirectories?: Pick<AuthorizedDirectoryNotices, 'prepareNotice'>
+  connectionGeneration?: () => number
+  backend: () => AcpBackendGenerationView
+  tooling: () => AcpSessionToolingAvailability
+  role?: () => SessionCapabilityPolicy['role']
+  bridgeSkillsAvailable: () => boolean
+  skillImportEnabled: () => boolean
+  contextEstimateInput: (sessionId: string) => SessionEstimateInput
+  selectedContextWindow: (sessionId: string) => number | undefined
+  resolveComputeExecutionTargetIds?: (sessionId: string) => readonly string[]
+  emitSkillActivities: (
+    sessionId: string,
+    promptTurn: number,
+    inputs: ReadonlyArray<{ name: string }>,
+    status: 'in_progress' | 'completed' | 'failed'
+  ) => void
+  onSkillImportAttachmentEligible?: (sessionId: string, turnToken: string, uri: string) => void
+  onProviderPromptAccepted?: (sessionId: string, promptAttemptId?: string) => void
+  onRuntimeSessionProviderAccepted?: (sessionId: string, promptMessageId: string) => Promise<void>
+  sideChatRelays?: Readonly<{
+    claim: (parentSessionId: string) =>
+      | Readonly<{
+          historyPreamble: string
+          commit: (promptMessageId?: string) => void | Promise<void>
+          restore: () => void
+        }>
+      | undefined
+  }>
+  routeNotification: (notification: SessionNotification, sessionId: string) => void
+  artifactPublicationPrompt?: (
+    sessionId: string,
+    files: readonly NotebookWorkingFile[]
+  ) => string | undefined
+  diagnosticContext: () => Record<string, unknown>
+  pushUserMessage: (input: {
+    sessionId: string
+    promptMessageId?: string
+    text: string
+    attribution?: MessageAttribution
+  }) => void
+  beforePromptDispatch?: (input: {
+    appSessionId: string
+    framework: AgentFramework
+    providerSessionId: string
+    cwd: string
+    skillRuntimeAllowlist?: readonly string[]
+  }) => Promise<void>
+}>
+
+type AcpPromptTurnArtifacts = Readonly<{
+  open: (
+    sessionId: string,
+    executionId: string,
+    provenance: AcpPromptRequest['provenanceContext']
+  ) => Promise<ArtifactTurnHandle | undefined>
+  promptMessageIdFor: (artifact: ArtifactTurnHandle | undefined) => string | undefined
+  publish: (
+    sessionId: string,
+    artifact: ArtifactTurnHandle | undefined,
+    onPublished: () => void
+  ) => Promise<void>
+  dispose: (artifact: ArtifactTurnHandle | undefined) => Promise<void>
+  sealForPublication: (artifact: ArtifactTurnHandle) => Promise<'empty' | 'ready'>
+}>
+
+type AcpPromptTurnPlanWorkflow = Readonly<{
+  preflight: (
+    request: AcpPromptRequest,
+    mode: AcpPromptTurnMode
+  ) => AcpPromptTurnPlanContext | Promise<AcpPromptTurnPlanContext>
+  admit: (
+    request: AcpPromptRequest,
+    interaction: AcpPromptSessionInteractionScope,
+    plan: AcpPromptTurnPlanContext
+  ) => AcpPromptTurnPlanContext | Promise<AcpPromptTurnPlanContext>
+  toolWaitFailed?: (interaction: AcpPromptSessionInteractionScope) => void
+  providerStopped?: (interaction: AcpPromptSessionInteractionScope) => void
+  isProviderPaused?: (interaction: AcpPromptSessionInteractionScope) => boolean
+  resumeAfterProviderStop?: (interaction: AcpPromptSessionInteractionScope) => Promise<
+    | {
+        content: string
+        dispatch?: () => Promise<void>
+        notDispatched?: () => Promise<void>
+        accepted: () => Promise<void>
+      }
+    | undefined
+  >
+  providerAccepted: (sessionId: string, mode: AcpPromptTurnMode) => void | Promise<void>
+  beforeRelease: (sessionId: string, interaction: AcpPromptSessionInteractionScope) => void
+  afterRelease: (sessionId: string) => Promise<void>
+}>
+
+type AcpPromptTurnFinalization = Readonly<{
+  errorMessage: AcpPromptFinalizationHandles['errorMessage']
+  errorKind: AcpPromptFinalizationHandles['errorKind']
+  pushEvent: AcpPromptFinalizationHandles['pushEvent']
+  commitTerminal?: AcpPromptFinalizationHandles['commitTerminal']
+  retryTerminalCommits?: (sessionId: string) => void
+  onPromptEnded: (sessionId: string, turnToken: string) => void
+  generationActivityChanged: () => void
+  autoCompact: (
+    sessionId: string,
+    session: ActiveSession,
+    interaction: AcpPromptSessionInteractionScope
+  ) => Promise<unknown>
+  compactIfIdle: (sessionId: string) => Promise<unknown>
+  preemptCompaction: (sessionId: string) => Promise<void> | undefined
+}>
+
+type AcpPromptTurnWorkflowOptions = Readonly<{
+  registry: Pick<AcpSessionRegistry, 'lookup' | 'select'>
+  interactions: Pick<
+    AcpSessionInteractionOwner,
+    | 'activatePrompt'
+    | 'cancellationCheckpoint'
+    | 'captureTerminal'
+    | 'current'
+    | 'release'
+    | 'reservePrompt'
+    | 'settle'
+    | 'updatePromptProvenance'
+  >
+  skills: Pick<AcpTurnSkillOwner, 'authorize'>
+  preparation: Pick<AcpPromptPreparationOwner, 'prepare'>
+  executor: Pick<AcpProviderPromptExecutor, 'execute'>
+  serialization: Pick<AcpProviderPromptSerializationOwner, 'run'>
+  contextUsage: Pick<ContextUsageTracker, 'reconcileUsed'>
+  providerReconnectPending: () => boolean
+  finalizer: Pick<AcpPromptOutcomeFinalizer, 'finalize'>
+  permission: Pick<AcpPermissionContext, 'clearCorrelationsForSession'>
+  environment: AcpPromptTurnEnvironment
+  artifacts: AcpPromptTurnArtifacts
+  plan: AcpPromptTurnPlanWorkflow
+  finalization: AcpPromptTurnFinalization
+  currentCwd: () => string
+  resolveProjectId: (sessionId: string) => string
+  prepareContinuationReplay: (
+    request: AcpPromptRequest
+  ) => Promise<AcpPromptRequest['resumeFallback']>
+  disconnectForReload: () => Promise<unknown>
+  resumeAfterReload: (
+    input: {
+      sessionId: string
+      providerSessionId?: string
+      cwd: string
+      projectId: string
+      permissionProfile: PermissionProfileId
+    },
+    retainStartup: (release: AcpReloadStartupRelease) => void
+  ) => Promise<{ contextReset?: boolean }>
+  recordAdmittedPrompt: (request: AcpPromptRequest) => void
+  beginRuntimeSessionTurn?: (
+    request: AcpPromptRequest,
+    executionId: string,
+    reviewOwner: 'task' | 'renderer',
+    planDeliveryCommandId?: string,
+    delegatedMessageId?: string,
+    applicationPrompt?: { text: string; attribution: MessageAttribution },
+    approvedHandoffContinuation?: boolean,
+    continuationAdmission?: RuntimeSessionContinuationAdmission
+  ) => Promise<void>
+  assertRuntimeSessionAdmissionAvailable?: (sessionId: string) => Promise<void>
+  waitForRuntimeSessionTerminalWrites?: (sessionId: string, signal: AbortSignal) => Promise<void>
+  onPromptStarted: (sessionId: string, turnToken: string, promptAttemptId?: string) => void
+  emitState: () => void
+}>
+
+class AcpPromptTurnWorkflow {
+  // A send outlives the provider generation replaced by a forced Skill reload.
+  private readonly requests = new Map<string, AcpPromptRequestState>()
+
+  captureCancellation(sessionId: string): (() => void) | undefined {
+    const request = this.requests.get(sessionId)
+    return request
+      ? () => {
+          request.cancelled = true
+        }
+      : undefined
+  }
+
+  constructor(private readonly options: AcpPromptTurnWorkflowOptions) {}
+
+  async run(
+    request: AcpPromptRequest,
+    mode: AcpPromptTurnMode,
+    onPromptAdmitted?: () => Promise<AcpPromptRequest['provenanceContext']>
+  ): Promise<PromptResponse> {
+    if (!this.activeSession(request.sessionId)) {
+      throw new Error(`ACP session not found: ${request.sessionId}`)
+    }
+    this.assertSessionIdle(request.sessionId)
+    const cancellation: AcpPromptRequestState = { cancelled: false }
+    this.requests.set(request.sessionId, cancellation)
+    try {
+      return await this.runRequest(request, mode, cancellation, onPromptAdmitted)
+    } finally {
+      // Cancellation or failure before activation must also unblock the queued reconnect.
+      this.releaseReloadStartup(cancellation, cancellation.cancelled ? 'cancelled' : 'failed')
+      if (this.requests.get(request.sessionId) === cancellation)
+        this.requests.delete(request.sessionId)
+    }
+  }
+
+  private async runRequest(
+    request: AcpPromptRequest,
+    mode: AcpPromptTurnMode,
+    cancellation: AcpPromptRequestState,
+    onPromptAdmitted?: () => Promise<AcpPromptRequest['provenanceContext']>
+  ): Promise<PromptResponse> {
+    if (request.permissionPrompts === 'none' && request.turnIntent === 'plan-first') {
+      throw new Error('Plan-first requires an available human approver.')
+    }
+    let activeSession = this.activeSession(request.sessionId)
+    if (!activeSession) throw new Error(`ACP session not found: ${request.sessionId}`)
+    this.assertSessionIdle(request.sessionId)
+
+    if (
+      this.options.assertRuntimeSessionAdmissionAvailable &&
+      (mode.kind !== 'app-continuation' || !this.options.waitForRuntimeSessionTerminalWrites)
+    ) {
+      await this.options.assertRuntimeSessionAdmissionAvailable(request.sessionId)
+    }
+    let reservation = this.reserve(request)
+    if (mode.kind === 'app-continuation' && this.options.waitForRuntimeSessionTerminalWrites) {
+      try {
+        await this.options.waitForRuntimeSessionTerminalWrites(
+          request.sessionId,
+          reservation.signal
+        )
+        reservation.signal.throwIfAborted()
+      } catch (error) {
+        if (reservation.signal.aborted)
+          await this.options.interactions.cancellationCheckpoint(reservation)
+        this.options.interactions.release(reservation)
+        if (reservation.signal.aborted) return { stopReason: 'cancelled' }
+        throw error
+      }
+    }
+    let plan: AcpPromptTurnPlanContext
+    let skill: TurnSkillHandle
+    try {
+      const preemption = this.options.finalization.preemptCompaction(request.sessionId)
+      if (preemption) await preemption
+      const planPreflight = this.options.plan.preflight(request, mode)
+      plan = planPreflight instanceof Promise ? await planPreflight : planPreflight
+      const backend = this.options.environment.backend()
+      const skillRuntime = backend.session.options?.[OPEN_SCIENCE_SKILL_RUNTIME_SESSION_OPTION] as
+        { nativeAllowedNames?: string[]; mainAllowedNames?: string[] } | undefined
+      const authorization = this.options.skills.authorize({
+        diagnosticContext: {
+          sessionId: request.sessionId,
+          frameworkId: backend.framework.id,
+          modelRoute: backend.modelRoute
+        },
+        frameworkId: backend.framework.id,
+        nativeSkillScope: skillRuntime?.nativeAllowedNames,
+        mainSkillScope: skillRuntime?.mainAllowedNames,
+        role: this.options.environment.role?.(),
+        specialistId: this.options.registry.lookup(request.sessionId)?.aggregate.snapshot()
+          .specialistId,
+        selectedSkillIds: request.forcedSkillIds,
+        signal: reservation.signal
+      })
+      skill = authorization instanceof Promise ? await authorization : authorization
+    } catch (error) {
+      this.options.interactions.release(reservation)
+      throw error
+    }
+    const rejectedSkillOutcome =
+      skill.reloadDecision.kind === 'reload' ? 'reload-restored' : 'failed'
+
+    if (
+      skill.reloadDecision.kind === 'reload' &&
+      mode.kind === 'app-continuation' &&
+      !request.resumeFallback
+    ) {
+      try {
+        this.assertSessionIdle(request.sessionId)
+        request.resumeFallback = await this.options.prepareContinuationReplay(request)
+        reservation.signal.throwIfAborted()
+        this.assertSessionIdle(request.sessionId)
+      } catch (error) {
+        // No provider reconnect has begun, so releasing authorization must not schedule one.
+        skill.close('failed', { reload: false })
+        this.options.interactions.release(reservation)
+        throw error
+      }
+    }
+
+    try {
+      if (skill.reloadDecision.kind === 'reload') {
+        this.assertSessionIdle(request.sessionId)
+        if (cancellation.cancelled) {
+          skill.close('reload-restored')
+          this.options.interactions.release(reservation)
+          return { stopReason: 'cancelled' }
+        }
+        const entry = this.options.registry.lookup(request.sessionId)
+        const snapshot = entry?.aggregate.snapshot()
+        // App identity survives replacement; a Skill reconnect must resume the current provider,
+        // not the original provider whose ID happened to seed the App Session.
+        const providerSessionId =
+          entry?.attachment?.providerSessionId ?? snapshot?.providerSessionId
+        const projectId = this.options.resolveProjectId(request.sessionId)
+        await this.options.disconnectForReload()
+        const resumed = await this.options.resumeAfterReload(
+          {
+            sessionId: request.sessionId,
+            ...(providerSessionId ? { providerSessionId } : {}),
+            cwd: snapshot?.cwd ?? this.options.currentCwd(),
+            projectId,
+            permissionProfile:
+              snapshot?.permissionProfile?.selectedProfile ?? DEFAULT_PERMISSION_PROFILE,
+            ...(request.memoryEnabled !== undefined ? { memoryEnabled: request.memoryEnabled } : {})
+          },
+          (release) => {
+            cancellation.releaseReloadStartup = release
+          }
+        )
+        if (cancellation.cancelled) {
+          skill.close('reload-restored')
+          this.options.interactions.release(reservation)
+          return { stopReason: 'cancelled' }
+        }
+        if (resumed.contextReset) {
+          request.historyPreamble = request.resumeFallback?.historyPreamble
+          request.historyAttachments = request.resumeFallback?.historyAttachments
+          request.historyImages = request.resumeFallback?.historyImages
+          request.contextReset = true
+        }
+        activeSession = this.activeSession(request.sessionId)
+        if (!activeSession) {
+          throw new Error(`ACP session not found after force-load: ${request.sessionId}`)
+        }
+        reservation = this.reserve(request)
+      }
+    } catch (error) {
+      skill.close('reload-restored')
+      this.options.interactions.release(reservation)
+      throw error
+    }
+
+    if (this.options.interactions.current(request.sessionId)) {
+      skill.close(rejectedSkillOutcome)
+      this.options.interactions.release(reservation)
+      throw new Error('An ACP prompt is already running for this session')
+    }
+    activeSession = this.activeSession(request.sessionId)
+    if (!activeSession) {
+      skill.close(rejectedSkillOutcome)
+      this.options.interactions.release(reservation)
+      throw new Error(`ACP session not found: ${request.sessionId}`)
+    }
+
+    let interaction: AcpPromptSessionInteractionScope | undefined
+    let admittedRequest = request
+    try {
+      interaction = this.options.interactions.activatePrompt(reservation)
+      // Activate the prompt before releasing startup protection so reconnect never sees an idle gap.
+      this.releaseReloadStartup(cancellation, 'prompt-activated')
+      const admittedPlan = this.options.plan.admit(request, interaction, plan)
+      plan = admittedPlan instanceof Promise ? await admittedPlan : admittedPlan
+      // Admission-dependent state may commit only while this interaction owns the Session. A
+      // rejected commit releases ownership below without publishing prompt start or dispatching.
+      const admittedProvenanceContext = await onPromptAdmitted?.()
+      if (admittedProvenanceContext) {
+        this.options.interactions.updatePromptProvenance(interaction, admittedProvenanceContext)
+        admittedRequest = { ...request, provenanceContext: admittedProvenanceContext }
+      }
+      if (this.options.beginRuntimeSessionTurn) {
+        await this.options.beginRuntimeSessionTurn(
+          admittedRequest,
+          interaction.turnToken,
+          mode.kind === 'user' ? (mode.runtimeReviewOwner ?? 'renderer') : 'renderer',
+          mode.kind === 'app-continuation' ? mode.planDelivery?.commandId : undefined,
+          mode.kind === 'app-continuation' ? mode.delegatedMessageId : undefined,
+          mode.kind === 'application'
+            ? { text: admittedRequest.text ?? '', attribution: mode.attribution }
+            : undefined,
+          mode.kind === 'app-continuation',
+          mode.kind === 'app-continuation'
+            ? {
+                signal: interaction.signal,
+                assertCurrent: () => {
+                  if (this.options.interactions.current(request.sessionId) !== interaction)
+                    throw new Error('ACP prompt interaction is no longer active')
+                }
+              }
+            : undefined
+        )
+      }
+      this.options.registry.select(admittedRequest.sessionId)
+      this.options.recordAdmittedPrompt(admittedRequest)
+    } catch (error) {
+      const scope = interaction ?? reservation
+      const cancelled = mode.kind === 'app-continuation' && scope.signal.aborted
+      skill.close(cancelled ? 'cancelled' : rejectedSkillOutcome)
+      try {
+        if (cancelled) await this.options.interactions.cancellationCheckpoint(scope)
+      } finally {
+        this.options.interactions.release(scope)
+      }
+      if (cancelled) return { stopReason: 'cancelled' }
+      if (mode.kind === 'app-continuation' && mode.delegatedMessageId) {
+        throw new DelegateMessagePreAcceptanceError(
+          error instanceof Error ? error.message : String(error),
+          error
+        )
+      }
+      throw error
+    }
+
+    this.safeCallback('prompt-start callback failed', () =>
+      this.options.onPromptStarted(request.sessionId, interaction.turnToken, mode.promptAttemptId)
+    )
+    this.options.emitState()
+    log.info('prompt start', {
+      sessionId: request.sessionId,
+      textLength: request.text?.length ?? 0
+    })
+    return this.executeTurn({
+      request: admittedRequest,
+      connectionGeneration: this.options.environment.connectionGeneration?.() ?? 0,
+      mode,
+      session: activeSession,
+      interaction,
+      skill,
+      plan
+    })
+  }
+
+  private async executeTurn(turn: AcpActivatedPromptTurn): Promise<PromptResponse> {
+    const { request, session, interaction, skill } = turn
+    const {
+      artifacts,
+      environment: env,
+      executor,
+      finalization,
+      finalizer,
+      interactions,
+      plan,
+      permission,
+      preparation,
+      registry
+    } = this.options
+    const sessionId = request.sessionId
+    const promptTurn = interaction.sequence
+    const turnToken = interaction.turnToken
+    const eventIdentity = interaction.promptMessageId
+      ? { promptMessageId: interaction.promptMessageId }
+      : {}
+    let promptBackend: AcpBackendGenerationView | undefined
+    let artifact: ArtifactTurnHandle | undefined
+    let prepared: PreparedPromptHandle | undefined
+    let context: ContextWindowTurnHandle | undefined
+    let skillInputs: Array<{ name: string; path: string }> = []
+    let skillStarted = false
+    let skillFinalized = false
+    let userMessageEmitted = false
+    let sideChatRelay: ReturnType<NonNullable<typeof env.sideChatRelays>['claim']>
+    let sideChatRelaySettled = false
+    const notebookWorkingFiles = new NotebookWorkingFileObserver()
+    const planToolWait = new PlanToolWaitObserver()
+    const emitUserMessage = (): void => {
+      if (
+        (turn.mode.kind !== 'user' && turn.mode.kind !== 'application') ||
+        request.continuation ||
+        request.suppressUserMessage ||
+        userMessageEmitted
+      )
+        return
+      userMessageEmitted = true
+      env.pushUserMessage({
+        sessionId,
+        ...eventIdentity,
+        text: request.text,
+        ...(turn.mode.kind === 'application' ? { attribution: turn.mode.attribution } : {})
+      })
+    }
+    const execute = async (): Promise<ProviderPromptOutcome> => {
+      artifact = await artifacts.open(sessionId, turnToken, request.provenanceContext)
+      if ((await this.checkpoint(interaction)) === 'cancelled') {
+        return Object.freeze({ kind: 'not-dispatched' })
+      }
+      if (turn.mode.kind === 'user' && !request.continuation && !request.suppressUserMessage) {
+        sideChatRelay = env.sideChatRelays?.claim(sessionId)
+      }
+      const preparationRequest = sideChatRelay
+        ? {
+            ...request,
+            historyPreamble: [request.historyPreamble, sideChatRelay.historyPreamble]
+              .filter((value): value is string => Boolean(value))
+              .join('\n\n')
+          }
+        : request
+      const snapshot = registry.lookup(sessionId)?.aggregate.snapshot()
+      const backend = env.backend()
+      promptBackend = backend
+      const planContext =
+        turn.plan.active ?? turn.plan.protectedPending ?? turn.plan.protectedRejected
+      // Only an explicit user send carries the notice; continuations never consume it.
+      const authorizationNotice =
+        turn.mode.kind === 'user' && !request.continuation && !request.suppressUserMessage
+          ? await env.authorizedDirectories?.prepareNotice(session)
+          : undefined
+      prepared = await preparation.prepare({
+        request: preparationRequest,
+        classificationEnabled:
+          turn.mode.kind === 'user' &&
+          turn.mode.runtimeReviewOwner !== 'task' &&
+          !request.continuation &&
+          !request.suppressUserMessage,
+        connectionGeneration: turn.connectionGeneration,
+        backend,
+        tooling: env.tooling(),
+        role: env.role?.(),
+        specialistPrefix: snapshot?.specialistPrefix,
+        sessionSetupPromptPrefix: snapshot?.sessionSetupPromptPrefix,
+        projectId: this.options.resolveProjectId(sessionId),
+        fallbackPromptMessageId: artifacts.promptMessageIdFor(artifact),
+        bridgeSkillsAvailable: env.bridgeSkillsAvailable(),
+        skillImportEnabled: env.skillImportEnabled(),
+        skillImportTurnToken: turnToken,
+        turnSkill: skill,
+        selectedComputeHostIds: env.resolveComputeExecutionTargetIds?.(sessionId) ?? [],
+        ...(planContext
+          ? { protectedContext: formatPlanProtectedContext(planContext, turn.plan.source) }
+          : {}),
+        turnPromptReminders: [
+          ...(request.turnIntent === 'plan-first' ? [PLAN_FIRST_TURN_PROMPT_REMINDER] : []),
+          ...(authorizationNotice ? [authorizationNotice.text] : [])
+        ],
+        signal: interaction.signal,
+        isCurrent: () => this.isCurrent(turn),
+        cancellationCheckpoint: () => this.checkpoint(interaction),
+        contextEstimateInput: env.contextEstimateInput(sessionId),
+        selectedContextWindow: env.selectedContextWindow(sessionId),
+        ...(env.onSkillImportAttachmentEligible
+          ? {
+              onSkillImportAttachmentEligible: (uri: string) =>
+                this.safeCallback('skill import attachment callback failed', () =>
+                  env.onSkillImportAttachmentEligible?.(sessionId, turnToken, uri)
+                )
+            }
+          : {})
+      })
+      if (prepared.status === 'cancelled') return Object.freeze({ kind: 'not-dispatched' })
+      const readyPrepared = prepared
+      skillInputs = [...readyPrepared.skillActivityInputs]
+      context = readyPrepared.transferContextTurn()
+      emitUserMessage()
+      if (skillInputs.length > 0) {
+        env.emitSkillActivities(sessionId, promptTurn, skillInputs, 'in_progress')
+        skillStarted = true
+      }
+      const promptSnapshot = registry.lookup(sessionId)?.aggregate.snapshot()
+      promptBackend = env.backend()
+      const framework = promptBackend.framework
+      const cwd = promptSnapshot?.cwd ?? this.options.currentCwd()
+      let providerContent = readyPrepared.content
+      let resumeAccepted: (() => Promise<void>) | undefined
+      let resumeDispatch: (() => Promise<void>) | undefined
+      let resumeNotDispatched: (() => Promise<void>) | undefined
+      let publicationPrompt: string | undefined
+      let publicationAttempted = false
+      let deliveryClaimed = false
+      let providerDispatched = false
+      let accumulatedFacts: AcpProviderTurnResult | undefined
+      const executeProviderTurn = (): Promise<ProviderPromptOutcome> =>
+        executor.execute({
+          session,
+          content: providerContent,
+          cwd,
+          frameworkId: promptSnapshot?.frameworkId ?? framework.id,
+          ...(!accumulatedFacts && readyPrepared.preDispatchModelCalls
+            ? { preDispatchModelCalls: readyPrepared.preDispatchModelCalls }
+            : {}),
+          isCurrent: () => this.isCurrent(turn),
+          beforeDispatch: async () => {
+            if ((await this.checkpoint(interaction)) === 'cancelled') return 'cancelled'
+            if (publicationPrompt && artifact) {
+              // The provider slot may have been queued. Revalidate the same execution
+              // against durable session state before issuing another write capability.
+              if (!this.isCurrent(turn)) return 'cancelled'
+              await this.options.beginRuntimeSessionTurn?.(
+                request,
+                turnToken,
+                turn.mode.kind === 'user'
+                  ? (turn.mode.runtimeReviewOwner ?? 'renderer')
+                  : 'renderer'
+              )
+              const promptMessageId = artifacts.promptMessageIdFor(artifact)
+              await artifacts.dispose(artifact)
+              artifact = undefined
+              if ((await this.checkpoint(interaction)) === 'cancelled' || !this.isCurrent(turn))
+                return 'cancelled'
+              artifact = await artifacts.open(
+                sessionId,
+                turnToken,
+                request.provenanceContext ?? (promptMessageId ? { promptMessageId } : undefined)
+              )
+            }
+            await env.beforePromptDispatch?.({
+              appSessionId: sessionId,
+              framework,
+              providerSessionId: session.sessionId,
+              cwd,
+              ...(readyPrepared.skillRuntimeAllowlist
+                ? { skillRuntimeAllowlist: readyPrepared.skillRuntimeAllowlist }
+                : {})
+            })
+            if (!accumulatedFacts && request.historyPreamble) {
+              log.info('session transcript replay dispatched', {
+                sessionId,
+                historyTextLength: request.historyPreamble.length,
+                historyAttachmentCount: request.historyAttachments?.length ?? 0,
+                historyImageCount: request.historyImages?.length ?? 0,
+                ...env.diagnosticContext()
+              })
+            }
+            if (resumeDispatch) {
+              await resumeDispatch()
+              deliveryClaimed = true
+            }
+            const dispatch = await this.checkpoint(interaction)
+            // Mark the boundary before calling the adapter: a synchronous throw from
+            // session.prompt cannot prove that no request left the process.
+            if (dispatch !== 'cancelled' && turn.mode.kind === 'app-continuation') {
+              turn.mode.onProviderDispatched?.()
+            }
+            return dispatch
+          },
+          onDispatched: () => {
+            providerDispatched = true
+          },
+          captureStop: (response) => {
+            if (plan.isProviderPaused?.(interaction)) {
+              plan.providerStopped?.(interaction)
+              return true
+            }
+            if (
+              response.stopReason === 'end_turn' &&
+              artifact &&
+              !publicationAttempted &&
+              turn.mode.kind !== 'app-continuation' &&
+              env.tooling().artifacts
+            ) {
+              const files = notebookWorkingFiles.snapshot()
+              if (files.length)
+                publicationPrompt = env.artifactPublicationPrompt?.(sessionId, files)
+              if (publicationPrompt) return true
+            }
+            return interactions.captureTerminal(interaction, 'stop')
+          },
+          onAccepted: async () => {
+            if (publicationPrompt) return
+            authorizationNotice?.commit()
+            if (resumeAccepted) {
+              const accept = resumeAccepted
+              resumeAccepted = undefined
+              await accept()
+            } else {
+              await plan.providerAccepted(sessionId, turn.mode)
+            }
+            if (sideChatRelay && !sideChatRelaySettled) {
+              sideChatRelaySettled = true
+              try {
+                await sideChatRelay.commit(request.provenanceContext?.promptMessageId)
+              } catch (error) {
+                log.warn('side chat advisory persistence failed after provider admission', {
+                  sessionId,
+                  ...errorLogFields(error)
+                })
+              }
+            }
+            // Receipts describe provider acceptance and keep their durable notifications. Only
+            // the current turn may publish live acceptance and Skill completion after those waits.
+            if (!this.isCurrent(turn)) return
+            if (request.provenanceContext?.promptMessageId) {
+              await env.onRuntimeSessionProviderAccepted?.(
+                sessionId,
+                request.provenanceContext.promptMessageId
+              )
+            }
+            this.safeCallback('provider-prompt-accepted callback failed', () =>
+              env.onProviderPromptAccepted?.(sessionId, turn.mode.promptAttemptId)
+            )
+            if (skillStarted && !skillFinalized) {
+              env.emitSkillActivities(sessionId, promptTurn, skillInputs, 'completed')
+              skillFinalized = true
+            }
+          },
+          // Application turns are app-authored prompts, but their provider output is still the
+          // Session's authoritative assistant turn. Route it through the normal event projection so
+          // the response, tools, stop metadata, and durable transcript all settle. Dropping these
+          // notifications left Reviewer Corrections with only the [Auditor] prompt persisted, so the
+          // fix loop could never observe the completed correction and refused its scoped re-review.
+          routeNotification: (notification) => {
+            if (planToolWait.failed(notification)) plan.toolWaitFailed?.(interaction)
+            this.safeCallback('Notebook working-file observation failed', () =>
+              notebookWorkingFiles.observe(notification)
+            )
+            env.routeNotification(notification, sessionId)
+          },
+          reportBestEffortFailure: (stage, error) =>
+            log.warn('provider prompt observation failed', {
+              sessionId,
+              stage,
+              ...errorLogFields(error)
+            })
+        })
+
+      for (;;) {
+        // Release the shared Provider slot before waiting for human review.
+        let outcome: ProviderPromptOutcome
+        deliveryClaimed = false
+        providerDispatched = false
+        try {
+          outcome = await this.options.serialization.run(framework, executeProviderTurn)
+        } finally {
+          if (deliveryClaimed && !providerDispatched) await resumeNotDispatched?.()
+        }
+        if (outcome.kind !== 'stopped') {
+          if (outcome.kind === 'not-dispatched' && accumulatedFacts) {
+            interactions.captureTerminal(interaction, 'cancelled')
+            return {
+              kind: 'stopped',
+              response: { stopReason: 'cancelled' },
+              facts: accumulatedFacts
+            }
+          }
+          return outcome
+        }
+        accumulatedFacts = accumulatedFacts
+          ? combineProviderPromptFacts(accumulatedFacts, outcome.facts)
+          : outcome.facts
+        if (publicationPrompt && !publicationAttempted && artifact) {
+          publicationAttempted = true
+          // Drain outstanding writes before deciding whether this run is empty. A sealed
+          // run with files is reused by the finalizer, including its existing claim.
+          const sealed = await artifacts.sealForPublication(artifact).catch((error: unknown) => {
+            // Leave publication failures to the normal finalizer and its bounded retry.
+            log.warn('could not check Notebook artifact publication', {
+              sessionId,
+              ...errorLogFields(error)
+            })
+          })
+          if (sealed === 'empty') {
+            providerContent = publicationPrompt
+            resumeDispatch = undefined
+            resumeNotDispatched = undefined
+            continue
+          }
+          if (!interactions.captureTerminal(interaction, 'stop'))
+            return { kind: 'superseded', response: outcome.response }
+        }
+        if (!plan.isProviderPaused?.(interaction)) {
+          return { ...outcome, facts: accumulatedFacts }
+        }
+        let resumed: Awaited<ReturnType<NonNullable<typeof plan.resumeAfterProviderStop>>>
+        try {
+          resumed = await plan.resumeAfterProviderStop?.(interaction)
+        } catch (error) {
+          if (!interaction.signal.aborted) throw error
+        }
+        if (!resumed || (await this.checkpoint(interaction)) === 'cancelled') {
+          interactions.captureTerminal(interaction, 'cancelled')
+          return { kind: 'stopped', response: { stopReason: 'cancelled' }, facts: accumulatedFacts }
+        }
+        publicationPrompt = undefined
+        providerContent = resumed.content
+        resumeAccepted = resumed.accepted
+        resumeDispatch = resumed.dispatch
+        resumeNotDispatched = resumed.notDispatched
+      }
+    }
+    let outcome: AcpPromptFinalizationOutcome
+    try {
+      outcome = await execute()
+    } catch (error) {
+      outcome = Object.freeze({ kind: 'failed', error })
+    }
+    if (sideChatRelay && !sideChatRelaySettled) {
+      sideChatRelaySettled = true
+      sideChatRelay.restore()
+    }
+    const model = promptBackend?.context.model ?? promptBackend?.session.model
+    return finalizer.finalize(
+      {
+        sessionId,
+        ...eventIdentity,
+        interaction,
+        interactions,
+        permission,
+        ...(prepared ? { prepared } : {}),
+        ...(context ? { context } : {}),
+        skill,
+        ...(model ? { model } : {}),
+        providerName: promptBackend?.providerName,
+        emitUserMessage,
+        emitArtifact: (onPublished) => artifacts.publish(sessionId, artifact, onPublished),
+        disposeArtifact: () => artifacts.dispose(artifact),
+        failPendingSkillActivities: () => {
+          if (!skillStarted || skillFinalized) return
+          env.emitSkillActivities(sessionId, promptTurn, skillInputs, 'failed')
+          skillFinalized = true
+        },
+        recordContextUsed: (used) => {
+          if (
+            this.options.providerReconnectPending() ||
+            interactions.current(sessionId) !== interaction
+          ) {
+            return false
+          }
+          const reconciled = this.options.contextUsage.reconcileUsed(sessionId, used)
+          if (reconciled) this.options.emitState()
+          return reconciled
+        },
+        errorMessage: finalization.errorMessage,
+        errorKind: finalization.errorKind,
+        pushEvent: finalization.pushEvent,
+        ...(finalization.commitTerminal ? { commitTerminal: finalization.commitTerminal } : {}),
+        retryTerminalCommits: () => finalization.retryTerminalCommits?.(sessionId),
+        emitState: this.options.emitState,
+        onPromptEnded: () => finalization.onPromptEnded(sessionId, turnToken),
+        generationActivityChanged: finalization.generationActivityChanged,
+        autoCompactIfNeeded: () => finalization.autoCompact(sessionId, session, interaction),
+        beforeInteractionRelease: () => plan.beforeRelease(sessionId, interaction),
+        afterInteractionRelease: async () => {
+          await plan.afterRelease(sessionId)
+          void finalization.compactIfIdle(sessionId)
+        }
+      },
+      outcome
+    )
+  }
+
+  private releaseReloadStartup(
+    request: AcpPromptRequestState,
+    reason: Parameters<AcpReloadStartupRelease>[0]
+  ): void {
+    const release = request.releaseReloadStartup
+    request.releaseReloadStartup = undefined
+    release?.(reason)
+  }
+
+  private activeSession(sessionId: string): ActiveSession | undefined {
+    return this.options.registry.lookup(sessionId)?.attachment?.session
+  }
+
+  private assertSessionIdle(sessionId: string): void {
+    const current = this.options.interactions.current(sessionId)
+    if (!current) return
+    if (current.kind === 'prompt') {
+      throw new Error('An ACP prompt is already running for this session')
+    }
+  }
+
+  private reserve(request: AcpPromptRequest): AcpPromptSessionInteractionScope {
+    return this.options.interactions.reservePrompt({
+      sessionId: request.sessionId,
+      kind: 'prompt',
+      ...(request.permissionPrompts ? { permissionPrompts: request.permissionPrompts } : {}),
+      promptMessageId: request.provenanceContext?.promptMessageId,
+      provenanceContext: request.provenanceContext,
+      ...(request.memoryEnabled !== undefined ? { memoryEnabled: request.memoryEnabled } : {}),
+      turnToken: request.continuation?.originatingTurnToken,
+      ...(request.referencedSessions?.length
+        ? {
+            referencedSessionIds: request.referencedSessions.map((reference) => reference.sessionId)
+          }
+        : {})
+    })
+  }
+
+  private checkpoint(
+    interaction: AcpPromptSessionInteractionScope
+  ): Promise<'active' | 'cancelled'> {
+    return this.options.interactions.cancellationCheckpoint(interaction)
+  }
+
+  private isCurrent(turn: AcpActivatedPromptTurn): boolean {
+    return (
+      this.options.interactions.current(turn.request.sessionId) === turn.interaction &&
+      this.activeSession(turn.request.sessionId) === turn.session
+    )
+  }
+
+  private safeCallback(message: string, action: () => void): void {
+    try {
+      action()
+    } catch (error) {
+      try {
+        log.error(message, errorLogFields(error))
+      } catch {
+        // Diagnostics must not replace the prompt lifecycle.
+      }
+    }
+  }
+}
+
+export { AcpPromptTurnWorkflow }
+export type {
+  AcpPromptTurnMode,
+  AcpPromptTurnPlanContext,
+  AcpPromptTurnPlanWorkflow,
+  AcpPromptTurnWorkflowOptions
+}

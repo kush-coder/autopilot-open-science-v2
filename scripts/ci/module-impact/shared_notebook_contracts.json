@@ -1,0 +1,24 @@
+{
+  "ownerPaths": [
+    "src/shared/notebook-network-settings.ts",
+    "src/shared/notebook-network-strict.ts",
+    "src/shared/notebook-network-strict.test.ts",
+    "src/shared/network-destination-grants.ts",
+    "src/shared/network-destination-grants.test.ts"
+  ],
+  "interfacePaths": [
+    "src/shared/notebook-network-settings.ts",
+    "src/shared/network-destination-grants.ts"
+  ],
+  "consumerModules": [],
+  "testFiles": {
+    "owner": [
+      "src/shared/network-destination-grants.test.ts",
+      "src/shared/notebook-network-strict.test.ts"
+    ],
+    "contract": [],
+    "consumer": ["src/shared/notebook-env.typecheck.test.ts"]
+  },
+  "capabilityOverlays": [],
+  "fallbackCapability": "shared_contract"
+}

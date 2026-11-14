@@ -1,0 +1,220 @@
+import { createStore, type StoreApi } from 'zustand/vanilla'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+
+import {
+  createInitialSettingsNavigationState,
+  createSettingsNavigationSlice,
+  type SettingsNavigationActions,
+  type SettingsNavigationState
+} from './settings-navigation-slice'
+import { takeSettingsReturnFocusTarget } from './settings-return-focus'
+import { useNavigationStore } from './navigation-store'
+
+type TestStore = SettingsNavigationState & SettingsNavigationActions
+
+const createHarness = (): StoreApi<TestStore> =>
+  createStore<TestStore>((set, get) => ({
+    ...createInitialSettingsNavigationState(),
+    ...createSettingsNavigationSlice({
+      getState: get,
+      setState: (patch) => set(patch)
+    })
+  }))
+
+describe('settings navigation slice', () => {
+  let store: StoreApi<TestStore>
+
+  beforeEach(() => {
+    takeSettingsReturnFocusTarget()
+    store = createHarness()
+    useNavigationStore.setState({ view: 'home', resourceCenterIntent: undefined })
+  })
+
+  it('lands on the exact account or connector without launching authorization', () => {
+    store.getState().openSettingsToProvider('codex-account')
+    expect(store.getState().pendingSettingsIntent?.route).toEqual({
+      panel: 'model',
+      view: { kind: 'list', recoveryProviderId: 'codex-account' }
+    })
+    store.getState().openSettingsToProvider('codex-account', 'pinned-model')
+    expect(store.getState().pendingSettingsIntent?.route).toEqual({
+      panel: 'model',
+      view: { kind: 'list', recoveryProviderId: 'codex-account', recoveryModel: 'pinned-model' }
+    })
+    store.getState().openSettingsToConnector('connector-a')
+    expect(store.getState().isSettingsOpen).toBe(true)
+    expect(useNavigationStore.getState().view).toBe('home')
+    expect(store.getState().pendingSettingsIntent?.route).toEqual({
+      panel: 'connectors',
+      view: { kind: 'list', recoveryConnectorId: 'connector-a' }
+    })
+  })
+
+  afterEach(() => {
+    takeSettingsReturnFocusTarget()
+    vi.unstubAllGlobals()
+  })
+
+  it('captures the opener once and consumes it as transient focus state', () => {
+    class FocusTarget {}
+    const body = new FocusTarget()
+    const opener = new FocusTarget()
+    const settingsControl = new FocusTarget()
+    const documentStub = { activeElement: opener, body }
+    vi.stubGlobal('HTMLElement', FocusTarget)
+    vi.stubGlobal('document', documentStub)
+
+    store.getState().openSettings()
+    documentStub.activeElement = settingsControl
+    store.getState().openSettingsToPanel('storage')
+
+    expect(takeSettingsReturnFocusTarget()).toBe(opener)
+    expect(takeSettingsReturnFocusTarget()).toBeNull()
+  })
+
+  it('resolves a transient menu item to its connected menu trigger', () => {
+    class FocusTarget {
+      constructor(
+        private readonly role: string,
+        readonly id = '',
+        private readonly menu: FocusTarget | null = null,
+        private readonly controls: string | null = null
+      ) {}
+
+      isConnected = true
+
+      matches(selector: string): boolean {
+        return selector.includes('menuitem') && this.role === 'menuitem'
+      }
+
+      closest(selector: string): FocusTarget | null {
+        return selector.includes('[role="menu"]') && this.role === 'menuitem' ? this.menu : null
+      }
+
+      getAttribute(name: string): string | null {
+        return name === 'aria-controls' ? this.controls : null
+      }
+    }
+    const body = new FocusTarget('body')
+    const menu = new FocusTarget('menu', 'settings-menu')
+    const menuItem = new FocusTarget('menuitem', '', menu)
+    const trigger = new FocusTarget('button', '', null, 'settings-menu')
+    const documentStub = {
+      activeElement: menuItem,
+      body,
+      querySelectorAll: () => [trigger]
+    }
+    vi.stubGlobal('HTMLElement', FocusTarget)
+    vi.stubGlobal('document', documentStub)
+
+    store.getState().openSettings()
+
+    expect(takeSettingsReturnFocusTarget()).toBe(trigger)
+  })
+
+  it('opens normally without replacing a pending landing intent', () => {
+    store.getState().openSettingsToPanel('storage')
+    const intent = store.getState().pendingSettingsIntent
+    store.setState({ isSettingsOpen: false })
+
+    store.getState().openSettings()
+
+    expect(store.getState()).toMatchObject({
+      isSettingsOpen: true,
+      pendingSettingsIntent: intent
+    })
+  })
+
+  it.each([
+    ['panel', () => store.getState().openSettingsToPanel('storage'), { panel: 'storage' }],
+    [
+      'OpenAlex',
+      () => store.getState().openSettingsToOpenAlex(),
+      { panel: 'credentials', view: { kind: 'service', serviceId: 'openalex' } }
+    ],
+    [
+      'Compute',
+      () => store.getState().openSettingsToCompute(),
+      { panel: 'compute', view: { kind: 'list' } }
+    ]
+  ] as const)('opens the exact %s route as one intent', (_label, open, route) => {
+    open()
+
+    expect(store.getState().isSettingsOpen).toBe(true)
+    expect(store.getState().pendingSettingsIntent?.route).toEqual(route)
+  })
+
+  it('redirects legacy Skill and Specialist entry points into Resource Center', () => {
+    store.getState().openSettingsToSkill('skill-1')
+    expect(store.getState()).toMatchObject({
+      isSettingsOpen: false,
+      pendingSettingsIntent: undefined
+    })
+    expect(useNavigationStore.getState()).toMatchObject({
+      view: 'marketplace',
+      resourceCenterIntent: { resource: 'skills', skillId: 'skill-1' }
+    })
+
+    store.getState().openSettingsToSpecialist('specialist-1')
+    expect(useNavigationStore.getState().resourceCenterIntent).toEqual({
+      resource: 'specialists',
+      specialistId: 'specialist-1'
+    })
+  })
+
+  it('routes legacy panel opens for Skills and Specialists into Resource Center', () => {
+    store.getState().openSettingsToPanel('connectors')
+    expect(useNavigationStore.getState().resourceCenterIntent).toEqual({ resource: 'connectors' })
+    store.getState().openSettingsToPanel('skills')
+    expect(useNavigationStore.getState().resourceCenterIntent).toEqual({ resource: 'skills' })
+    store.getState().openSettingsToPanel('specialists')
+    expect(useNavigationStore.getState().resourceCenterIntent).toEqual({ resource: 'specialists' })
+  })
+
+  it('clears a stale intent on close so a normal reopen starts fresh', () => {
+    store.getState().openSettingsToPanel('storage')
+
+    store.getState().closeSettings()
+    store.getState().openSettings()
+
+    expect(store.getState()).toMatchObject({
+      isSettingsOpen: true,
+      pendingSettingsIntent: undefined
+    })
+  })
+
+  it('opens the exact Compute Host authentication recovery route', () => {
+    store.getState().openSettingsToComputeAuthentication('ssh:biowulf', 'authentication_failed')
+
+    const intent = store.getState().pendingSettingsIntent!
+    expect(store.getState().isSettingsOpen).toBe(true)
+    expect(intent.route).toEqual({
+      panel: 'compute',
+      view: {
+        kind: 'detail',
+        providerId: 'ssh:biowulf',
+        authenticationFocus: 'authentication_failed',
+        authenticationRequestId: intent.requestId
+      }
+    })
+
+    store.getState().consumePendingSettingsIntent(intent.requestId)
+    expect(store.getState().pendingSettingsIntent).toBeUndefined()
+
+    store.getState().openSettingsToComputeAuthentication('ssh:biowulf', 'authentication_failed')
+    expect(store.getState().pendingSettingsIntent?.requestId).toBeGreaterThan(intent.requestId)
+  })
+
+  it('opens the exact Compute Host detail route', () => {
+    store.getState().openSettingsToComputeHost('ssh:biowulf')
+
+    const intent = store.getState().pendingSettingsIntent!
+    expect(intent.route).toEqual({
+      panel: 'compute',
+      view: { kind: 'detail', providerId: 'ssh:biowulf' }
+    })
+
+    store.getState().consumePendingSettingsIntent(intent.requestId)
+    expect(store.getState().pendingSettingsIntent).toBeUndefined()
+  })
+})

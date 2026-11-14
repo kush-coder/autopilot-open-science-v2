@@ -1,0 +1,427 @@
+import { createLogger, diagnosticErrorFields, errorLogFields } from '@aipoch/diagnostics/node'
+import { randomUUID } from 'node:crypto'
+import { DispatchTracker } from './dispatch-tracker'
+import { DISPATCH_DEFINITELY_NOT_STARTED, dispatchMayHaveStarted } from './compute-job-lifecycle'
+import { probeRemoteLaunch } from './remote-launch-recovery'
+
+import { projectJobStatus } from './compute-job-status'
+import { ComputeConnectionError, type ComputeConnectionBrokerAcquirer } from './connection'
+import {
+  ComputeHostUnavailableError,
+  type ComputeJob,
+  type JobStatusResult,
+  type ComputeJobCancellationStatus,
+  type JobError
+} from './model'
+import type { ComputeJobRepository } from './ports'
+import {
+  ComputeJobOperationRepository,
+  type ClaimedComputeJobOperation,
+  type ComputeJobOperationRecord,
+  type ComputeJobOperationScope
+} from './ports'
+import { parseRemoteJobHandle } from './remote-job-handle'
+import { probeRemoteJobProcessOwnership, terminateRemoteJobProcess } from './remote-job-process'
+import { cancelSlurmJob, recoverSlurmJob } from './slurm-driver'
+
+const log = createLogger('compute-cancellation')
+
+// Allow delayed launch receipts to appear. The durable attempt count survives app restarts.
+const DIRECT_SSH_CANCEL_ATTEMPT_LIMIT = 3
+
+type RetryReason =
+  | 'dispatch-in-flight'
+  | 'handle-unavailable'
+  | 'scheduler-unconfirmed'
+  | 'ownership-unknown'
+  | 'termination-unconfirmed'
+  | 'operation-failed'
+
+type ReaperOptions = Readonly<{
+  dispatchTracker?: Pick<DispatchTracker, 'has'>
+  now?: () => Date
+  leaseMs?: number
+  retryDelayMs?: (attempt: number) => number
+  makeLeaseToken?: () => string
+  intervalMs?: number
+  onConfirmed?: (jobId: string) => void | Promise<void>
+  onFailed?: (
+    jobId: string,
+    failure: { operationId: string; revision: number; error: JobError }
+  ) => void | Promise<void>
+}>
+
+const cancellationStatus = (
+  cancellation: ComputeJobOperationRecord | null
+): ComputeJobCancellationStatus | undefined =>
+  cancellation?.phase === 'active'
+    ? 'cancelling'
+    : cancellation?.outcome === 'fulfilled'
+      ? 'cancelled'
+      : cancellation?.outcome === 'failed'
+        ? 'failed'
+        : undefined
+
+const cancellationError = (operation: ComputeJobOperationRecord | null): JobError | undefined =>
+  operation?.outcome === 'failed' && operation.errorCode && operation.errorMessage
+    ? { code: operation.errorCode, message: operation.errorMessage }
+    : undefined
+
+class ComputeJobCancellationOwner {
+  constructor(
+    private readonly operations: ComputeJobOperationRepository,
+    private readonly jobs: Pick<ComputeJobRepository, 'get'>,
+    private readonly now: () => Date = () => new Date()
+  ) {}
+
+  async request(jobId: string, scope: ComputeJobOperationScope): Promise<JobStatusResult> {
+    const result = await this.operations.request(jobId, 'cancel', scope, this.now())
+    if (!result.found) throw new ComputeHostUnavailableError()
+    const job = await this.requireOwnedJob(jobId, scope)
+    const status = projectJobStatus(
+      job,
+      cancellationStatus(result.record),
+      cancellationError(result.record)
+    )
+    log.info('Compute Job cancellation requested', {
+      jobId,
+      status: status.status,
+      cancellationStatus: status.cancellation?.status
+    })
+    return status
+  }
+
+  async status(jobId: string, scope: ComputeJobOperationScope): Promise<JobStatusResult> {
+    const job = await this.requireOwnedJob(jobId, scope)
+    const operation = await this.operations.get(jobId, 'cancel')
+    return projectJobStatus(job, cancellationStatus(operation), cancellationError(operation))
+  }
+
+  private async requireOwnedJob(
+    jobId: string,
+    scope: ComputeJobOperationScope
+  ): Promise<ComputeJob> {
+    const job = await this.jobs.get(jobId)
+    if (
+      !job ||
+      job.project_id !== scope.projectId ||
+      job.session_id !== scope.sessionId ||
+      job.provider_id !== scope.providerId
+    ) {
+      throw new ComputeHostUnavailableError()
+    }
+    return job
+  }
+}
+
+class ComputeJobCancellationReaper {
+  private readonly dispatchTracker: Pick<DispatchTracker, 'has'>
+  private readonly now: () => Date
+  private readonly leaseMs: number
+  private readonly retryDelayMs: (attempt: number) => number
+  private readonly makeLeaseToken: () => string
+  private readonly intervalMs: number
+  private readonly onConfirmed?: (jobId: string) => void | Promise<void>
+  private readonly onFailed?: ReaperOptions['onFailed']
+  private timer: ReturnType<typeof setInterval> | undefined
+  private inFlight: Promise<void> | undefined
+  private started = false
+  private paused = false
+
+  constructor(
+    private readonly operations: ComputeJobOperationRepository,
+    private readonly jobs: Pick<ComputeJobRepository, 'get' | 'recordCancellationHandle'>,
+    private readonly connectionBroker: ComputeConnectionBrokerAcquirer,
+    options: ReaperOptions = {}
+  ) {
+    this.dispatchTracker = options.dispatchTracker ?? new DispatchTracker()
+    this.now = options.now ?? (() => new Date())
+    this.leaseMs = options.leaseMs ?? 30_000
+    this.retryDelayMs =
+      options.retryDelayMs ?? ((attempt) => Math.min(60_000, 1_000 * 2 ** Math.min(attempt, 6)))
+    this.makeLeaseToken = options.makeLeaseToken ?? randomUUID
+    this.intervalMs = options.intervalMs ?? 1_000
+    this.onConfirmed = options.onConfirmed
+    this.onFailed = options.onFailed
+  }
+
+  start(): void {
+    if (this.started) return
+    this.started = true
+    this.schedule()
+    this.tickInBackground()
+  }
+
+  async stop(): Promise<void> {
+    this.started = false
+    if (this.timer) clearInterval(this.timer)
+    this.timer = undefined
+    await this.inFlight
+  }
+
+  async pause(): Promise<void> {
+    this.paused = true
+    await this.inFlight
+  }
+
+  resume(): void {
+    this.paused = false
+    if (this.started) this.tickInBackground()
+  }
+
+  private schedule(): void {
+    this.timer = setInterval(() => this.tickInBackground(), this.intervalMs)
+    this.timer.unref?.()
+  }
+
+  private tickInBackground(): void {
+    void this.tick().catch((error) => {
+      log.warn('background cancellation recovery failed', errorLogFields(error))
+    })
+  }
+
+  private tick(): Promise<void> {
+    if (!this.started || this.paused) return Promise.resolve()
+    if (this.inFlight) return this.inFlight
+    const work = this.runOnce().then(() => undefined)
+    const tracked = work.finally(() => {
+      if (this.inFlight === tracked) this.inFlight = undefined
+    })
+    this.inFlight = tracked
+    return this.inFlight
+  }
+
+  async runOnce(): Promise<boolean> {
+    const claim = await this.operations.claimNext(
+      'cancel',
+      this.now(),
+      this.leaseMs,
+      this.makeLeaseToken(),
+      { deferDirectSshAttempt: true }
+    )
+    if (!claim) return false
+    await this.reap(claim)
+    return true
+  }
+
+  private async reap(claim: ClaimedComputeJobOperation): Promise<void> {
+    // The sidecar claim owns only the lease. Execution data is read through the ComputeJob
+    // repository so encrypted handles/workdirs are revealed by the single persistence owner.
+    const job = await this.jobs.get(claim.jobId)
+    if (!job) return
+    let handle = parseRemoteJobHandle(job.remote_handle, job.remote_workdir)
+
+    const directSsh = (job.execution_mode ?? 'direct_ssh') === 'direct_ssh'
+    let exhaustedDirectSsh = false
+    try {
+      if (!handle && this.dispatchTracker.has(job.job_id)) {
+        await this.scheduleRetry(claim, 'dispatch-in-flight')
+        return
+      }
+      if (!handle && job.last_poll_error === DISPATCH_DEFINITELY_NOT_STARTED) {
+        // The dispatcher proved launch never occurred. Directory absence is a separate fact;
+        // leave remote cleanup to its owner and settle only through the current claim CAS.
+        await this.confirm(claim)
+        return
+      }
+      if (directSsh) {
+        const attempt = await this.operations.beginAttempt(claim, this.now())
+        if (!attempt) return
+        claim = attempt
+        exhaustedDirectSsh = claim.operation.attemptCount >= DIRECT_SSH_CANCEL_ATTEMPT_LIMIT
+      }
+      const connection = await this.connectionBroker.acquire(job.provider_id, {
+        intent: 'job_cleanup'
+      })
+      if (!handle && job.execution_mode === 'slurm') {
+        handle = (await recoverSlurmJob(job, connection)) ?? null
+        if (handle) await this.jobs.recordCancellationHandle(job.job_id, JSON.stringify(handle))
+      }
+      if (!handle && job.execution_mode !== 'slurm' && job.remote_workdir) {
+        const observation = await probeRemoteLaunch(connection, job.remote_workdir)
+        if (observation.kind === 'running') {
+          handle = observation.handle
+          await this.jobs.recordCancellationHandle(job.job_id, JSON.stringify(handle))
+        } else if (
+          (observation.kind === 'not_started' && !dispatchMayHaveStarted(job)) ||
+          observation.kind === 'exited' ||
+          observation.kind === 'vanished'
+        ) {
+          await this.confirm(claim, observation.kind === 'not_started')
+          return
+        }
+      }
+      if (!handle) {
+        await this.retryUnidentifiedProcess(claim, 'handle-unavailable', exhaustedDirectSsh)
+        return
+      }
+      if (handle.driver === 'slurm') {
+        const result = await cancelSlurmJob(handle, connection)
+        switch (result.kind) {
+          case 'cancelled':
+            if (result.diagnostic)
+              log.info('Slurm cancellation evidence', {
+                jobId: claim.jobId,
+                diagnostic: result.diagnostic
+              })
+            await this.confirm(claim)
+            return
+          case 'completed': {
+            const status =
+              result.state === 'TIMEOUT' || result.exitCode === 124
+                ? 'timeout'
+                : result.state === 'COMPLETED' && result.exitCode === 0
+                  ? 'success'
+                  : 'failed'
+            const stderr = result.stderrTail ?? ''
+            const failureStderr =
+              `${stderr}${stderr.length > 0 && !stderr.endsWith('\n') ? '\n' : ''}Slurm scheduler state: ${result.state}.`.slice(
+                -65536
+              )
+            const settled = await this.operations.settle(claim, this.now(), {
+              outcome: 'superseded',
+              job: {
+                status,
+                exitCode: result.exitCode ?? null,
+                errorCode:
+                  status === 'success' ? null : status === 'timeout' ? 'timeout' : 'job_failed',
+                errorMessage: null,
+                stdoutTail: result.stdoutTail,
+                stderrTail: status === 'success' ? result.stderrTail : failureStderr,
+                lastPollError: result.diagnostic ?? null,
+                finishedAt: this.now()
+              }
+            })
+            if (settled) await this.onConfirmed?.(claim.jobId)
+            return
+          }
+          case 'rejected':
+            await this.failCancellation(claim, {
+              code: 'cancel_request_rejected',
+              message: result.message
+            })
+            return
+          case 'unavailable': {
+            const settled = await this.operations.settle(claim, this.now(), {
+              outcome: 'failed',
+              error: result.cancellationError ?? {
+                code: 'cancel_confirmation_failed',
+                message: result.message
+              },
+              job: {
+                status: 'error',
+                errorCode: 'job_status_unavailable',
+                errorMessage: result.message,
+                lastPollError: null,
+                finishedAt: this.now()
+              }
+            })
+            if (settled) await this.onConfirmed?.(claim.jobId)
+            return
+          }
+          case 'unconfirmed':
+            await this.scheduleRetry(claim, 'scheduler-unconfirmed', result.message)
+            return
+        }
+      }
+      const ownership = await probeRemoteJobProcessOwnership(handle.pid, handle.workdir, connection)
+      if (ownership === 'mismatch' || ownership === 'absent') {
+        await this.confirm(claim)
+        return
+      }
+      if (ownership !== 'owned') {
+        await this.retryUnidentifiedProcess(claim, 'ownership-unknown', exhaustedDirectSsh)
+        return
+      }
+      const termination = await terminateRemoteJobProcess(handle.pid, handle.workdir, connection)
+      if (termination === 'terminated') {
+        await this.confirm(claim)
+        return
+      }
+      if (termination === 'ownership-unknown') {
+        await this.retryUnidentifiedProcess(claim, 'ownership-unknown', exhaustedDirectSsh)
+        return
+      }
+      await this.scheduleRetry(claim, 'termination-unconfirmed')
+    } catch (error) {
+      if (
+        exhaustedDirectSsh &&
+        error instanceof ComputeConnectionError &&
+        (error.code === 'host_unreachable' || error.code === 'timeout')
+      ) {
+        await this.failCancellation(claim, {
+          code: 'cancel_confirmation_failed',
+          message: 'Unable to reach the remote host to confirm cancellation.'
+        })
+        return
+      }
+      await this.scheduleRetry(claim, 'operation-failed', error)
+    }
+  }
+
+  private async retryUnidentifiedProcess(
+    claim: ClaimedComputeJobOperation,
+    reason: 'handle-unavailable' | 'ownership-unknown',
+    exhausted: boolean
+  ): Promise<void> {
+    if (!exhausted) return this.scheduleRetry(claim, reason)
+    await this.failCancellation(claim, {
+      code: 'cancel_confirmation_failed',
+      message: 'Unable to identify the remote process to confirm cancellation.'
+    })
+  }
+
+  private async failCancellation(
+    claim: ClaimedComputeJobOperation,
+    error: JobError
+  ): Promise<void> {
+    const settled = await this.operations.settle(claim, this.now(), { outcome: 'failed', error })
+    if (settled)
+      await this.onFailed?.(claim.jobId, {
+        operationId: settled.id,
+        revision: settled.revision,
+        error
+      })
+  }
+
+  private async scheduleRetry(
+    claim: ClaimedComputeJobOperation,
+    reason: RetryReason,
+    error?: unknown
+  ): Promise<void> {
+    const now = this.now()
+    const retryAt = new Date(
+      now.getTime() + this.retryDelayMs(Math.max(1, claim.operation.attemptCount))
+    )
+    if (await this.operations.retry(claim, now, retryAt)) {
+      // Keep repeated outages diagnosable without logging credentials, commands, or remote paths.
+      // Log the first attempt and powers of two so an offline host cannot flood the log forever.
+      const attempt = claim.operation.attemptCount
+      if (attempt === 1 || Number.isInteger(Math.log2(attempt))) {
+        log.warn('Compute Job cancellation unconfirmed; retry scheduled', {
+          jobId: claim.jobId,
+          attempt,
+          reason,
+          retryAt: retryAt.toISOString(),
+          ...(error === undefined ? {} : diagnosticErrorFields(error))
+        })
+      }
+    }
+  }
+
+  private async confirm(
+    claim: ClaimedComputeJobOperation,
+    remoteWorkdirAbsent = false
+  ): Promise<void> {
+    if (await this.operations.fulfill(claim, this.now(), remoteWorkdirAbsent)) {
+      log.info('Compute Job cancellation confirmed', {
+        jobId: claim.jobId,
+        attempt: claim.operation.attemptCount
+      })
+      await this.onConfirmed?.(claim.jobId)
+    }
+  }
+}
+
+export { ComputeJobCancellationOwner, ComputeJobCancellationReaper }
+export type { ReaperOptions }

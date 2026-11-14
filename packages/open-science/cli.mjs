@@ -1,0 +1,2509 @@
+#!/usr/bin/env node
+
+/* eslint-disable @typescript-eslint/explicit-function-return-type */
+
+import { randomUUID } from 'node:crypto'
+import { closeSync, createWriteStream, existsSync, openSync, realpathSync } from 'node:fs'
+import { chmod, lstat, mkdir, open, readFile, readlink, rename, rm, stat } from 'node:fs/promises'
+import { basename, dirname, join, resolve } from 'node:path'
+import { Readable } from 'node:stream'
+import { pipeline } from 'node:stream/promises'
+import { text as readStreamText } from 'node:stream/consumers'
+import { spawn } from 'node:child_process'
+import { fileURLToPath } from 'node:url'
+
+import {
+  candidateConfigRoots,
+  findServiceState,
+  readWebToken,
+  resolveConfigRoot
+} from './config-root.mjs'
+import { codexLoginCommand } from './codex-login.mjs'
+import { connectToOpenScience, OpenScienceApiError } from './index.mjs'
+import { locateBackend } from './locate-backend.mjs'
+import { startLaunchLogReader } from './launch-log.mjs'
+import { protectInstallationStartup } from './installation-startup.cjs'
+import {
+  requestExistingRuntimeWeb,
+  requestServiceLifetime,
+  verifyServiceConfigRoot,
+  waitForServiceStopped
+} from './runtime-control.mjs'
+
+const DEFAULT_PORT = 44100
+const START_TIMEOUT_MS = 120_000
+// Cover the service's 40s authentication-aware stop budget plus exit-record observation.
+const STOP_TIMEOUT_MS = 42_000
+const MAX_DOWNLOAD_SYMLINK_HOPS = 40
+
+const usage = `Usage: open-science <command> [options]
+
+Commands:
+  version     Print the local application version (also --version or -v)
+  help [command]  Show general or command help
+  paths       Show local CLI, Node and configuration discovery paths
+  init        Create the local CLI configuration directory
+  start       Start or connect to the local service and keep it running after the App exits
+  stop        Revoke persistent running; stop if no App is connected (tasks may be interrupted)
+  stop --force  Stop the local service even with an App connected; running tasks may be interrupted
+  status      Show local service status, App sessions, and persistent running
+  url         Print the authenticated web URL
+  mcp         Serve research tools over MCP stdio (--config-root <path> or --profile <path>)
+  doctor --json  Inspect headless readiness
+  runtime list          List detected Agent runtimes
+  runtime install codex   Prepare the app-managed Codex runtime
+  provider add --type official --vendor openai --model <id> --api-key-env <ENV>
+  connector configure literature --openalex-key-env <ENV>
+  cli install            Install the PATH launcher
+  codex login [--force]
+  connector list | show <id> | enable <id> | disable <id>
+  connector add | update <id>      Read configuration JSON from stdin
+  connector remove <id> | test <id>
+  credential list | add | update <id>  Read credential JSON from stdin for writes
+  project list
+  project create <name> [--description <text>] [--agent-context <text> | --agent-context-file <path>]
+  project update <id-or-name> [--name <name>] [--description <text>] [--agent-context <text> | --agent-context-file <path> | --clear-agent-context]
+  project session-defaults show <id-or-name>  Automation new-session defaults
+  project session-defaults update <id-or-name> [session options]
+  run --project <id-or-name> (--prompt <text> | --prompt-file <path>) [--compute-host <provider-id>] [--wait]
+  run status <run-id> | --request-id <request-id>
+  run wait <run-id> | --request-id <request-id> [--timeout-ms <ms>]
+  run cancel <run-id>
+  session status <session-id>
+  session config show <session-id>
+  session config update <session-id> --revision <number> [session options]
+  session fork <session-id> --project <id-or-name>
+  session export <session-id> --project <id-or-name> --output <path>
+  session import <path> [--project <id-or-name> | --new-project <name>] --non-interactive
+  settings agent-routing show
+  settings agent-routing update [routing options]
+  plan show <session-id>
+  plan approve <session-id> --artifact-version <id> --revision <number>
+  plan reject <session-id> --artifact-version <id> --revision <number>
+  plan revise <session-id> --feedback <text>
+  artifacts list <session-id>
+  artifacts download <artifact-id> --output <path>
+  literature search [query] [--project <id-or-name>] [--limit <n>] [--offset <n>]
+  literature show <item-id>
+  literature styles
+  literature format <item-id>... --style <style-id> [--locale en-US|zh-CN]
+  literature lookup <doi | pmid:<n> | pmcid:PMC<n> | arxiv:<id>>
+  literature import <path | -> [--commit [--duplicates <policy>] [--collection <id>] [--project <id-or-name>]]
+  literature add <doi | pmid:<n> | pmcid:PMC<n> | arxiv:<id>>
+  literature link | unlink <item-id>... --project <id-or-name>
+  literature collection create <name> [--description <text>] [--parent <collection-id>]
+  literature collection add | remove <collection-id> <item-id>...
+  literature status <unread|reading|read> <item-id>...
+  literature trash | restore <item-id>...
+
+Options:
+  --port <port>          Web service port (default: 44100)
+  --password-store <name>  Linux OS vault (gnome-libsecret, kwallet5, kwallet6)
+  --config-root <path>   Config directory override
+  --profile <path>       Alias for --config-root (portable CLI profile)
+  --project <id-or-name> Project id or exact name
+  --session <id>         Resume an existing session
+  --cwd <path>           Working directory for a new or matching existing session
+  --prompt <text>        Prompt text (or read stdin when omitted)
+  --prompt-file <path>   Read the prompt from a UTF-8 file
+  --agent-context <text> Persistent Project Agent Context
+  --agent-context-file <path>  Read Project Agent Context from a UTF-8 file
+  --clear-agent-context  Clear a Project's persistent Agent Context
+  --approval-profile <profile>  ask, auto, or full (default: ask)
+  --provider <provider-id>  Configured Main provider
+  --model <model-id>       Main model
+  --provider-default-model Follow the provider-owned default model
+  --reasoning-effort <effort>  default, low, medium, high, xhigh, or max
+  --skill <id>           Force-load a skill for this run (repeatable)
+  --compute-host <provider-id>  Select a Compute Host execution target (repeatable)
+  --enable-compute-host <provider-id>  Enable a Compute Host without selecting it (repeatable)
+  --clear-compute-hosts    Clear enabled and selected Compute Hosts
+  --plan-first           Require an approved Plan before execution
+  --auto-review          Enable automatic review for this Session
+  --no-auto-review       Disable automatic review for this Session
+  --memory               Enable Memory for this Session
+  --no-memory            Disable Memory for this Session
+  --specialist <id-or-name>  Bind a new Session to a Specialist
+  --delegation <policy>  allow or deny new delegated children
+  --framework <id>       open-science-agent, claude-code, opencode, codex, codebuddy, or pi
+  --reviewer-inherit | --reviewer-provider <id> --reviewer-model <id> [--reviewer-effort <effort>]
+  --subagent-inherit | --subagent-provider <id> --subagent-model <id> [--subagent-effort <effort>]
+  --clear-provider | --clear-approval-profile | --clear-auto-review | --clear-memory
+  --clear-delegation | --clear-specialist  Clear one automation new-session default
+  --permission-prompts none  Deny unresolved human interactions instead of waiting (run only)
+  --request-id <id>      Stable submission identity for lookup and safe retries
+  --wait                 Wait for the run to finish
+  --return-on-attention  With --wait, return when the Plan needs approval
+  --timeout-ms <ms>      Bound startup, run waiting, or package transfer time
+  --output <path>        Destination path (session export, artifacts download)
+  --style <style-id>     Citation style (literature format)
+  --locale <locale>      Citation locale: en-US (default) or zh-CN (literature format)
+  --limit <n>            Page size, 1-100 (literature search)
+  --offset <n>           Page offset (literature search)
+  --commit               Save a literature import; without it import only previews
+  --duplicates <policy>  reuse (default), separate, or fill-missing (literature import --commit)
+  --collection <id>      Add imported records to a collection (literature import --commit)
+  --parent <id>          Parent collection (literature collection create)
+  --new-project <name>   Import into a new Project with this name (session import)
+  --non-interactive      Import without an interactive preview confirmation (session import)
+  --cancel-on-timeout    Cancel the server run when --timeout-ms expires
+  --jsonl                With run --wait, stream one machine-readable event per line
+  --credential-store <os|file>  Settings credential storage (Linux headless; start only)
+  --no-open              Do not open the browser after start
+  --no-sandbox           Disable Chromium's process sandbox (security risk; start only)
+  --force                Stop the local service even with an App connected; also supports codex login
+  --json                 Emit one machine-readable result
+  -v, --version          Print the local application version and exit
+  -h, --help             Show this help`
+
+// Flags that take a value, mapped to their camelCase option key (explicit so new hyphenated flags
+// can't collide the way a generic slice/replace would).
+const VALUE_OPTIONS = {
+  '--credential-store': 'credentialStore',
+  '--port': 'port',
+  '--app-path': 'appPath',
+  '--password-store': 'passwordStore',
+  '--config-root': 'configRoot',
+  '--profile': 'configRoot',
+  '--type': 'providerType',
+  '--vendor': 'vendor',
+  '--api-key-env': 'apiKeyEnv',
+  '--openalex-key-env': 'openAlexKeyEnv',
+  '--project': 'project',
+  '--session': 'session',
+  '--cwd': 'cwd',
+  '--prompt': 'prompt',
+  '--prompt-file': 'promptFile',
+  '--approval-profile': 'approvalProfile',
+  '--permission-prompts': 'permissionPrompts',
+  '--provider': 'provider',
+  '--model': 'model',
+  '--reasoning-effort': 'reasoningEffort',
+  '--framework': 'framework',
+  '--reviewer-provider': 'reviewerProvider',
+  '--reviewer-model': 'reviewerModel',
+  '--reviewer-effort': 'reviewerEffort',
+  '--subagent-provider': 'subagentProvider',
+  '--subagent-model': 'subagentModel',
+  '--subagent-effort': 'subagentEffort',
+  '--specialist': 'specialist',
+  '--delegation': 'delegation',
+  '--artifact-version': 'artifactVersion',
+  '--revision': 'revision',
+  '--feedback': 'feedback',
+  '--timeout-ms': 'timeoutMs',
+  '--request-id': 'requestId',
+  '--name': 'name',
+  '--description': 'description',
+  '--agent-context': 'agentContext',
+  '--agent-context-file': 'agentContextFile',
+  '--output': 'output',
+  '--new-project': 'newProject',
+  '--style': 'style',
+  '--locale': 'locale',
+  '--limit': 'limit',
+  '--offset': 'offset',
+  '--duplicates': 'duplicates',
+  '--collection': 'collection',
+  '--parent': 'parent'
+}
+
+const TASK_COMMANDS = new Set([
+  'doctor',
+  'runtime',
+  'project',
+  'run',
+  'session',
+  'settings',
+  'plan',
+  'artifacts',
+  'literature',
+  'connector',
+  'credential',
+  'runtime',
+  'provider',
+  'cli'
+])
+const GROUP_COMMANDS = new Set([
+  'codex',
+  'runtime',
+  'project',
+  'session',
+  'settings',
+  'plan',
+  'artifacts',
+  'literature',
+  'connector',
+  'credential',
+  'runtime',
+  'provider',
+  'cli'
+])
+// Project create, update, and session-defaults intentionally remain unbounded because their
+// positional Project names may contain multiple unquoted words.
+const POSITIONAL_LIMITS = new Map([
+  ['version', 0],
+  ['help', 1],
+  ['paths', 0],
+  ['mcp', 0],
+  ['doctor', 0],
+  ['runtime list', 0],
+  ['runtime install', 1],
+  ['provider add', 0],
+  ['connector configure', 1],
+  ['cli install', 0],
+  ['connector list', 0],
+  ['connector show', 1],
+  ['connector enable', 1],
+  ['connector disable', 1],
+  ['connector add', 0],
+  ['connector update', 1],
+  ['connector remove', 1],
+  ['connector test', 1],
+  ['credential list', 0],
+  ['credential add', 0],
+  ['credential update', 1],
+
+  ['start', 0],
+  ['init', 0],
+  ['stop', 0],
+  ['status', 0],
+  ['url', 0],
+  ['codex login', 0],
+  ['project list', 0],
+  ['run', 0],
+  ['run status', 1],
+  ['run wait', 1],
+  ['run cancel', 1],
+  ['session status', 1],
+  ['session config', 2],
+  ['session export', 1],
+  ['session fork', 1],
+  ['session import', 1],
+  ['settings agent-routing', 1],
+  ['plan show', 1],
+  ['plan approve', 1],
+  ['plan reject', 1],
+  ['plan revise', 1],
+  ['artifacts list', 1],
+  ['artifacts download', 1],
+  ['literature show', 1],
+  ['literature styles', 0],
+  ['literature lookup', 1],
+  ['literature import', 1],
+  ['literature add', 1]
+])
+
+export class CliUsageError extends Error {
+  constructor(message) {
+    super(message)
+    this.name = 'CliUsageError'
+    this.code = 'invalid_cli_usage'
+    this.exitCode = 2
+  }
+}
+
+const parsePortOption = (value) => {
+  const normalized = value.trim()
+  const port = Number(normalized)
+  if (!/^\d+$/.test(normalized) || !Number.isInteger(port) || port < 0 || port > 65535) {
+    throw new CliUsageError(`Invalid port: ${value}`)
+  }
+  return port
+}
+
+const assertPositionalLimit = (command, subcommand, positionals) => {
+  const commandPath = [command, subcommand].filter(Boolean).join(' ')
+  const limit = POSITIONAL_LIMITS.get(commandPath)
+  if (limit === undefined || positionals.length <= limit) return
+  if (limit === 0) throw new CliUsageError(`${commandPath} accepts no arguments.`)
+  throw new CliUsageError(
+    `${commandPath} accepts ${limit === 1 ? 'one argument' : 'two arguments'}.`
+  )
+}
+
+export const parseCliArgs = (argv) => {
+  const args = [...argv]
+  const requestedCommand = args.shift()
+  const command =
+    requestedCommand === '--version' || requestedCommand === '-v' ? 'version' : requestedCommand
+  const localOptions =
+    command === 'version'
+      ? ['--json', '--help', '-h']
+      : command === 'paths'
+        ? ['--json', '--help', '-h', '--config-root', '--profile']
+        : command === 'mcp'
+          ? ['--help', '-h', '--config-root', '--profile']
+          : command === 'help'
+            ? ['--help', '-h']
+            : undefined
+  const subcommand =
+    (GROUP_COMMANDS.has(command) && args[0] && !args[0].startsWith('-')) ||
+    (command === 'run' && ['status', 'cancel', 'wait'].includes(args[0]))
+      ? args.shift()
+      : undefined
+  const options = {
+    open: true,
+    json: false,
+    ...(TASK_COMMANDS.has(command) ? { jsonl: false } : {}),
+    ...(command === 'run' ? { wait: subcommand === 'wait' } : {})
+  }
+  const positionals = []
+  while (args.length > 0) {
+    const arg = args.shift()
+    if (localOptions && arg.startsWith('-') && !localOptions.includes(arg)) {
+      throw new CliUsageError(`Unknown option for ${command}: ${arg}`)
+    }
+    if (arg.startsWith('--credential-store=')) {
+      if (options.credentialStore !== undefined)
+        throw new CliUsageError('Specify --credential-store only once.')
+      options.credentialStore = arg.slice('--credential-store='.length)
+    } else if (arg === '--no-open') options.open = false
+    else if (arg.startsWith('--password-store='))
+      options.passwordStore = arg.slice('--password-store='.length)
+    else if (arg === '--no-sandbox') options.noSandbox = true
+    else if (arg === '--json') options.json = true
+    else if (arg === '--force') options.force = true
+    else if (arg === '--jsonl') options.jsonl = true
+    else if (arg === '--wait') options.wait = true
+    else if (arg === '--return-on-attention') options.returnOnAttention = true
+    else if (arg === '--plan-first') options.planFirst = true
+    else if (arg === '--non-interactive') options.nonInteractive = true
+    else if (arg === '--commit') options.commit = true
+    else if (arg === '--provider-default-model') options.providerDefaultModel = true
+    else if (arg === '--clear-compute-hosts') options.clearComputeHosts = true
+    else if (arg === '--memory') {
+      if (options.memoryEnabled === false) {
+        throw new CliUsageError('Use only one of --memory or --no-memory.')
+      }
+      options.memoryEnabled = true
+    } else if (arg === '--no-memory') {
+      if (options.memoryEnabled === true) {
+        throw new CliUsageError('Use only one of --memory or --no-memory.')
+      }
+      options.memoryEnabled = false
+    } else if (arg === '--reviewer-inherit') options.reviewerInherit = true
+    else if (arg === '--subagent-inherit') options.subagentInherit = true
+    else if (arg === '--clear-provider') options.clearProvider = true
+    else if (arg === '--clear-approval-profile') options.clearApprovalProfile = true
+    else if (arg === '--clear-auto-review') options.clearAutoReview = true
+    else if (arg === '--clear-memory') options.clearMemory = true
+    else if (arg === '--clear-delegation') options.clearDelegation = true
+    else if (arg === '--clear-specialist') options.clearSpecialist = true
+    else if (arg === '--auto-review') {
+      if (options.autoReviewEnabled === false) {
+        throw new CliUsageError('Use only one of --auto-review or --no-auto-review.')
+      }
+      options.autoReviewEnabled = true
+    } else if (arg === '--no-auto-review') {
+      if (options.autoReviewEnabled === true) {
+        throw new CliUsageError('Use only one of --auto-review or --no-auto-review.')
+      }
+      options.autoReviewEnabled = false
+    } else if (arg === '--cancel-on-timeout') options.cancelOnTimeout = true
+    else if (arg === '--clear-agent-context') options.clearAgentContext = true
+    else if (arg === '--skill') {
+      const value = args.shift()
+      if (!value) throw new CliUsageError('--skill requires a value.')
+      options.skills = [...(options.skills ?? []), value]
+    } else if (arg === '--compute-host') {
+      const value = args.shift()
+      if (!value) throw new CliUsageError('--compute-host requires a value.')
+      options.computeHosts = [...(options.computeHosts ?? []), value]
+    } else if (arg === '--enable-compute-host') {
+      const value = args.shift()
+      if (!value) throw new CliUsageError('--enable-compute-host requires a value.')
+      options.enabledComputeHosts = [...(options.enabledComputeHosts ?? []), value]
+    } else if (arg === '-h' || arg === '--help') options.help = true
+    else if (Object.hasOwn(VALUE_OPTIONS, arg)) {
+      const value = args.shift()
+      if (!value) throw new CliUsageError(`${arg} requires a value.`)
+      if (arg === '--credential-store' && options.credentialStore !== undefined)
+        throw new CliUsageError('Specify --credential-store only once.')
+      options[VALUE_OPTIONS[arg]] = value
+    } else if (arg.startsWith('-') && arg !== '-') {
+      throw new CliUsageError(`Unknown option: ${arg}`)
+    } else {
+      positionals.push(arg)
+    }
+  }
+  const parsed = {
+    command,
+    ...(subcommand ? { subcommand } : {}),
+    ...(positionals.length ? { positionals } : {}),
+    options
+  }
+  if (localOptions) {
+    assertPositionalLimit(command, subcommand, positionals)
+    return parsed
+  }
+  // Help is local: it must not require execution-only options or a running backend.
+  if (options.help) return parsed
+  if (options.port !== undefined) {
+    options.port = parsePortOption(options.port)
+  }
+  if (options.permissionPrompts !== undefined && options.permissionPrompts !== 'none') {
+    throw new CliUsageError('--permission-prompts must be none.')
+  }
+  if (options.permissionPrompts === 'none' && options.planFirst) {
+    throw new CliUsageError('--plan-first cannot be combined with --permission-prompts none.')
+  }
+  if (options.approvalProfile && !['ask', 'auto', 'full'].includes(options.approvalProfile)) {
+    throw new CliUsageError(`Invalid approval profile: ${options.approvalProfile}`)
+  }
+  if (options.timeoutMs !== undefined) {
+    const timeoutMs = Number(options.timeoutMs)
+    if (!Number.isInteger(timeoutMs) || timeoutMs <= 0) {
+      throw new CliUsageError(`Invalid timeout: ${options.timeoutMs}`)
+    }
+    options.timeoutMs = timeoutMs
+  }
+  if (options.revision !== undefined) {
+    const revision = Number(options.revision)
+    if (!Number.isInteger(revision) || revision < 0) {
+      throw new CliUsageError(`Invalid revision: ${options.revision}`)
+    }
+    options.revision = revision
+  }
+  if (options.delegation && !['allow', 'deny'].includes(options.delegation)) {
+    throw new CliUsageError(`Invalid delegation policy: ${options.delegation}`)
+  }
+  for (const [label, value] of [
+    ['--reasoning-effort', options.reasoningEffort],
+    ['--reviewer-effort', options.reviewerEffort],
+    ['--subagent-effort', options.subagentEffort]
+  ]) {
+    if (
+      value !== undefined &&
+      !['default', 'low', 'medium', 'high', 'xhigh', 'max'].includes(value)
+    ) {
+      throw new CliUsageError(`Invalid ${label}: ${value}`)
+    }
+  }
+  if (
+    options.framework !== undefined &&
+    !['open-science-agent', 'claude-code', 'opencode', 'codex', 'codebuddy', 'pi'].includes(
+      options.framework
+    )
+  ) {
+    throw new CliUsageError(`Invalid framework: ${options.framework}`)
+  }
+  if (options.model !== undefined && options.providerDefaultModel) {
+    throw new CliUsageError('Use only one of --model or --provider-default-model.')
+  }
+  if (
+    options.provider !== undefined &&
+    options.model === undefined &&
+    !options.providerDefaultModel
+  ) {
+    throw new CliUsageError('--provider requires --model or --provider-default-model.')
+  }
+  if (
+    options.clearComputeHosts &&
+    (options.computeHosts !== undefined || options.enabledComputeHosts !== undefined)
+  ) {
+    throw new CliUsageError(
+      'Use only one of Compute Host selection options or --clear-compute-hosts.'
+    )
+  }
+  if (options.requestId !== undefined) {
+    if (command !== 'run' || (subcommand && !['status', 'wait'].includes(subcommand)))
+      throw new CliUsageError('--request-id requires run, run status, or run wait.')
+    if (!/^[A-Za-z0-9_-]{1,128}$/.test(options.requestId))
+      throw new CliUsageError(
+        'Request ID must contain 1–128 letters, digits, underscores or hyphens.'
+      )
+    if (subcommand && positionals.length)
+      throw new CliUsageError('Use a Run ID or --request-id, not both.')
+  }
+  if (options.json && options.jsonl) {
+    throw new CliUsageError('Use only one of --json or --jsonl.')
+  }
+  if (command === 'doctor' && !options.json) {
+    throw new CliUsageError('doctor requires --json.')
+  }
+  if (command === 'runtime' && subcommand !== 'list' && subcommand !== 'install') {
+    throw new CliUsageError(`Unknown command: runtime ${subcommand ?? ''}`.trimEnd())
+  }
+  if (options.json && command === 'url') {
+    throw new CliUsageError(`--json is not supported for ${command}.`)
+  }
+  if (options.cwd !== undefined && !options.cwd.trim()) {
+    throw new CliUsageError('--cwd requires a non-empty path.')
+  }
+  if (options.cwd && (command !== 'run' || subcommand)) {
+    throw new CliUsageError('--cwd requires run.')
+  }
+  if (
+    options.jsonl &&
+    (command !== 'run' || (subcommand && subcommand !== 'wait') || !options.wait)
+  ) {
+    throw new CliUsageError('--jsonl requires run --wait.')
+  }
+  const isPackageTransfer =
+    command === 'session' && ['export', 'import', 'fork'].includes(subcommand)
+  if (
+    options.timeoutMs !== undefined &&
+    !isPackageTransfer &&
+    command !== 'start' &&
+    (command !== 'run' || (subcommand && subcommand !== 'wait') || !options.wait)
+  ) {
+    throw new CliUsageError(
+      '--timeout-ms requires start, run --wait, run wait or session export/import/fork.'
+    )
+  }
+  if (command === 'session' && subcommand === 'import') {
+    if (!options.nonInteractive) throw new CliUsageError('--non-interactive is required.')
+    if (options.project && options.newProject)
+      throw new CliUsageError('Use only one of --project and --new-project.')
+  }
+  if (
+    options.returnOnAttention &&
+    (command !== 'run' || (subcommand && subcommand !== 'wait') || !options.wait)
+  ) {
+    throw new CliUsageError('--return-on-attention requires run --wait.')
+  }
+  if (
+    options.cancelOnTimeout &&
+    (command !== 'run' || (subcommand && subcommand !== 'wait') || !options.wait)
+  ) {
+    throw new CliUsageError('--cancel-on-timeout requires run --wait.')
+  }
+  if (options.cancelOnTimeout && options.timeoutMs === undefined) {
+    throw new CliUsageError('--cancel-on-timeout requires --timeout-ms.')
+  }
+  if (
+    options.credentialStore !== undefined &&
+    (command !== 'start' || !['os', 'file'].includes(options.credentialStore))
+  ) {
+    throw new CliUsageError('--credential-store requires start and a value of os or file.')
+  }
+  if (
+    options.passwordStore !== undefined &&
+    (command !== 'start' ||
+      !['gnome-libsecret', 'kwallet', 'kwallet5', 'kwallet6'].includes(options.passwordStore))
+  )
+    throw new CliUsageError('--password-store requires start and a supported Linux OS vault.')
+  if (options.credentialStore === 'file' && process.platform !== 'linux') {
+    throw new CliUsageError('--credential-store=file is supported only on Linux.')
+  }
+  if (options.noSandbox && command !== 'start') {
+    throw new CliUsageError('--no-sandbox requires start.')
+  }
+  if (options.force && command !== 'stop' && (command !== 'codex' || subcommand !== 'login')) {
+    throw new CliUsageError('--force requires stop or codex login.')
+  }
+  const isProjectCreate = command === 'project' && subcommand === 'create'
+  const isProjectUpdate = command === 'project' && subcommand === 'update'
+  const agentContextSources = [
+    options.agentContext !== undefined,
+    options.agentContextFile !== undefined,
+    options.clearAgentContext === true
+  ].filter(Boolean)
+  if (agentContextSources.length > 1) {
+    throw new CliUsageError('Use only one Agent Context source.')
+  }
+  if (agentContextSources.length > 0 && !isProjectCreate && !isProjectUpdate) {
+    throw new CliUsageError('Agent Context options require project create or project update.')
+  }
+  if (options.clearAgentContext && !isProjectUpdate) {
+    throw new CliUsageError('--clear-agent-context requires project update.')
+  }
+  if (options.name !== undefined && !isProjectUpdate) {
+    throw new CliUsageError('--name requires project update.')
+  }
+  if (options.name !== undefined && !options.name.trim()) {
+    throw new CliUsageError('--name requires a non-empty value.')
+  }
+  const isCollectionCreate =
+    command === 'literature' && subcommand === 'collection' && positionals[0] === 'create'
+  if (
+    options.description !== undefined &&
+    !isProjectCreate &&
+    !isProjectUpdate &&
+    !isCollectionCreate
+  ) {
+    throw new CliUsageError(
+      '--description requires project create, project update, or literature collection create.'
+    )
+  }
+  if (options.agentContext !== undefined) {
+    const context = options.agentContext.trim()
+    if (!context) throw new CliUsageError('Agent Context must not be empty.')
+    if (context.length > 16_000) {
+      throw new CliUsageError('Agent Context must not exceed 16000 characters.')
+    }
+    options.agentContext = context
+  }
+  if (command === 'codex' && subcommand === 'login') {
+    if (options.json || options.jsonl) {
+      throw new CliUsageError('codex login does not support machine-readable output.')
+    }
+  }
+  const sessionConfigAction = command === 'session' && subcommand === 'config' && positionals[0]
+  const projectDefaultsAction =
+    command === 'project' && subcommand === 'session-defaults' && positionals[0]
+  const agentRoutingAction =
+    command === 'settings' && subcommand === 'agent-routing' && positionals[0]
+  const isSessionConfigUpdate = sessionConfigAction === 'update'
+  const isProjectDefaultsUpdate = projectDefaultsAction === 'update'
+  const isAgentRoutingUpdate = agentRoutingAction === 'update'
+  const isRun = command === 'run' && !subcommand
+  if (isRun && options.session && options.enabledComputeHosts !== undefined) {
+    throw new CliUsageError(
+      '--enable-compute-host cannot update an existing Session; use session config update.'
+    )
+  }
+  if (isRun && options.session && options.clearComputeHosts) {
+    throw new CliUsageError(
+      '--clear-compute-hosts cannot update an existing Session; use session config update.'
+    )
+  }
+  const runOnlyOptions = [
+    ['--plan-first', options.planFirst],
+    ['--permission-prompts', options.permissionPrompts !== undefined],
+    ['--skill', options.skills !== undefined]
+  ]
+  for (const [label, present] of runOnlyOptions) {
+    if (present && !isRun) {
+      throw new CliUsageError(`${label} requires run.`)
+    }
+  }
+  const sessionOptionPresent =
+    options.provider !== undefined ||
+    (options.model !== undefined && !(command === 'provider' && subcommand === 'add')) ||
+    options.providerDefaultModel ||
+    options.reasoningEffort !== undefined ||
+    options.approvalProfile !== undefined ||
+    options.autoReviewEnabled !== undefined ||
+    options.memoryEnabled !== undefined ||
+    options.delegation !== undefined ||
+    options.computeHosts !== undefined ||
+    options.enabledComputeHosts !== undefined ||
+    options.clearComputeHosts
+  if (sessionOptionPresent && !isRun && !isSessionConfigUpdate && !isProjectDefaultsUpdate) {
+    throw new CliUsageError(
+      'Session configuration options require run or a defaults/config update.'
+    )
+  }
+  if (options.specialist !== undefined && !isRun && !isProjectDefaultsUpdate) {
+    throw new CliUsageError('--specialist requires run or project session-defaults update.')
+  }
+  const projectClearPresent =
+    options.clearProvider ||
+    options.clearApprovalProfile ||
+    options.clearAutoReview ||
+    options.clearMemory ||
+    options.clearDelegation ||
+    options.clearSpecialist
+  if (projectClearPresent && !isProjectDefaultsUpdate) {
+    throw new CliUsageError(
+      'Project default clear options require project session-defaults update.'
+    )
+  }
+  const routingPresent =
+    options.framework !== undefined ||
+    options.reviewerProvider !== undefined ||
+    options.reviewerModel !== undefined ||
+    options.reviewerEffort !== undefined ||
+    options.reviewerInherit ||
+    options.subagentProvider !== undefined ||
+    options.subagentModel !== undefined ||
+    options.subagentEffort !== undefined ||
+    options.subagentInherit
+  if (routingPresent && !isAgentRoutingUpdate) {
+    throw new CliUsageError('Agent routing options require settings agent-routing update.')
+  }
+  if (
+    command !== 'plan' &&
+    !isSessionConfigUpdate &&
+    (options.artifactVersion !== undefined ||
+      (options.revision !== undefined && !isSessionConfigUpdate) ||
+      options.feedback !== undefined)
+  ) {
+    throw new CliUsageError('Plan response options require a plan command.')
+  }
+  const isLiteratureSearch = command === 'literature' && subcommand === 'search'
+  const isLiteratureFormat = command === 'literature' && subcommand === 'format'
+  if ((options.limit !== undefined || options.offset !== undefined) && !isLiteratureSearch) {
+    throw new CliUsageError('--limit and --offset require literature search.')
+  }
+  if (options.limit !== undefined) {
+    const limit = Number(options.limit)
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+      throw new CliUsageError(`Invalid limit: ${options.limit}`)
+    }
+    options.limit = limit
+  }
+  if (options.offset !== undefined) {
+    const offset = Number(options.offset)
+    if (!Number.isInteger(offset) || offset < 0) {
+      throw new CliUsageError(`Invalid offset: ${options.offset}`)
+    }
+    options.offset = offset
+  }
+  if ((options.style !== undefined || options.locale !== undefined) && !isLiteratureFormat) {
+    throw new CliUsageError('--style and --locale require literature format.')
+  }
+  if (options.locale !== undefined && !['en-US', 'zh-CN'].includes(options.locale)) {
+    throw new CliUsageError(`Invalid citation locale: ${options.locale}`)
+  }
+  const isLiteratureImport = command === 'literature' && subcommand === 'import'
+  if (options.commit && !isLiteratureImport) {
+    throw new CliUsageError('--commit requires literature import.')
+  }
+  if (
+    (options.duplicates !== undefined || options.collection !== undefined) &&
+    !(isLiteratureImport && options.commit)
+  ) {
+    throw new CliUsageError('--duplicates and --collection require literature import --commit.')
+  }
+  if (isLiteratureImport && options.project !== undefined && !options.commit) {
+    throw new CliUsageError('--project requires literature import --commit.')
+  }
+  if (
+    options.duplicates !== undefined &&
+    !['reuse', 'separate', 'fill-missing'].includes(options.duplicates)
+  ) {
+    throw new CliUsageError(`Invalid duplicate policy: ${options.duplicates}`)
+  }
+  if (options.parent !== undefined && !isCollectionCreate) {
+    throw new CliUsageError('--parent requires literature collection create.')
+  }
+  assertPositionalLimit(command, subcommand, positionals)
+  return parsed
+}
+
+export const isProcessAlive = (pid) => {
+  if (!Number.isInteger(pid) || pid <= 0) return false
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return error.code === 'EPERM'
+  }
+}
+
+export const initCommand = async (options, deps = DEFAULT_DEPS) => {
+  const backend = await (deps.locateBackend ?? locateBackend)({ required: false })
+  const configRoot = resolveConfigRoot({
+    override: options.configRoot,
+    packaged: !backend.development
+  })
+  await mkdir(configRoot, { recursive: true, mode: 0o700 })
+  const result = { configRoot, initialized: true }
+  deps.log(options.json ? JSON.stringify(result) : `Open-Science is initialized at ${configRoot}.`)
+  return result
+}
+
+const authenticatedUrl = async (state, deps = DEFAULT_DEPS) => {
+  const token = await deps.readWebToken(state.configRoot)
+  return `http://127.0.0.1:${state.port}/?token=${encodeURIComponent(token)}`
+}
+
+const healthCheck = async (state, deps = DEFAULT_DEPS) => {
+  if (!state || !deps.isAlive(state.pid)) return false
+  try {
+    const token = await deps.readWebToken(state.configRoot)
+    const response = await deps.fetch(`http://127.0.0.1:${state.port}/api/bootstrap`, {
+      headers: { authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(1_500)
+    })
+    return response.ok
+  } catch {
+    return false
+  }
+}
+
+const sleep = (milliseconds) =>
+  new Promise((resolveSleep) => setTimeout(resolveSleep, milliseconds))
+
+const waitForState = async (
+  configRoot,
+  deps = DEFAULT_DEPS,
+  timeoutMs = START_TIMEOUT_MS,
+  signal
+) => {
+  const deadline = deps.now() + timeoutMs
+  while (deps.now() < deadline && !signal?.aborted) {
+    const state = await deps.findServiceState({ override: configRoot })
+    if (signal?.aborted) return undefined
+    if (await healthCheck(state, deps)) return state
+    if (deps.requestExistingRuntimeWeb)
+      await deps.requestExistingRuntimeWeb({ configRoot }, deps.fetch)
+    if (signal?.aborted) return undefined
+    await deps.sleep(250)
+  }
+  return undefined
+}
+
+// Keep the health poll and child-process lifecycle coupled: a fatal Node startup error must not
+// look like a slow service startup and consume the full CLI timeout.
+export const waitForStartup = async (
+  configRoot,
+  child,
+  deps = DEFAULT_DEPS,
+  timeoutMs = START_TIMEOUT_MS
+) => {
+  const abortController = new AbortController()
+  let cleanup = () => {}
+  const childFailure = new Promise((resolveFailure) => {
+    const onExit = (code, signal) => {
+      // EX_TEMPFAIL means another entry won directory ownership. Wait for that owner to serve.
+      if ((code === 0 || code === 75) && signal === null) return
+      abortController.abort()
+      resolveFailure({ kind: 'exit', code, signal })
+    }
+    const onError = (error) => {
+      abortController.abort()
+      resolveFailure({ kind: 'error', error })
+    }
+    child.once('exit', onExit)
+    child.once('error', onError)
+    cleanup = () => {
+      child.off('exit', onExit)
+      child.off('error', onError)
+    }
+  })
+  const healthy = waitForState(configRoot, deps, timeoutMs, abortController.signal).then((state) =>
+    state ? { kind: 'ready', state } : { kind: 'timeout' }
+  )
+  try {
+    return await Promise.race([healthy, childFailure])
+  } finally {
+    abortController.abort()
+    cleanup()
+  }
+}
+
+const openBrowser = (url) => {
+  const [command, args] =
+    process.platform === 'win32'
+      ? ['cmd', ['/c', 'start', '', url]]
+      : process.platform === 'darwin'
+        ? ['open', [url]]
+        : ['xdg-open', [url]]
+  const child = spawn(command, args, { detached: true, stdio: 'ignore', windowsHide: true })
+  child.unref()
+}
+
+// The real I/O the commands use, bundled so tests can substitute fakes. Declared after the helpers it
+// references so its initializer sees them; commands take `deps = DEFAULT_DEPS`, so production callers
+// pass nothing and get these.
+const DEFAULT_DEPS = {
+  requestExistingRuntimeWeb,
+  requestServiceLifetime,
+  verifyServiceConfigRoot,
+  waitForServiceStopped,
+  findServiceState: (options) => findServiceState(options),
+  readWebToken: (configRoot) => readWebToken(configRoot),
+  isAlive: isProcessAlive,
+  fetch: (input, init) => fetch(input, init),
+  sleep,
+  now: () => Date.now(),
+  log: (...args) => console.log(...args),
+  warn: (...args) => console.warn(...args)
+}
+
+// Waits for the daemon to exit after an authenticated graceful shutdown request. A PID proves only
+// that some process is alive, not that it is still the daemon recorded in a potentially stale state
+// file, so this function deliberately never signals it. Returns true iff the PID is no longer alive.
+export const terminateDaemon = async (pid, opts) => {
+  const { isAlive, sleep: sleepFn, now, gracefulTimeoutMs } = opts
+  const deadline = now() + gracefulTimeoutMs
+  while (now() < deadline && isAlive(pid)) await sleepFn(250)
+  return !isAlive(pid)
+}
+
+// Snapshot the end as well as the start: the daemon may still be writing after a timeout.
+export const readLogTail = async (logPath) => {
+  try {
+    const file = await open(logPath, 'r')
+    try {
+      const { size } = await file.stat()
+      if (size === 0) return ''
+      const start = Math.max(0, size - 64 * 1024)
+      const stream = file.createReadStream({ start, end: size - 1 })
+      const text = await readStreamText(stream)
+      return text.split(/\r?\n/).slice(-30).join('\n')
+    } finally {
+      await file.close()
+    }
+  } catch {
+    return ''
+  }
+}
+
+export const openLaunchLog = (logPath) => openSync(logPath, 'wx', 0o600)
+
+export const buildBackendLaunchArgs = (backend, options, port) => [
+  backend.entry,
+  ...(backend.development ? ['--development'] : []),
+  ...(options.credentialStore ? [`--credential-store=${options.credentialStore}`] : []),
+  ...(options.passwordStore ? [`--password-store=${options.passwordStore}`] : []),
+  `--serve=${port}`
+]
+
+export const formatStartupFailure = (outcome, logTail) => {
+  if (outcome.kind === 'error') return `Could not start Open-Science: ${outcome.error.message}`
+
+  const exitStatus = outcome.signal
+    ? ` after receiving ${outcome.signal}`
+    : ` with exit code ${outcome.code ?? 'unknown'}`
+  return `Open-Science exited before becoming healthy${exitStatus}.${logTail ? `\n\n${logTail}` : ''}`
+}
+
+export const startCommand = async (options, deps = DEFAULT_DEPS) => {
+  const existing = await findCurrentState(options, deps)
+  if (await healthCheck(existing, deps)) {
+    if (options.credentialStore !== undefined)
+      throw new Error(
+        'Open-Science is already running. Stop it before selecting a credential store.'
+      )
+    const service = await (deps.requestServiceLifetime ?? requestServiceLifetime)(
+      existing.configRoot,
+      'start',
+      deps.fetch
+    )
+    const url = await authenticatedUrl(existing, deps)
+    if (options.json)
+      deps.log(
+        JSON.stringify({
+          result: 'already-running',
+          ...existing,
+          lifetime: service?.lifetime ?? 'unknown'
+        })
+      )
+    else {
+      deps.log(`Open-Science is already running (PID ${existing.pid}).`)
+      if (!service)
+        deps.warn(
+          'Persistent running could not be confirmed for this older service. Stop it from its App and start a compatible service when persistent running is needed.'
+        )
+    }
+    if (options.open) openBrowser(url)
+    else if (!options.json) deps.log('Run "open-science url" to print a browser login URL.')
+    return { state: existing, started: false }
+  }
+
+  if (options.noSandbox)
+    throw new Error(
+      '--no-sandbox does not apply to the Node backend. Notebook and process sandbox protections remain enabled.'
+    )
+  const reusedRoot = await requestExistingRuntimeWeb(options, deps.fetch)
+  if (reusedRoot) {
+    const state = await findCurrentState({ ...options, configRoot: reusedRoot }, deps)
+    if (await healthCheck(state, deps)) {
+      const service = await (deps.requestServiceLifetime ?? requestServiceLifetime)(
+        state.configRoot,
+        'start',
+        deps.fetch
+      )
+      if (options.json)
+        deps.log(
+          JSON.stringify({
+            result: 'already-running',
+            ...state,
+            lifetime: service?.lifetime ?? 'unknown'
+          })
+        )
+      else {
+        deps.log(`Open-Science is already running (PID ${state.pid}).`)
+        if (!service)
+          deps.warn(
+            'Persistent running could not be confirmed for this older service. Stop it from its App and start a compatible service when persistent running is needed.'
+          )
+      }
+      if (options.open) openBrowser(await authenticatedUrl(state, deps))
+      else if (!options.json) deps.log('Run "open-science url" to print a browser login URL.')
+      return { state, started: false }
+    }
+  }
+  if (options.appPath)
+    throw new CliUsageError(
+      '--app-path is no longer used for Node startup. Install the standalone backend package.'
+    )
+  const backend = await (deps.locateBackend ?? locateBackend)()
+  const configRoot = resolveConfigRoot({
+    packaged: !backend.development,
+    override: options.configRoot
+  })
+  await mkdir(configRoot, { recursive: true, mode: 0o700 })
+  const logPath = join(configRoot, `cli-daemon-${randomUUID()}.log`)
+  const environmentPort = process.env.OPEN_SCIENCE_WEB_PORT?.trim()
+  const port = options.port ?? (environmentPort ? parsePortOption(environmentPort) : DEFAULT_PORT)
+  const childEnv = {
+    ...process.env,
+    OPEN_SCIENCE_CAPTURED_LAUNCH_OUTPUT: '1',
+    OPEN_SCIENCE_WEB_PORT: String(port)
+  }
+  // A computed default is not an override: injecting it would make the backend select
+  // <configRoot>/electron-profile instead of the existing desktop Electron profile.
+  if (
+    options.configRoot ||
+    process.env.OPEN_SCIENCE_CONFIG_ROOT ||
+    process.env.OPEN_SCIENCE_STORAGE_ROOT
+  )
+    childEnv.OPEN_SCIENCE_CONFIG_ROOT = configRoot
+  delete childEnv.ELECTRON_RUN_AS_NODE
+  if (options.credentialStore === 'file')
+    deps.warn(
+      'Settings credentials will be stored unencrypted in local files. Use this option at every start; existing encrypted credentials are not migrated. Compute credentials still require OS secure storage.'
+    )
+  let installationLease
+  const logFd = openLaunchLog(logPath)
+  let capture
+  let startup
+  let launcherPid
+  const startupTimeoutMs = options.timeoutMs ?? START_TIMEOUT_MS
+  try {
+    installationLease = protectInstallationStartup(backend.entry, configRoot)
+    capture = await startLaunchLogReader(backend.command, logFd)
+    const child = spawn(backend.command, buildBackendLaunchArgs(backend, options, port), {
+      detached: true,
+      stdio: ['ignore', capture.input, capture.input],
+      windowsHide: true,
+      env: childEnv
+    })
+    launcherPid = child.pid
+    const startupPromise = waitForStartup(configRoot, child, deps, startupTimeoutMs)
+    child.unref()
+    capture.input.destroy()
+
+    startup = await startupPromise
+  } finally {
+    capture?.input.destroy()
+    closeSync(logFd)
+    installationLease?.release()
+  }
+  if (startup.kind !== 'ready') {
+    if (startup.kind === 'exit' || startup.kind === 'error') {
+      // A surviving descendant may still hold the pipe. Give ordinary exits time to drain.
+      let timer
+      try {
+        await Promise.race([
+          capture.closed,
+          new Promise((resolve) => {
+            timer = setTimeout(resolve, 500)
+          })
+        ])
+      } finally {
+        clearTimeout(timer)
+      }
+    }
+    const logTail = await readLogTail(logPath)
+    if (startup.kind !== 'timeout') {
+      throw new Error(formatStartupFailure(startup, logTail, options))
+    }
+    throw Object.assign(
+      new Error(
+        `Open-Science startup is unconfirmed after ${startupTimeoutMs / 1000}s. The service may still become ready. Check: open-science status --config-root ${JSON.stringify(configRoot)}. Log: ${logPath}${logTail ? `\n\n${logTail}` : ''}`
+      ),
+      {
+        code: 'startup_unconfirmed',
+        configRoot,
+        launcherPid,
+        logPath,
+        next: ['status', '--config-root', configRoot, '--json']
+      }
+    )
+  }
+  const state = startup.state
+  const url = await authenticatedUrl(state, deps)
+  if (options.json) {
+    const service = await (deps.requestServiceLifetime ?? requestServiceLifetime)(
+      state.configRoot,
+      'status',
+      deps.fetch
+    )
+    deps.log(
+      JSON.stringify({ result: 'started', ...state, lifetime: service?.lifetime ?? 'unknown' })
+    )
+  } else deps.log(`Open-Science started (PID ${state.pid}).`)
+  if (options.open) openBrowser(url)
+  else if (!options.json) deps.log('Run "open-science url" to print a browser login URL.')
+  return { state, started: true }
+}
+
+const findCurrentState = async (options, deps = DEFAULT_DEPS) => {
+  let firstLiveState
+  const state = await deps.findServiceState({
+    override: options.configRoot,
+    accept: async (candidate) => {
+      if (!deps.isAlive(candidate.pid)) {
+        return false
+      }
+      firstLiveState ??= candidate
+      return healthCheck(candidate, deps)
+    }
+  })
+  // Keep a live but unhealthy candidate when none passed: stop must still authenticate its shutdown
+  // or fail, rather than claim that an unreachable process has already stopped.
+  return state ?? firstLiveState
+}
+
+export const stopCommand = async (options, deps = DEFAULT_DEPS) => {
+  const state = await findCurrentState(options, deps)
+  if (!state) {
+    deps.log(
+      options.json ? JSON.stringify({ result: 'already-stopped' }) : 'Open-Science is not running.'
+    )
+    return
+  }
+  const service = await (deps.requestServiceLifetime ?? requestServiceLifetime)(
+    state.configRoot,
+    options.force ? 'force-stop' : 'stop',
+    deps.fetch
+  )
+  if (service) {
+    if (!service.lifetime.stopping) {
+      deps.log(
+        options.json
+          ? JSON.stringify({ result: 'keep-alive-revoked', ...service })
+          : 'Persistent running revoked. The local service remains running while an App is connected.'
+      )
+      return
+    }
+    if (!options.json) deps.log('Stopping the local service. Running tasks may be interrupted.')
+    const confirmation = await (deps.waitForServiceStopped ?? waitForServiceStopped)(service, {
+      isAlive: deps.isAlive,
+      sleep: deps.sleep,
+      now: deps.now,
+      timeoutMs: STOP_TIMEOUT_MS,
+      ...(deps.readServiceProcessBirth ? { readBirth: deps.readServiceProcessBirth } : {}),
+      ...(deps.readRuntimeOwner ? { readOwner: deps.readRuntimeOwner } : {})
+    })
+    if (!confirmation.stopped)
+      throw Object.assign(
+        new Error(
+          `Local service exit is not confirmed (PID ${service.pid}, generation ${service.lifetime.generation}; ${confirmation.reason}). Inspect the service logs before retrying.`
+        ),
+        { code: 'service_stop_unconfirmed' }
+      )
+    deps.log(
+      options.json
+        ? JSON.stringify({ result: 'stopped', ...service })
+        : 'Local service stopped. Cleanup details are available in the service logs.'
+    )
+    return
+  }
+  if (options.force)
+    throw new Error(
+      'This older service cannot record a force-stop intent. Stop it from its App or update it first.'
+    )
+  const token = await deps.readWebToken(state.configRoot)
+  // Legacy shutdown has no lifetime intent. Authenticate its actual root before any mutation.
+  try {
+    const bootstrap = await deps.fetch(`http://127.0.0.1:${state.port}/api/bootstrap`, {
+      headers: { authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(1500),
+      redirect: 'error'
+    })
+    if (!bootstrap.ok) throw new Error(`HTTP ${bootstrap.status}`)
+    const boot = await bootstrap.json()
+    await (deps.verifyServiceConfigRoot ?? verifyServiceConfigRoot)(
+      state.configRoot,
+      boot.configRoot
+    )
+  } catch (cause) {
+    throw Object.assign(
+      new Error(
+        'The older service could not prove its Config Root. Stop it from its original App or use the correct --config-root.',
+        { cause }
+      ),
+      { code: 'service_identity_unverified' }
+    )
+  }
+  let shutdownAccepted = false
+  try {
+    const response = await deps.fetch(`http://127.0.0.1:${state.port}/api/shutdown`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(3_000),
+      redirect: 'error'
+    })
+    if (!response.ok) throw new Error(`HTTP ${response.status}`)
+    shutdownAccepted = true
+    await response.arrayBuffer()
+  } catch (error) {
+    if (!options.json) deps.warn(`Graceful shutdown failed: ${error.message}`)
+  }
+
+  if (!shutdownAccepted) {
+    throw new Error(
+      `Could not safely stop Open-Science (PID ${state.pid}); the authenticated shutdown request was not accepted, so no process signal was sent.`
+    )
+  }
+
+  const notice =
+    'Shutdown requested; completion is unconfirmed because this older service protocol cannot identify the exact stopped generation. Check its original App.'
+  deps.log(
+    options.json
+      ? JSON.stringify({ result: 'shutdown-requested', completionStatus: 'unconfirmed', notice })
+      : notice
+  )
+  if (deps.setExitCode) deps.setExitCode(1)
+  else process.exitCode = 1
+}
+
+export const statusCommand = async (options, deps = DEFAULT_DEPS) => {
+  const state = await findCurrentState(options, deps)
+  const running = await healthCheck(state, deps)
+  const unreachable = !running && state && deps.isAlive(state.pid)
+  const service = running
+    ? await (deps.requestServiceLifetime ?? requestServiceLifetime)(
+        state.configRoot,
+        'status',
+        deps.fetch
+      )
+    : undefined
+  if (options.json) {
+    deps.log(
+      JSON.stringify(
+        running
+          ? {
+              running: true,
+              ...state,
+              pid: service?.pid ?? state.pid,
+              ...(service
+                ? {
+                    lifetime: service.lifetime,
+                    appVersion: service.identity?.version ?? state.appVersion
+                  }
+                : { lifetime: 'unknown' })
+            }
+          : unreachable
+            ? { ...state, running: null, status: 'unreachable', lifetime: 'unknown' }
+            : { running: false },
+        null,
+        2
+      )
+    )
+  } else if (running) {
+    deps.log(`Open-Science is running (PID ${service?.pid ?? state.pid}, port ${state.port}).`)
+    if (service?.identity?.version) deps.log(`Service version: ${service.identity.version}.`)
+    deps.log(
+      service
+        ? `App sessions: ${service.lifetime.apps}; persistent running: ${service.lifetime.explicit ? 'enabled' : 'disabled'}; state: ${service.lifetime.stopping ? 'stopping' : 'running'}. Known task activity: query run status; this is not an idle guarantee.`
+        : 'Service holds: unknown (older service).'
+    )
+  } else if (unreachable) {
+    deps.log(
+      `Local service status is unknown (PID ${state.pid}, port ${state.port}). The process is alive but did not respond. App sessions and persistent running are unknown.`
+    )
+  } else {
+    deps.log('Open-Science is not running.')
+  }
+  if (!running) {
+    if (deps.setExitCode) deps.setExitCode(1)
+    else process.exitCode = 1
+  }
+}
+
+export const urlCommand = async (options, deps = DEFAULT_DEPS) => {
+  const state = await findCurrentState(options, deps)
+  if (!(await healthCheck(state, deps))) throw new Error('Open-Science is not running.')
+  deps.log(await authenticatedUrl(state, deps))
+}
+
+const resolveDownloadOutput = async (output) => {
+  let candidate = output
+  for (let hop = 0; ; hop += 1) {
+    const linkTarget = await lstat(candidate).then(
+      (metadata) => (metadata.isSymbolicLink() ? readlink(candidate) : undefined),
+      (error) => {
+        if (error?.code === 'ENOENT') return undefined
+        throw error
+      }
+    )
+    if (linkTarget === undefined) return candidate
+    if (hop === MAX_DOWNLOAD_SYMLINK_HOPS) break
+    candidate = resolve(dirname(candidate), linkTarget)
+  }
+  throw new Error(`Too many symbolic links in artifact output: ${output}`)
+}
+
+const writeDownload = async (response, output) => {
+  if (!response.body) throw new Error('Artifact download returned no data.')
+  const destination = await resolveDownloadOutput(output)
+  const existingMode = await stat(destination).then(
+    ({ mode }) => mode & 0o777,
+    (error) => {
+      if (error?.code === 'ENOENT') return undefined
+      throw error
+    }
+  )
+  const temporaryOutput = join(dirname(destination), `.open-science-${randomUUID()}.tmp`)
+  try {
+    await pipeline(
+      Readable.fromWeb(response.body),
+      createWriteStream(temporaryOutput, {
+        flags: 'wx',
+        ...(existingMode === undefined ? {} : { mode: existingMode })
+      })
+    )
+    if (existingMode !== undefined) await chmod(temporaryOutput, existingMode)
+    await rename(temporaryOutput, destination)
+  } finally {
+    await rm(temporaryOutput, { force: true }).catch(() => undefined)
+  }
+}
+
+const TASK_DEPS = {
+  connect: (options) => connectToOpenScience(options),
+  readFile: (path) => readFile(path, 'utf8'),
+  readBinaryFile: (path) => readFile(path),
+  readStdin: () => readStreamText(process.stdin),
+  writeDownload,
+  log: (...args) => console.log(...args),
+  warn: (...args) => console.warn(...args),
+  stdinIsTTY: process.stdin.isTTY,
+  setExitCode: (code) => {
+    process.exitCode = code
+  }
+}
+
+const outputValue = (value, options, deps) => {
+  if (options.json || options.jsonl) deps.log(JSON.stringify(value))
+  else if (Array.isArray(value)) {
+    for (const item of value) {
+      deps.log(`${item.id}\t${item.name ?? item.title ?? item.path ?? ''}`.trimEnd())
+    }
+  } else {
+    deps.log(
+      typeof value === 'string'
+        ? value
+        : [value.id, value.name ?? value.title ?? value.status ?? value.path]
+            .filter(Boolean)
+            .join('\t') || JSON.stringify(value)
+    )
+  }
+}
+
+const readPrompt = async (options, deps) => {
+  const sources = [options.prompt !== undefined, options.promptFile !== undefined].filter(Boolean)
+  if (sources.length > 1) throw new CliUsageError('Use only one of --prompt or --prompt-file.')
+  if (options.prompt !== undefined) return options.prompt.trim()
+  if (options.promptFile !== undefined) return (await deps.readFile(options.promptFile)).trim()
+  if (deps.stdinIsTTY) {
+    throw new CliUsageError('Provide --prompt, --prompt-file, or pipe a prompt on stdin.')
+  }
+  return (await deps.readStdin()).trim()
+}
+
+const validateAgentContext = (value) => {
+  const context = value.trim()
+  if (!context) throw new CliUsageError('Agent Context must not be empty.')
+  if (context.length > 16_000) {
+    throw new CliUsageError('Agent Context must not exceed 16000 characters.')
+  }
+  return context
+}
+
+const readAgentContext = async (options, deps) => {
+  if (options.clearAgentContext) return ''
+  if (options.agentContext !== undefined) return validateAgentContext(options.agentContext)
+  if (options.agentContextFile === undefined) return undefined
+  let decoded
+  try {
+    const bytes = await deps.readBinaryFile(options.agentContextFile)
+    decoded = new TextDecoder('utf-8', { fatal: true }).decode(bytes)
+  } catch (error) {
+    if (error?.code === 'ENOENT') {
+      throw new CliUsageError(`Agent Context file not found: ${options.agentContextFile}`)
+    }
+    if (error instanceof TypeError) {
+      throw new CliUsageError('Agent Context file must contain valid UTF-8 text.')
+    }
+    throw error
+  }
+  return validateAgentContext(decoded)
+}
+
+const resolveCliProject = async (client, selector) => {
+  const projects = await client.listProjects()
+  const byId = projects.find((project) => project.id === selector)
+  if (byId) return byId
+  const byName = projects.filter((project) => project.name === selector)
+  if (byName.length === 1) return byName[0]
+  if (byName.length > 1) {
+    throw new CliUsageError(`Project name is ambiguous: ${selector}. Use a project ID.`)
+  }
+  throw new OpenScienceApiError(`Project not found: ${selector}`, { code: 'project_not_found' })
+}
+
+const resolveCliProjectId = async (client, selector) =>
+  (await resolveCliProject(client, selector)).id
+
+const emitRunEvent = (event, options, deps) => {
+  if (options.jsonl) {
+    deps.log(JSON.stringify(event))
+  } else if (event.type === 'stream.resync-required') {
+    deps.warn(
+      'Run event history could not be fully replayed. Final Run state will still be read from Open-Science.'
+    )
+  } else if (event.type === 'run.progress') {
+    if (event.data?.heartbeat) {
+      const seconds = Math.max(1, Math.round((event.data.elapsedMs ?? 0) / 1_000))
+      const subject =
+        event.data.phase === 'provider-accepted' ? 'the first provider output' : 'the provider'
+      deps.log(`Still waiting for ${subject} (${seconds}s elapsed).`)
+      return
+    }
+    const message = {
+      accepted: 'Run accepted.',
+      'session-ready': 'Session ready.',
+      'prompt-dispatched': 'Prompt dispatched to the agent.',
+      'provider-accepted': 'Provider accepted the prompt.',
+      'first-visible-output': 'First provider output received.'
+    }[event.data?.phase]
+    if (message) deps.log(message)
+  } else if (event.type === 'permission.requested') {
+    deps.warn(
+      'Run is waiting for approval. Approve the request in Open-Science Desktop or the Web UI.'
+    )
+  } else if (
+    event.type === 'run.event' &&
+    event.data?.planProjection?.lifecycle === 'awaiting_approval'
+  ) {
+    deps.warn('Run is waiting for Plan approval.')
+  } else if (
+    event.type === 'run.event' &&
+    event.data?.kind !== 'message' &&
+    (event.data?.title || event.data?.text)
+  ) {
+    deps.log(event.data.title ?? event.data.text)
+  }
+}
+
+const isEventForRun = (event, run) => {
+  if (event?.runId) return event.runId === run.runId
+  const sessionId = event?.sessionId ?? event?.data?.sessionId
+  return !sessionId || sessionId === run.sessionId
+}
+
+const streamRunEvents = async (eventStream, runRef, options, deps, signal) => {
+  try {
+    for await (const event of eventStream) {
+      if (!runRef.current) {
+        runRef.pending.push(event)
+        continue
+      }
+      if (!isEventForRun(event, runRef.current)) continue
+      emitRunEvent(event, options, deps)
+    }
+  } catch (error) {
+    if (!signal.aborted) throw error
+  }
+}
+
+const agentConfigurationPatch = (options) => {
+  const present =
+    options.provider !== undefined ||
+    options.model !== undefined ||
+    options.providerDefaultModel ||
+    options.reasoningEffort !== undefined
+  if (!present) return undefined
+  return {
+    ...(options.provider !== undefined ? { providerId: options.provider } : {}),
+    ...(options.model !== undefined
+      ? { model: options.model }
+      : options.providerDefaultModel
+        ? { model: null }
+        : {}),
+    ...(options.reasoningEffort !== undefined ? { reasoningEffort: options.reasoningEffort } : {})
+  }
+}
+
+const computeHostsPatch = (options, current = { enabled: [], selected: [] }) => {
+  if (options.clearComputeHosts) return { enabled: [], selected: [] }
+  if (options.computeHosts === undefined && options.enabledComputeHosts === undefined) {
+    return undefined
+  }
+  const selected = options.computeHosts ?? current.selected
+  const enabled = [...(options.enabledComputeHosts ?? current.enabled), ...selected].filter(
+    (value, index, values) => values.indexOf(value) === index
+  )
+  return { enabled, selected }
+}
+
+const modelRouting = (options, prefix) => {
+  const inherit = options[`${prefix}Inherit`]
+  const providerId = options[`${prefix}Provider`]
+  const model = options[`${prefix}Model`]
+  const reasoningEffort = options[`${prefix}Effort`]
+  if (inherit) {
+    if (providerId !== undefined || model !== undefined || reasoningEffort !== undefined) {
+      throw new CliUsageError(
+        `--${prefix}-inherit cannot be combined with fixed ${prefix} routing options.`
+      )
+    }
+    return { mode: 'inherit' }
+  }
+  if (providerId === undefined && model === undefined && reasoningEffort === undefined) {
+    return undefined
+  }
+  if (!providerId || !model) {
+    throw new CliUsageError(
+      `--${prefix}-provider and --${prefix}-model are required for fixed routing.`
+    )
+  }
+  return { mode: 'fixed', providerId, model, reasoningEffort: reasoningEffort ?? 'default' }
+}
+
+const assertNoClearConflict = (clear, present, label) => {
+  if (clear && present) throw new CliUsageError(`Cannot set and clear ${label} together.`)
+}
+
+export const runTaskCommand = async (parsed, dependencies = {}) => {
+  const deps = { ...TASK_DEPS, ...dependencies }
+  const { command, subcommand, positionals = [], options } = parsed
+  let client
+  try {
+    client = await deps.connect({ configRoot: options.configRoot })
+  } catch (error) {
+    if (command !== 'doctor' || error?.code !== 'daemon_unavailable' || error?.status !== undefined)
+      throw error
+    deps.log(
+      JSON.stringify({
+        ready: false,
+        checks: { daemon: { status: 'missing' } },
+        next: [{ code: 'daemon_unavailable', argv: ['start', '--no-open'] }]
+      })
+    )
+    deps.setExitCode(3)
+    return
+  }
+
+  if (command === 'doctor') {
+    deps.log(JSON.stringify(await client.doctor()))
+    return
+  }
+
+  if (command === 'runtime' && subcommand === 'list') {
+    const runtimes = await client.listRuntimes()
+    if (options.json) {
+      deps.log(JSON.stringify(runtimes))
+    } else {
+      deps.log('FRAMEWORK\tSTATUS\tVERSION\tSOURCE')
+      for (const runtime of runtimes) {
+        deps.log(
+          `${runtime.framework}\t${runtime.status}\t${runtime.version ?? '-'}\t${runtime.source ?? '-'}`
+        )
+      }
+    }
+    return
+  }
+
+  if (command === 'cli' && subcommand === 'install') {
+    outputValue(await client.installCli(), options, deps)
+    return
+  }
+  if (
+    command === 'runtime' ||
+    command === 'provider' ||
+    (command === 'connector' && subcommand === 'configure')
+  ) {
+    const readSecret = (name) => {
+      if (!name || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(name))
+        throw new CliUsageError('Name a credential environment variable.')
+      const key = (dependencies.env ?? process.env)[name]?.trim()
+      if (!key) throw new CliUsageError('The credential environment variable is empty.')
+      return key
+    }
+    let request
+    if (command === 'runtime' && subcommand === 'install' && positionals[0] === 'codex')
+      request = { action: 'runtime' }
+    else if (
+      command === 'provider' &&
+      subcommand === 'add' &&
+      options.providerType === 'official' &&
+      options.vendor === 'openai' &&
+      options.model
+    ) {
+      request = { action: 'provider', key: readSecret(options.apiKeyEnv), model: options.model }
+    } else if (command === 'connector' && positionals[0] === 'literature')
+      request = { action: 'openalex', key: readSecret(options.openAlexKeyEnv) }
+    else
+      throw new CliUsageError(
+        'Supported setup commands: runtime install codex; provider add --type official --vendor openai --model <id> --api-key-env <ENV>; connector configure literature --openalex-key-env <ENV>.'
+      )
+    const result = await client.bootstrap(request, { timeoutMs: 600_000 })
+    if (!result.ok)
+      throw Object.assign(new Error(`Setup failed: ${result.code}.`), { code: result.code })
+    outputValue(result, options, deps)
+    return
+  }
+
+  if (command === 'connector' || command === 'credential') {
+    const id = positionals[0]
+    const actions =
+      command === 'connector'
+        ? ['list', 'show', 'enable', 'disable', 'add', 'update', 'remove', 'test']
+        : ['list', 'add', 'update']
+    if (!actions.includes(subcommand))
+      throw new CliUsageError(`Unknown command: ${command} ${subcommand ?? ''}`)
+    if (!['list', 'add'].includes(subcommand) && !id) throw new CliUsageError('An ID is required.')
+    let input
+    if (subcommand === 'add' || subcommand === 'update') {
+      if (deps.stdinIsTTY)
+        throw new CliUsageError('Pipe a JSON configuration object through stdin.')
+      try {
+        input = JSON.parse(await deps.readStdin())
+      } catch {
+        throw new CliUsageError('Stdin must contain a valid JSON configuration object.')
+      }
+      if (!input || typeof input !== 'object' || Array.isArray(input)) {
+        throw new CliUsageError('Stdin must contain a JSON configuration object.')
+      }
+    }
+    let result
+    if (command === 'credential') {
+      if (subcommand === 'list') result = await client.listCredentials()
+      else if (subcommand === 'add') result = await client.createCredential(input)
+      else result = await client.updateCredential(id, input)
+    } else {
+      if (subcommand === 'list') result = await client.listConnectors()
+      else if (subcommand === 'show') result = await client.getConnector(id)
+      else if (subcommand === 'enable' || subcommand === 'disable')
+        result = await client.setConnectorEnabled(id, subcommand === 'enable')
+      else if (subcommand === 'add') result = await client.addConnector(input)
+      else if (subcommand === 'update') result = await client.updateConnector(id, input)
+      else if (subcommand === 'remove') result = await client.removeConnector(id)
+      else result = await client.testConnector(id)
+    }
+    // Preserve every safe status/configuration field in both output formats.
+    deps.log(JSON.stringify(result, null, options.json ? undefined : 2))
+    if (
+      !options.json &&
+      command === 'connector' &&
+      ['add', 'update', 'remove', 'enable', 'disable'].includes(subcommand)
+    ) {
+      deps.log(
+        'Connector settings saved. Existing session refresh follows the configured agent framework; start a new session if its tool list is unchanged.'
+      )
+    }
+    if (subcommand === 'test' && result?.success === false) deps.setExitCode(1)
+    return
+  }
+
+  if (command === 'project' && subcommand === 'list') {
+    outputValue(await client.listProjects(), options, deps)
+    return
+  }
+  if (command === 'project' && subcommand === 'create') {
+    const name = positionals.join(' ').trim()
+    if (!name) throw new CliUsageError('Project name is required.')
+    const agentContext = await readAgentContext(options, deps)
+    outputValue(
+      await client.createProject({
+        name,
+        description: options.description,
+        ...(agentContext === undefined ? {} : { agentContext })
+      }),
+      options,
+      deps
+    )
+    return
+  }
+  if (command === 'project' && subcommand === 'update') {
+    const selector = positionals.join(' ').trim()
+    if (!selector) throw new CliUsageError('Project id or name is required.')
+    const agentContext = await readAgentContext(options, deps)
+    if (
+      options.name === undefined &&
+      options.description === undefined &&
+      agentContext === undefined
+    ) {
+      throw new CliUsageError('Project update requires at least one field.')
+    }
+    const project = await resolveCliProject(client, selector)
+    outputValue(
+      await client.updateProject(project.id, {
+        expectedUpdatedAt: project.updatedAt,
+        ...(options.name === undefined ? {} : { name: options.name }),
+        ...(options.description === undefined ? {} : { description: options.description }),
+        ...(agentContext === undefined ? {} : { agentContext })
+      }),
+      options,
+      deps
+    )
+    return
+  }
+  if (command === 'project' && subcommand === 'session-defaults') {
+    const action = positionals[0]
+    const selector = positionals.slice(1).join(' ').trim()
+    if (!selector) throw new CliUsageError('Project id or name is required.')
+    const project = await resolveCliProject(client, selector)
+    const current = await client.getProjectSessionDefaults(project.id)
+    if (action === 'show') {
+      outputValue(current, options, deps)
+      return
+    }
+    if (action !== 'update') {
+      throw new CliUsageError('Use project session-defaults show or update.')
+    }
+    const agent = agentConfigurationPatch(options)
+    assertNoClearConflict(options.clearProvider, agent !== undefined, 'the provider default')
+    assertNoClearConflict(
+      options.clearApprovalProfile,
+      options.approvalProfile !== undefined,
+      'the approval profile default'
+    )
+    assertNoClearConflict(
+      options.clearAutoReview,
+      options.autoReviewEnabled !== undefined,
+      'the auto-review default'
+    )
+    assertNoClearConflict(
+      options.clearMemory,
+      options.memoryEnabled !== undefined,
+      'the Memory default'
+    )
+    assertNoClearConflict(
+      options.clearDelegation,
+      options.delegation !== undefined,
+      'the delegation default'
+    )
+    assertNoClearConflict(
+      options.clearSpecialist,
+      options.specialist !== undefined,
+      'the Specialist default'
+    )
+    const computeHosts = computeHostsPatch(options, current.configured.computeHosts)
+    const patch = {
+      ...(options.clearProvider
+        ? { agentConfiguration: null }
+        : agent
+          ? { agentConfiguration: agent }
+          : {}),
+      ...(options.clearApprovalProfile
+        ? { permissionProfile: null }
+        : options.approvalProfile !== undefined
+          ? { permissionProfile: options.approvalProfile }
+          : {}),
+      ...(options.clearAutoReview
+        ? { autoReviewEnabled: null }
+        : options.autoReviewEnabled !== undefined
+          ? { autoReviewEnabled: options.autoReviewEnabled }
+          : {}),
+      ...(options.clearMemory
+        ? { memoryEnabled: null }
+        : options.memoryEnabled !== undefined
+          ? { memoryEnabled: options.memoryEnabled }
+          : {}),
+      ...(options.clearDelegation
+        ? { delegationPolicy: null }
+        : options.delegation !== undefined
+          ? { delegationPolicy: options.delegation }
+          : {}),
+      ...(options.clearSpecialist
+        ? { specialistId: null }
+        : options.specialist !== undefined
+          ? { specialistId: options.specialist }
+          : {}),
+      ...(computeHosts !== undefined
+        ? { computeHosts: options.clearComputeHosts ? null : computeHosts }
+        : {})
+    }
+    if (Object.keys(patch).length === 0) {
+      throw new CliUsageError('Project Session defaults update requires at least one field.')
+    }
+    outputValue(
+      await client.updateProjectSessionDefaults(project.id, {
+        expectedUpdatedAt: current.updatedAt,
+        patch
+      }),
+      options,
+      deps
+    )
+    return
+  }
+  if (command === 'session' && subcommand === 'status') {
+    const sessionId = positionals[0]
+    if (!sessionId) throw new CliUsageError('Session id is required.')
+    outputValue(await client.getSession(sessionId), options, deps)
+    return
+  }
+  if (command === 'session' && subcommand === 'config') {
+    const action = positionals[0]
+    const sessionId = positionals[1]
+    if (!sessionId) throw new CliUsageError('Session id is required.')
+    if (action === 'show') {
+      outputValue(await client.getSessionConfiguration(sessionId), options, deps)
+      return
+    }
+    if (action !== 'update') throw new CliUsageError('Use session config show or update.')
+    if (options.revision === undefined) throw new CliUsageError('--revision is required.')
+    const current = await client.getSessionConfiguration(sessionId)
+    const computeHosts = computeHostsPatch(options, current.persisted.computeHosts)
+    const patch = {
+      ...(agentConfigurationPatch(options)
+        ? { agentConfiguration: agentConfigurationPatch(options) }
+        : {}),
+      ...(options.approvalProfile !== undefined
+        ? { permissionProfile: options.approvalProfile }
+        : {}),
+      ...(options.autoReviewEnabled !== undefined
+        ? { autoReviewEnabled: options.autoReviewEnabled }
+        : {}),
+      ...(options.memoryEnabled !== undefined ? { memoryEnabled: options.memoryEnabled } : {}),
+      ...(options.delegation !== undefined ? { delegationPolicy: options.delegation } : {}),
+      ...(computeHosts !== undefined ? { computeHosts } : {})
+    }
+    if (Object.keys(patch).length === 0) {
+      throw new CliUsageError('Session configuration update requires at least one field.')
+    }
+    outputValue(
+      await client.updateSessionConfiguration(sessionId, {
+        expectedRevision: options.revision,
+        ...patch
+      }),
+      options,
+      deps
+    )
+    return
+  }
+  if (command === 'session' && subcommand === 'fork') {
+    const sessionId = positionals[0]
+    if (!sessionId) throw new CliUsageError('Session id is required.')
+    if (!options.project) throw new CliUsageError('--project is required.')
+    const projectId = await resolveCliProjectId(client, options.project)
+    try {
+      outputValue(
+        await client.forkSession(projectId, sessionId, { timeoutMs: options.timeoutMs }),
+        options,
+        deps
+      )
+    } catch (error) {
+      if (error?.code === 'timeout')
+        error.message +=
+          ' Fork outcome is unconfirmed. Inspect the package operation and Session list before forking again.'
+      throw error
+    }
+    return
+  }
+
+  if (command === 'session' && subcommand === 'export') {
+    const sessionId = positionals[0]
+    if (!sessionId) throw new CliUsageError('Session id is required.')
+    if (!options.project) throw new CliUsageError('--project is required.')
+    if (!options.output) throw new CliUsageError('--output is required.')
+    const projectId = await resolveCliProjectId(client, options.project)
+    outputValue(
+      await client.exportSessionPackage(projectId, sessionId, resolve(options.output), {
+        timeoutMs: options.timeoutMs
+      }),
+      options,
+      deps
+    )
+    return
+  }
+  if (command === 'session' && subcommand === 'import') {
+    const packagePath = positionals[0]
+    if (!packagePath) throw new CliUsageError('Session package path is required.')
+    const resolvedPath = resolve(packagePath)
+    const target = {}
+    if (options.project) target.projectId = await resolveCliProjectId(client, options.project)
+    else if (options.newProject) target.projectName = options.newProject
+    let imported
+    try {
+      imported = await client.importSessionPackage(
+        target,
+        resolvedPath,
+        { nonInteractive: true },
+        { timeoutMs: options.timeoutMs }
+      )
+    } catch (error) {
+      if (error?.code === 'timeout') {
+        error.completionStatus = 'unconfirmed'
+        error.message += ' The import may still complete. Check the destination before retrying.'
+      }
+      throw error
+    }
+    if (imported === null)
+      throw new OpenScienceApiError('Session import was cancelled.', { code: 'cancelled' })
+    outputValue(imported, options, deps)
+    return
+  }
+  if (command === 'settings' && subcommand === 'agent-routing') {
+    const action = positionals[0]
+    if (action === 'show') {
+      outputValue(await client.getAgentRouting(), options, deps)
+      return
+    }
+    if (action !== 'update') {
+      throw new CliUsageError('Use settings agent-routing show or update.')
+    }
+    const reviewer = modelRouting(options, 'reviewer')
+    const subagent = modelRouting(options, 'subagent')
+    const request = {
+      ...(options.framework !== undefined ? { framework: options.framework } : {}),
+      ...(reviewer ? { reviewer } : {}),
+      ...(subagent ? { subagent } : {})
+    }
+    if (Object.keys(request).length === 0) {
+      throw new CliUsageError('Agent routing update requires at least one field.')
+    }
+    outputValue(await client.updateAgentRouting(request), options, deps)
+    return
+  }
+  if (command === 'plan') {
+    const sessionId = positionals[0]
+    if (!sessionId) throw new CliUsageError('Session id is required.')
+    if (subcommand === 'show') {
+      outputValue(await client.getSessionPlan(sessionId), options, deps)
+      return
+    }
+    if (subcommand === 'approve' || subcommand === 'reject') {
+      if (!options.artifactVersion) {
+        throw new CliUsageError('--artifact-version is required.')
+      }
+      if (options.revision === undefined) {
+        throw new CliUsageError('--revision is required.')
+      }
+      outputValue(
+        await client.respondSessionPlan(sessionId, {
+          decision: subcommand === 'approve' ? 'approved' : 'rejected',
+          artifactVersionId: options.artifactVersion,
+          expectedRevision: options.revision
+        }),
+        options,
+        deps
+      )
+      return
+    }
+    if (subcommand === 'revise') {
+      if (!options.feedback?.trim()) throw new CliUsageError('--feedback is required.')
+      outputValue(
+        await client.respondSessionPlan(sessionId, { feedback: options.feedback.trim() }),
+        options,
+        deps
+      )
+      return
+    }
+  }
+  if (command === 'artifacts' && subcommand === 'list') {
+    const sessionId = positionals[0]
+    if (!sessionId) throw new CliUsageError('Session id is required.')
+    outputValue(await client.listArtifacts(sessionId), options, deps)
+    return
+  }
+  if (command === 'artifacts' && subcommand === 'download') {
+    const artifactId = positionals[0]
+    if (!artifactId) throw new CliUsageError('Artifact id is required.')
+    if (!options.output) throw new CliUsageError('--output is required.')
+    const response = await client.downloadArtifact(artifactId)
+    await deps.writeDownload(response, options.output)
+    outputValue({ artifactId, output: resolve(options.output) }, options, deps)
+    return
+  }
+  if (command === 'literature' && subcommand === 'search') {
+    const query = positionals.join(' ').trim()
+    const page = await client.searchLiterature({
+      ...(query ? { query } : {}),
+      ...(options.project ? { projectId: await resolveCliProjectId(client, options.project) } : {}),
+      ...(options.limit === undefined ? {} : { limit: options.limit }),
+      ...(options.offset === undefined ? {} : { offset: options.offset })
+    })
+    if (options.json) deps.log(JSON.stringify(page))
+    else {
+      for (const entry of page.entries)
+        deps.log(`${entry.id}\t${entry.item?.title ?? ''}`.trimEnd())
+      if (page.nextOffset !== undefined) deps.log(`More results: --offset ${page.nextOffset}`)
+    }
+    return
+  }
+  if (command === 'literature' && subcommand === 'show') {
+    const itemId = positionals[0]
+    if (!itemId) throw new CliUsageError('Literature item id is required.')
+    const item = await client.getLiteratureItem(itemId)
+    if (options.json) deps.log(JSON.stringify(item))
+    else deps.log(`${item.id}\t${item.item?.title ?? ''}`.trimEnd())
+    return
+  }
+  if (command === 'literature' && subcommand === 'styles') {
+    outputValue(await client.listCitationStyles(), options, deps)
+    return
+  }
+  if (command === 'literature' && subcommand === 'format') {
+    if (!positionals.length) throw new CliUsageError('At least one literature item id is required.')
+    if (!options.style) throw new CliUsageError('--style is required.')
+    const result = await client.formatReferences({
+      itemIds: positionals,
+      styleId: options.style,
+      locale: options.locale ?? 'en-US'
+    })
+    if (options.json) deps.log(JSON.stringify(result))
+    else for (const { reference } of result.references) deps.log(reference)
+    return
+  }
+  if (command === 'literature' && subcommand === 'lookup') {
+    const identifier = positionals[0]
+    if (!identifier)
+      throw new CliUsageError('A DOI, pmid:, pmcid: or arxiv: identifier is required.')
+    deps.log(JSON.stringify(await client.getReferenceMetadata(identifier)))
+    return
+  }
+  if (command === 'literature' && subcommand === 'import') {
+    const source = positionals[0]
+    if (!source) throw new CliUsageError('A reference file path or - for stdin is required.')
+    const content = source === '-' ? await deps.readStdin() : await deps.readFile(source)
+    if (!content.trim()) throw new CliUsageError('Reference import content is empty.')
+    const result = await client.importLiterature({
+      mode: options.commit ? 'commit' : 'preview',
+      content,
+      ...(options.duplicates ? { duplicatePolicy: options.duplicates } : {}),
+      ...(options.collection ? { collectionId: options.collection } : {}),
+      ...(options.project ? { projectId: await resolveCliProjectId(client, options.project) } : {})
+    })
+    if (options.json) deps.log(JSON.stringify(result))
+    else {
+      for (const entry of result.entries)
+        deps.log(`${entry.index}\t${entry.status}\t${entry.title}`)
+      deps.log(
+        result.imported
+          ? `Imported ${result.imported.createdCount} new and reused ${result.imported.reusedCount} existing record(s).`
+          : 'Preview only; nothing was saved. Re-run with --commit to import.'
+      )
+    }
+    return
+  }
+  if (command === 'literature' && subcommand === 'add') {
+    const identifier = positionals[0]
+    if (!identifier)
+      throw new CliUsageError('A DOI, pmid:, pmcid: or arxiv: identifier is required.')
+    outputValue(await client.createLiteratureItem(identifier), options, deps)
+    return
+  }
+  if (command === 'literature' && (subcommand === 'link' || subcommand === 'unlink')) {
+    if (!positionals.length) throw new CliUsageError('At least one literature item id is required.')
+    if (!options.project) throw new CliUsageError('--project is required.')
+    const projectId = await resolveCliProjectId(client, options.project)
+    outputValue(
+      await client.setProjectLiterature(projectId, positionals, subcommand === 'link'),
+      options,
+      deps
+    )
+    return
+  }
+  if (command === 'literature' && subcommand === 'collection') {
+    const [action, ...rest] = positionals
+    if (action === 'create') {
+      const name = rest.join(' ').trim()
+      if (!name) throw new CliUsageError('Collection name is required.')
+      outputValue(
+        await client.createLiteratureCollection({
+          name,
+          ...(options.description === undefined ? {} : { description: options.description }),
+          ...(options.parent === undefined ? {} : { parentId: options.parent })
+        }),
+        options,
+        deps
+      )
+      return
+    }
+    if (action !== 'add' && action !== 'remove')
+      throw new CliUsageError('Use literature collection create, add, or remove.')
+    const [collectionId, ...itemIds] = rest
+    if (!collectionId || !itemIds.length)
+      throw new CliUsageError('Collection id and at least one literature item id are required.')
+    outputValue(
+      await client.setCollectionLiterature(collectionId, itemIds, action === 'add'),
+      options,
+      deps
+    )
+    return
+  }
+  if (command === 'literature' && subcommand === 'status') {
+    const [readingStatus, ...itemIds] = positionals
+    if (!['unread', 'reading', 'read'].includes(readingStatus))
+      throw new CliUsageError('Reading status must be unread, reading, or read.')
+    if (!itemIds.length) throw new CliUsageError('At least one literature item id is required.')
+    outputValue(await client.setLiteratureReadingStatus(itemIds, readingStatus), options, deps)
+    return
+  }
+  if (command === 'literature' && (subcommand === 'trash' || subcommand === 'restore')) {
+    if (!positionals.length) throw new CliUsageError('At least one literature item id is required.')
+    outputValue(
+      await client.setLiteratureLifecycle(
+        positionals,
+        subcommand === 'trash' ? 'deleted' : 'active'
+      ),
+      options,
+      deps
+    )
+    return
+  }
+  if (command === 'run' && subcommand === 'status') {
+    const runId = positionals[0]
+    if (!runId && !options.requestId) throw new CliUsageError('Run id is required.')
+    outputValue(
+      options.requestId
+        ? await client.getSubmission(options.requestId)
+        : await client.getRun(runId),
+      options,
+      deps
+    )
+    return
+  }
+  if (command === 'run' && subcommand === 'cancel') {
+    const runId = positionals[0]
+    if (!runId) throw new CliUsageError('Run id is required.')
+    outputValue(await client.cancelRun(runId), options, deps)
+    return
+  }
+  if (command === 'run') {
+    const waiting = subcommand === 'wait'
+    if (waiting && !positionals[0] && !options.requestId)
+      throw new CliUsageError('Run id or --request-id is required.')
+    if (!waiting && !options.project) throw new CliUsageError('--project is required.')
+    const projectId = waiting ? undefined : await resolveCliProjectId(client, options.project)
+    const prompt = waiting ? undefined : await readPrompt(options, deps)
+    if (!waiting && !prompt) throw new CliUsageError('Prompt is required.')
+    const requestId = options.requestId ?? (waiting ? undefined : randomUUID())
+    const waitStartedAt = Date.now()
+    const remainingTimeout = () => {
+      if (options.timeoutMs === undefined) return undefined
+      const remaining = options.timeoutMs - (Date.now() - waitStartedAt)
+      if (remaining <= 0)
+        throw new OpenScienceApiError('Timed out waiting for the Run.', { code: 'timeout' })
+      return remaining
+    }
+    const runRef = { current: undefined, pending: [] }
+    const abortController = new AbortController()
+    let eventStream
+    // The event stream only renders progress; waitForRun remains authoritative for the final Run
+    // state, so a mid-run stream failure must not fail an otherwise-successful command.
+    const warnEventFailure = (error) => {
+      const message = error instanceof Error ? error.message : String(error)
+      if (options.jsonl)
+        deps.warn(JSON.stringify({ warning: { code: 'event_stream_stopped', message } }))
+      else
+        deps.warn(
+          `Run event stream stopped: ${message} Final Run state will still be read from Open-Science.`
+        )
+    }
+    let eventTask
+    let submissionAttempted = false
+    let result
+    try {
+      eventStream =
+        options.wait && !options.json && typeof client.events === 'function'
+          ? client.events({ signal: abortController.signal })
+          : undefined
+      let readyTimer
+      try {
+        await (eventStream && options.timeoutMs !== undefined
+          ? Promise.race([
+              eventStream.ready,
+              new Promise((_, reject) => {
+                readyTimer = setTimeout(
+                  () =>
+                    reject(
+                      new OpenScienceApiError('Timed out waiting for the Run event stream.', {
+                        code: 'timeout'
+                      })
+                    ),
+                  remainingTimeout()
+                )
+              })
+            ])
+          : eventStream?.ready)
+      } finally {
+        clearTimeout(readyTimer)
+      }
+      eventTask = eventStream
+        ? streamRunEvents(eventStream, runRef, options, deps, abortController.signal).catch(
+            (error) => {
+              if (!abortController.signal.aborted) warnEventFailure(error)
+            }
+          )
+        : undefined
+      submissionAttempted = !waiting
+      const started = waiting
+        ? requestId
+          ? await client.waitForSubmission(requestId, { timeoutMs: remainingTimeout() })
+          : await client.getRun(
+              positionals[0],
+              options.timeoutMs === undefined ? undefined : { timeoutMs: remainingTimeout() }
+            )
+        : await client.startRun(
+            {
+              project: projectId,
+              prompt,
+              ...(options.cwd ? { cwd: resolve(options.cwd) } : {}),
+              ...(options.session ? { sessionId: options.session } : {}),
+              ...(options.approvalProfile ? { permissionProfile: options.approvalProfile } : {}),
+              ...(options.skills?.length ? { skillIds: options.skills } : {}),
+              ...(options.permissionPrompts
+                ? { permissionPrompts: options.permissionPrompts }
+                : {}),
+              ...(options.planFirst ? { turnIntent: 'plan-first' } : {}),
+              ...(options.autoReviewEnabled !== undefined
+                ? { autoReviewEnabled: options.autoReviewEnabled }
+                : {}),
+              ...(options.specialist ? { specialist: options.specialist } : {}),
+              ...(options.delegation ? { delegationPolicy: options.delegation } : {}),
+              ...(agentConfigurationPatch(options)
+                ? { agentConfiguration: agentConfigurationPatch(options) }
+                : {}),
+              ...(options.memoryEnabled !== undefined
+                ? { memoryEnabled: options.memoryEnabled }
+                : {}),
+              ...(options.clearComputeHosts
+                ? { enabledComputeHostIds: [], computeHostIds: [] }
+                : {
+                    ...(options.enabledComputeHosts !== undefined
+                      ? { enabledComputeHostIds: options.enabledComputeHosts }
+                      : {}),
+                    ...(options.computeHosts !== undefined
+                      ? { computeHostIds: options.computeHosts }
+                      : {})
+                  })
+            },
+            {
+              requestId,
+              ...(options.timeoutMs === undefined ? {} : { timeoutMs: remainingTimeout() })
+            }
+          )
+      runRef.current = { runId: started.id, sessionId: started.sessionId }
+      for (const event of runRef.pending.splice(0)) {
+        if (isEventForRun(event, runRef.current)) emitRunEvent(event, options, deps)
+      }
+      try {
+        const waitOptions = {
+          ...(options.timeoutMs === undefined ? {} : { timeoutMs: remainingTimeout() }),
+          ...(options.returnOnAttention ? { returnOnAttention: true } : {})
+        }
+        result = options.wait
+          ? Object.keys(waitOptions).length === 0
+            ? await client.waitForRun(started.id)
+            : await client.waitForRun(started.id, waitOptions)
+          : started
+      } catch (error) {
+        if (options.cancelOnTimeout && error?.code === 'timeout') {
+          try {
+            await client.cancelRun(started.id)
+          } catch (cancelError) {
+            if (error instanceof Error) {
+              if (error.cause === undefined) error.cause = cancelError
+              const cancelMessage =
+                cancelError instanceof Error ? cancelError.message : String(cancelError)
+              error.message = `${error.message} Server run cancellation also failed: ${cancelMessage}`
+            }
+          }
+        }
+        throw error
+      }
+    } catch (error) {
+      if (error && typeof error === 'object' && requestId) {
+        error.requestId = requestId
+        error.message += ` Request: ${requestId}. Query: open-science run status --request-id ${requestId}.`
+      }
+      if (
+        error &&
+        typeof error === 'object' &&
+        ((runRef.current && options.wait) ||
+          (submissionAttempted &&
+            (['daemon_unavailable', 'timeout'].includes(error.code) ||
+              error instanceof SyntaxError ||
+              (error instanceof TypeError && error.message === 'fetch failed') ||
+              ['ECONNRESET', 'ECONNREFUSED', 'EPIPE', 'UND_ERR_SOCKET'].includes(
+                error.cause?.code
+              ))))
+      ) {
+        error.completionStatus = runRef.current ? 'unconfirmed' : 'submission-unconfirmed'
+        if (runRef.current) error.runId = runRef.current.runId
+        error.message += runRef.current
+          ? ` Completion status unconfirmed for run ${runRef.current.runId}. Query: open-science run status ${runRef.current.runId}. The run was not retried.`
+          : ' Submission result unconfirmed. Query the request receipt before retrying; the request was not retried.'
+      }
+      throw error
+    } finally {
+      abortController.abort()
+      // Progress transports are advisory. An iterator ignoring abort must not trap CLI exit.
+      let timer
+      try {
+        await Promise.race([
+          Promise.resolve(eventTask)
+            .then(() => eventStream?.return?.())
+            .catch(warnEventFailure),
+          new Promise((resolve) => {
+            timer = setTimeout(resolve, 1000)
+          })
+        ])
+      } finally {
+        clearTimeout(timer)
+      }
+    }
+    if (!options.wait && !['completed', 'failed', 'cancelled'].includes(result.status)) {
+      result = {
+        ...result,
+        submissionStatus: 'submitted-not-completed',
+        notice: 'Submitted, not completed. Exiting the App may interrupt this work.',
+        next: ['run', 'status', result.id]
+      }
+    }
+    if (options.json || options.jsonl) outputValue(result, options, deps)
+    else if (result.status === 'completed') deps.log(result.output || `Run completed: ${result.id}`)
+    else if (result.status === 'failed') deps.log(`Run failed: ${result.error ?? result.id}`)
+    else if (result.status === 'cancelled') deps.log(`Run cancelled: ${result.id}`)
+    else if (result.attention?.kind === 'plan-approval') {
+      const plan = result.attention.plan
+      deps.log(
+        `Run is waiting for Plan approval: open-science plan approve ${result.sessionId} --artifact-version ${plan.artifactVersionId} --revision ${plan.revision}`
+      )
+      if (!options.wait)
+        deps.log(
+          `Submitted, not completed: ${result.id}. Exiting the App may interrupt this work. Query: open-science run status ${result.id}`
+        )
+    } else
+      deps.log(
+        `Submitted, not completed: ${result.id} (session ${result.sessionId}). Exiting the App may interrupt this work. Query: open-science run status ${result.id}`
+      )
+    if (['failed', 'cancelled'].includes(result.status)) deps.setExitCode(1)
+    return
+  }
+
+  throw new CliUsageError(`Unknown command: ${[command, subcommand].filter(Boolean).join(' ')}`)
+}
+
+export const reportCliError = (error, argv = process.argv.slice(2), dependencies = {}) => {
+  const deps = {
+    error: (...args) => console.error(...args),
+    setExitCode: (code) => {
+      process.exitCode = code
+    },
+    ...dependencies
+  }
+  const code = error?.code ?? 'command_failed'
+  const message = error instanceof Error ? error.message : String(error)
+  const exitCode =
+    error?.exitCode ??
+    (code === 'daemon_unavailable'
+      ? 3
+      : [
+            'project_not_found',
+            'session_not_found',
+            'run_not_found',
+            'artifact_not_found',
+            'literature_item_not_found'
+          ].includes(code) || code === 'specialist_not_found'
+        ? 4
+        : 1)
+  if (argv.includes('--json') || argv.includes('--jsonl')) {
+    deps.error(
+      JSON.stringify({
+        error: {
+          code,
+          message,
+          ...(error?.correlationId ? { correlationId: error.correlationId } : {}),
+          ...(error?.requestId ? { requestId: error.requestId } : {}),
+          ...(error?.completionStatus ? { completionStatus: error.completionStatus } : {}),
+          ...(error?.runId ? { runId: error.runId } : {}),
+          ...(error?.code === 'startup_unconfirmed'
+            ? {
+                configRoot: error.configRoot,
+                launcherPid: error.launcherPid,
+                logPath: error.logPath,
+                next: error.next
+              }
+            : {})
+        },
+        exitCode
+      })
+    )
+  } else {
+    deps.error(message)
+  }
+  deps.setExitCode(exitCode)
+  return exitCode
+}
+
+const commandHelp = (command) => {
+  if (!command || command === '-h' || command === '--help') return usage
+  // Reuse the published command inventory rather than maintaining a second list.
+  const commands = usage
+    .split('Commands:\n')[1]
+    .split('\n\nOptions:')[0]
+    .split('\n')
+    .filter((line) => line.trimStart().startsWith(`${command} `))
+  if (!commands.length) throw new CliUsageError(`Unknown command: ${command}`)
+  return `Usage: open-science ${command}${GROUP_COMMANDS.has(command) ? ' <subcommand>' : ''} [options]
+
+Commands:
+${commands.join('\n')}
+
+Run "open-science --help" for the complete option reference.`
+}
+
+const readCliMetadata = async () => {
+  const here = dirname(fileURLToPath(import.meta.url))
+  // Source SDK metadata has its own version; installed CLI manifests carry the release version.
+  const development =
+    basename(here) === 'open-science' &&
+    basename(dirname(here)) === 'packages' &&
+    existsSync(join(here, '../../src/main/node-entry.ts'))
+  const manifestPath = join(development ? join(here, '../..') : here, 'package.json')
+  const manifest = JSON.parse(await readFile(manifestPath, 'utf8'))
+  if (
+    manifest.name !== (development ? 'open-science' : '@aipoch/open-science') ||
+    typeof manifest.version !== 'string' ||
+    !/^\d+\.\d+\.\d+(?:-[\da-zA-Z.-]+)?(?:\+[\da-zA-Z.-]+)?$/.test(manifest.version)
+  ) {
+    throw new Error(`Invalid Open-Science CLI metadata: ${manifestPath}`)
+  }
+  return { version: manifest.version, development }
+}
+
+const pathsCommand = async (options) => {
+  const { development } = await readCliMetadata()
+  const paths = {
+    cliPath: fileURLToPath(import.meta.url),
+    nodePath: process.execPath,
+    startupConfigRoot: resolveConfigRoot({
+      packaged: !development,
+      override: options.configRoot
+    }),
+    discoveryConfigRoots: candidateConfigRoots({ override: options.configRoot })
+  }
+  console.log(
+    options.json
+      ? JSON.stringify(paths)
+      : `CLI: ${paths.cliPath}\nNode: ${paths.nodePath}\nStartup configuration: ${paths.startupConfigRoot}\nService discovery (in order):\n${paths.discoveryConfigRoots.map((root) => `  ${root}`).join('\n')}`
+  )
+}
+
+export const runCli = async (argv = process.argv.slice(2)) => {
+  const parsed = parseCliArgs(argv)
+  const { command, options } = parsed
+  if (options.help || !command || command === 'help' || command === '-h' || command === '--help') {
+    console.log(commandHelp(command === 'help' ? parsed.positionals?.[0] : command))
+    return
+  }
+  if (command === 'version') {
+    const { version } = await readCliMetadata()
+    console.log(options.json ? JSON.stringify({ version }) : version)
+  } else if (command === 'paths') await pathsCommand(options)
+  else if (command === 'mcp') {
+    const { runResearchMcpServer } = await import('./mcp.mjs')
+    const { version } = await readCliMetadata()
+    await runResearchMcpServer({ configRoot: options.configRoot, version })
+  } else if (command === 'init') await initCommand(options)
+  else if (command === 'start') await startCommand(options)
+  else if (command === 'stop') await stopCommand(options)
+  else if (command === 'status') await statusCommand(options)
+  else if (command === 'url') await urlCommand(options)
+  else if (command === 'codex' && parsed.subcommand === 'login') await codexLoginCommand(options)
+  else if (TASK_COMMANDS.has(command)) await runTaskCommand(parsed)
+  else throw new CliUsageError(`Unknown command: ${command}\n\n${usage}`)
+}
+
+const isEntryPoint =
+  process.argv[1] &&
+  existsSync(process.argv[1]) &&
+  realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url))
+if (isEntryPoint) {
+  runCli().catch((error) => reportCliError(error))
+}

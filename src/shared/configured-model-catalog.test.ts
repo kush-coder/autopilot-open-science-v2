@@ -1,0 +1,292 @@
+import { describe, expect, it } from 'vitest'
+
+import {
+  CLAUDE_ISOLATED_PROVIDER_ID,
+  CLAUDE_SHARED_PROVIDER_ID,
+  type ProviderView
+} from './settings'
+import {
+  buildConfiguredModelCatalog,
+  configuredModelKey,
+  parseConfiguredModelKey
+} from './configured-model-catalog'
+
+const provider = (
+  id: string,
+  models: string[],
+  overrides: Partial<ProviderView> = {}
+): ProviderView => ({
+  id,
+  type: 'custom',
+  name: id,
+  apiEndpoints: ['chat-completions'],
+  baseUrl: 'https://example.test/v1',
+  model: models[0],
+  models,
+  supportsImageInput: false,
+  hasKey: true,
+  needsKey: false,
+  lastValidatedAt: 10,
+  ...overrides
+})
+
+describe('configured model catalog', () => {
+  it('uses native recovery evidence only for its tested framework in model selectors', () => {
+    const recovered = provider('gateway', ['model'], {
+      apiEndpoints: ['messages'],
+      lastValidationFailure: {
+        at: 10,
+        category: 'model-not-found',
+        target: { model: 'model', endpoint: 'messages' }
+      },
+      lastValidatedAt: 20,
+      lastValidatedTarget: {
+        model: 'model',
+        endpoint: 'messages',
+        frameworkId: 'claude-code',
+        route: 'claude-anthropic'
+      }
+    })
+    const catalog = (
+      frameworkId: 'claude-code' | 'opencode'
+    ): ReturnType<typeof buildConfiguredModelCatalog> =>
+      buildConfiguredModelCatalog({
+        providers: [recovered],
+        frameworkId,
+        frameworkEndpoints: ['messages']
+      })
+    expect(catalog('claude-code')).toMatchObject([{ model: 'model', selectable: true }])
+    expect(catalog('opencode')).toEqual([])
+  })
+
+  it.each([
+    { type: 'codex-shared', codexAuthMode: undefined },
+    { type: 'codex-isolated', codexAuthMode: 'imported' },
+    { type: 'codex-isolated', codexAuthMode: 'isolated' }
+  ] as const)('offers $type/$codexAuthMode in primary and fixed-model catalogs', (auth) => {
+    const entries = buildConfiguredModelCatalog({
+      providers: [
+        provider('builtin-codex-subscription', ['gpt-5.5'], {
+          ...auth,
+          apiEndpoints: [],
+          hasKey: false
+        })
+      ],
+      frameworkId: 'open-science-agent',
+      frameworkEndpoints: ['responses', 'chat-completions', 'messages']
+    })
+    expect(entries).toHaveLength(1)
+    expect(entries[0]).toMatchObject({
+      providerId: 'builtin-codex-subscription',
+      model: 'gpt-5.5',
+      selectable: true,
+      supportsImageInput: true
+    })
+  })
+
+  it('keeps same-named models distinct by compound provider identity', () => {
+    const entries = buildConfiguredModelCatalog({
+      providers: [provider('first', ['shared']), provider('second', ['shared'])],
+      frameworkId: 'opencode',
+      frameworkEndpoints: ['chat-completions']
+    })
+
+    expect(entries.map((entry) => entry.key)).toEqual([
+      configuredModelKey('first', 'shared'),
+      configuredModelKey('second', 'shared')
+    ])
+    expect(parseConfiguredModelKey(entries[1].key)).toEqual({
+      providerId: 'second',
+      model: 'shared'
+    })
+  })
+
+  it('owns validation and framework compatibility for every model selector', () => {
+    const entries = buildConfiguredModelCatalog({
+      providers: [
+        provider('failed', ['a'], { lastValidationFailure: { at: 11, category: 'auth' } }),
+        provider('incompatible', ['b'], { apiEndpoints: ['messages'] }),
+        provider('ready', ['c'])
+      ],
+      frameworkId: 'opencode',
+      frameworkEndpoints: ['chat-completions']
+    })
+
+    expect(
+      entries.map((entry) => [entry.providerId, entry.selectable, entry.unavailableReason])
+    ).toEqual([
+      ['incompatible', false, 'framework-incompatible'],
+      ['ready', true, undefined]
+    ])
+  })
+
+  it('grays out a verified local model instead of hiding it when the framework cannot drive it', () => {
+    // The framework-agnostic probe records its target against the provider's own route, so a
+    // verified-but-incompatible entry must stay in the catalog (grayed, with its reason) rather
+    // than being filtered out as unvalidated.
+    const entries = buildConfiguredModelCatalog({
+      providers: [
+        provider('ollama', ['qwen3:14b'], {
+          lastValidatedAt: 20,
+          lastValidatedTarget: { model: 'qwen3:14b', endpoint: 'chat-completions' }
+        })
+      ],
+      frameworkId: 'claude-code',
+      frameworkEndpoints: ['messages']
+    })
+
+    expect(
+      entries.map((entry) => [
+        entry.providerId,
+        entry.model,
+        entry.selectable,
+        entry.unavailableReason
+      ])
+    ).toEqual([['ollama', 'qwen3:14b', false, 'framework-incompatible']])
+  })
+
+  it('excludes only the model target whose validation reported it missing', () => {
+    const failedTargetProvider = provider('multi-model', ['model-a', 'model-b'], {
+      lastValidationFailure: {
+        at: 11,
+        category: 'model-not-found',
+        target: { model: 'model-b', endpoint: 'chat-completions' }
+      }
+    } as Partial<ProviderView>)
+
+    const entries = buildConfiguredModelCatalog({
+      providers: [failedTargetProvider],
+      frameworkId: 'opencode',
+      frameworkEndpoints: ['chat-completions']
+    })
+
+    expect(entries.map((entry) => entry.model)).toEqual(['model-a'])
+  })
+
+  it('checks each official model against its documented protocol', () => {
+    const entries = buildConfiguredModelCatalog({
+      providers: [
+        provider('opencode-zen', ['kimi-k2.7-code', 'gpt-5.6-sol', 'claude-opus-5'], {
+          type: 'official',
+          vendorId: 'opencode'
+        })
+      ],
+      frameworkId: 'opencode',
+      frameworkEndpoints: ['chat-completions', 'messages']
+    })
+
+    expect(
+      entries.map(({ model, selectable, unavailableReason }) => [
+        model,
+        selectable,
+        unavailableReason
+      ])
+    ).toEqual([
+      ['kimi-k2.7-code', true, undefined],
+      ['gpt-5.6-sol', false, 'framework-incompatible'],
+      ['claude-opus-5', true, undefined]
+    ])
+  })
+
+  it.each([
+    { frameworkId: 'claude-code', frameworkEndpoints: ['messages'] },
+    { frameworkId: 'opencode', frameworkEndpoints: ['chat-completions', 'messages'] },
+    { frameworkId: 'codex', frameworkEndpoints: ['responses'] }
+  ] as const)('offers the new Ark vision models to $frameworkId', (framework) => {
+    const models = [
+      'doubao-seed-2-1-pro-260915',
+      'deepseek-v4-1-flash-260910',
+      'glm-5-3-flash-260828'
+    ]
+    const entries = buildConfiguredModelCatalog({
+      providers: [provider('ark', models, { type: 'official', vendorId: 'volcengine' })],
+      ...framework
+    })
+    expect(
+      entries.map(({ model, selectable, supportsImageInput }) => ({
+        model,
+        selectable,
+        supportsImageInput
+      }))
+    ).toEqual(models.map((model) => ({ model, selectable: true, supportsImageInput: true })))
+  })
+
+  it('projects xAI subscription models as image-capable', () => {
+    const [entry] = buildConfiguredModelCatalog({
+      providers: [
+        provider('builtin-xai-subscription', ['grok-4.6'], {
+          type: 'xai-subscription',
+          apiEndpoints: ['messages', 'chat-completions', 'responses'],
+          supportsImageInput: true
+        })
+      ],
+      frameworkId: 'opencode',
+      frameworkEndpoints: ['chat-completions']
+    })
+
+    expect(entry.supportsImageInput).toBe(true)
+  })
+
+  it('uses a custom provider singular model when its catalog array is empty', () => {
+    const entries = buildConfiguredModelCatalog({
+      providers: [provider('custom', [], { model: 'custom-model' })],
+      activeProviderId: 'custom',
+      frameworkId: 'opencode',
+      frameworkEndpoints: ['chat-completions']
+    })
+
+    expect(entries).toMatchObject([
+      { providerId: 'custom', model: 'custom-model', label: 'custom-model', selectable: true }
+    ])
+  })
+
+  it('includes every Claude subscription only for Session catalogs', () => {
+    const providers = [
+      provider(CLAUDE_SHARED_PROVIDER_ID, ['shared-model'], {
+        type: 'claude-shared',
+        apiEndpoints: ['messages']
+      }),
+      provider(CLAUDE_ISOLATED_PROVIDER_ID, ['isolated-model'], {
+        type: 'claude-isolated',
+        apiEndpoints: ['messages']
+      })
+    ]
+    const input = {
+      providers,
+      activeProviderId: CLAUDE_SHARED_PROVIDER_ID,
+      frameworkId: 'claude-code' as const,
+      frameworkEndpoints: ['messages' as const]
+    }
+
+    expect(buildConfiguredModelCatalog(input).map((entry) => entry.providerId)).toEqual([
+      CLAUDE_SHARED_PROVIDER_ID
+    ])
+    expect(
+      buildConfiguredModelCatalog({
+        ...input,
+        includeAllClaudeSubscriptions: true
+      }).map((entry) => entry.providerId)
+    ).toEqual([CLAUDE_SHARED_PROVIDER_ID, CLAUDE_ISOLATED_PROVIDER_ID])
+  })
+})
+
+it('keeps a native-only Codex subscription selectable only for native Codex', () => {
+  const provider = {
+    id: 'subscription',
+    name: 'Codex subscription',
+    type: 'codex-isolated' as const,
+    codexHarnessAvailable: false,
+    supportsImageInput: true,
+    models: ['gpt-6.1-sol'],
+    hasKey: false,
+    needsKey: false
+  }
+  for (const frameworkId of ['codex', 'open-science-agent'] as const) {
+    const catalog = buildConfiguredModelCatalog({
+      providers: [provider],
+      frameworkId,
+      frameworkEndpoints: ['responses']
+    })
+    expect(catalog[0].selectable).toBe(frameworkId === 'codex')
+  }
+})

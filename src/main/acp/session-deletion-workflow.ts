@@ -1,0 +1,291 @@
+import * as acp from '@agentclientprotocol/sdk'
+import type { ClientConnection } from '@agentclientprotocol/sdk'
+import { randomUUID } from 'node:crypto'
+import { createLogger, diagnosticErrorFields } from '@aipoch/diagnostics/node'
+
+import type { AcpRuntimeEventInput, AcpStateSnapshot } from '../../shared/acp'
+import type { AcpAppContinuationOwner } from './app-continuation-owner'
+import type { ContextUsageTracker } from './context-usage-tracker'
+import type { AcpElicitationOwner } from './elicitation-owner'
+import type { AcpHandoffContinuityOwner } from './handoff-continuity-owner'
+import type { AcpPermissionContext } from './permission-context'
+import type { AcpPromptContentOwner } from './prompt-content-owner'
+import type { AcpSessionCapabilityOwner } from './session-capability-owner'
+import type { AcpSessionInteractionOwner } from './session-interaction-owner'
+import type { AcpSessionRegistry, AcpSessionRegistryEntry } from './session-registry'
+import type { AcpSessionUpdateProjector } from './session-update-projector'
+
+type SessionDeletedEvent = AcpRuntimeEventInput
+type OperationLease = <Result>(work: () => Promise<Result>) => Promise<Result>
+
+const log = createLogger('acp-session-deletion')
+const DEFAULT_PROVIDER_DELETE_TIMEOUT_MS = 5_000
+
+type DeletionStage = (stage: string) => void
+
+const reportDeletion = (data: Readonly<Record<string, unknown>>, error?: unknown): void => {
+  try {
+    if (error !== undefined)
+      log.warn('session deletion failed', { ...data, ...diagnosticErrorFields(error) })
+    else log.info('session deletion phase', data)
+  } catch {
+    // Logging must not interrupt provider cleanup or hide its original failure.
+  }
+}
+
+class AcpProviderSessionDeletionTimeoutError extends Error {
+  constructor() {
+    super('ACP provider Session deletion timed out.')
+    this.name = 'AcpProviderSessionDeletionTimeoutError'
+  }
+}
+
+type AcpSessionDeletionWorkflowDependencies = Readonly<{
+  registry: Pick<AcpSessionRegistry, 'beginDelete' | 'lookup' | 'detach'>
+  withOperation: OperationLease
+  currentConnection: () => ClientConnection | undefined
+  currentGeneration: () => number
+  supportsSessionDelete: () => boolean
+  supportsSessionClose: () => boolean
+  permission: Pick<AcpPermissionContext, 'cancelForSession' | 'clearSession'>
+  elicitation: Pick<AcpElicitationOwner, 'cancelForSession'>
+  clearUserChoiceProvenanceForSession: (sessionId: string) => void
+  appContinuations: Pick<AcpAppContinuationOwner, 'delete'>
+  interactions: Pick<AcpSessionInteractionOwner, 'supersedeCurrent'>
+  capabilities: Pick<AcpSessionCapabilityOwner, 'revokeSession'> &
+    Partial<Pick<AcpSessionCapabilityOwner, 'forgetSetupSession'>>
+  promptContent: Pick<AcpPromptContentOwner, 'resetSession'>
+  releasePromptResourcesForSession: (sessionId: string) => void
+  handoff: Pick<AcpHandoffContinuityOwner, 'clearSession'>
+  contextUsage: Pick<ContextUsageTracker, 'deleteSession'>
+  projector: Pick<AcpSessionUpdateProjector, 'clearSession'>
+  pushEvent: (event: SessionDeletedEvent) => void
+  emitState: () => void
+  getSnapshot: () => AcpStateSnapshot
+}>
+
+// Statelessly sequences provider teardown and app-keyed cleanup. The Registry owns identity,
+// deletion epochs, and selection; each injected owner cleans only the state it created.
+class AcpSessionDeletionWorkflow {
+  constructor(private readonly deps: AcpSessionDeletionWorkflowDependencies) {}
+
+  captureResumeCleanup(appSessionId: string, providerSessionId?: string): () => Promise<void> {
+    const attachment = this.deps.registry.lookup(appSessionId)?.attachment
+    let operation: Promise<void> | undefined
+    return () => {
+      if (operation) return operation
+      operation = this.deps
+        .withOperation(async () => {
+          if (
+            !attachment ||
+            attachment.providerSessionId !== providerSessionId ||
+            this.deps.registry.lookup(appSessionId)?.attachment !== attachment
+          )
+            return
+          const connection = this.deps.currentConnection()
+          if (connection && this.deps.supportsSessionClose()) {
+            await this.requestProviderDeletion(
+              connection,
+              acp.methods.agent.session.close,
+              providerSessionId
+            )
+          } else {
+            await connection?.agent.notify(acp.methods.agent.session.cancel, {
+              sessionId: providerSessionId
+            })
+          }
+          // Never delete provider history or durable setup authority for an unaccepted resume.
+          if (this.deps.registry.lookup(appSessionId)?.attachment !== attachment) return
+          this.deps.permission.cancelForSession(appSessionId)
+          this.deps.elicitation.cancelForSession(appSessionId)
+          this.deps.clearUserChoiceProvenanceForSession(appSessionId)
+          this.deps.appContinuations.delete(appSessionId)
+          this.deps.permission.clearSession(appSessionId)
+          this.deps.interactions.supersedeCurrent(appSessionId)
+          this.deps.capabilities.revokeSession(appSessionId)
+          this.deps.registry.detach(attachment, 'connection')
+          attachment.session.dispose()
+          this.deps.promptContent.resetSession(appSessionId)
+          this.deps.releasePromptResourcesForSession(appSessionId)
+          this.deps.handoff.clearSession(appSessionId)
+          this.deps.contextUsage.deleteSession(appSessionId)
+          this.deps.projector.clearSession(appSessionId)
+          this.deps.emitState()
+        })
+        .catch((error) => {
+          operation = undefined
+          throw error
+        })
+      return operation
+    }
+  }
+
+  async delete(appSessionId: string): Promise<AcpStateSnapshot> {
+    // Hold the deletion epoch through active-transition waits and protected provider cleanup.
+    const deletion = this.deps.registry.beginDelete(appSessionId)
+    const operationId = randomUUID()
+    const started = Date.now()
+    let phase = 'started'
+    const reportStage: DeletionStage = (stage) => {
+      phase = stage
+      reportDeletion({
+        operationId,
+        sessionId: appSessionId,
+        generation: this.deps.currentGeneration(),
+        phase,
+        elapsedMs: Date.now() - started
+      })
+    }
+    reportStage('started')
+    try {
+      const snapshot = await this.deps.withOperation(() => {
+        reportStage('cleanup-admitted')
+        return this.deleteWithLease(appSessionId, deletion, reportStage)
+      })
+      reportStage('completed')
+      return snapshot
+    } catch (error) {
+      reportDeletion(
+        { operationId, sessionId: appSessionId, phase, elapsedMs: Date.now() - started },
+        error
+      )
+      throw error
+    } finally {
+      deletion.finish()
+    }
+  }
+
+  private async deleteWithLease(
+    appSessionId: string,
+    deletion: ReturnType<AcpSessionRegistry['beginDelete']>,
+    reportStage: DeletionStage
+  ): Promise<AcpStateSnapshot> {
+    const generation = this.deps.currentGeneration()
+    const target = this.deps.registry.lookup(appSessionId)
+    const attachment = target?.attachment
+
+    this.deps.permission.cancelForSession(appSessionId)
+    this.deps.clearUserChoiceProvenanceForSession(appSessionId)
+    this.deps.elicitation.cancelForSession(appSessionId)
+    this.deps.appContinuations.delete(appSessionId)
+    reportStage('target-interactions-cancelled')
+    if (generation !== this.deps.currentGeneration()) {
+      throw new Error('ACP Session deletion connection was superseded.')
+    }
+    if (attachment) {
+      reportStage('provider-request-started')
+      await this.deleteProviderSession(attachment.session.sessionId)
+      reportStage('provider-request-completed')
+    }
+
+    if (attachment) {
+      attachment.session.dispose()
+      this.deps.registry.detach(attachment, 'provider')
+    }
+
+    // Forget durable setup authority only after provider deletion and a proven app identity. Recheck
+    // after the durable write so a stale captured generation cannot erase replacement-owned state.
+    if (!this.stillOwnsTarget(appSessionId, target)) {
+      deletion.finish(target)
+      return this.deps.getSnapshot()
+    }
+    reportStage('setup-authority-cleanup')
+    await this.deps.capabilities.forgetSetupSession?.(appSessionId)
+    // No await occurs between this ownership check and local cleanup. A stale captured generation
+    // may dispose its own provider object, but cannot erase app-keyed state owned by a replacement.
+    if (!this.stillOwnsTarget(appSessionId, target)) {
+      deletion.finish(target)
+      return this.deps.getSnapshot()
+    }
+
+    this.deps.permission.clearSession(appSessionId)
+    this.deps.interactions.supersedeCurrent(appSessionId)
+    this.deps.capabilities.revokeSession(appSessionId)
+    const removal = deletion.finish(target)
+    this.deps.promptContent.resetSession(appSessionId)
+    this.deps.releasePromptResourcesForSession(appSessionId)
+    this.deps.handoff.clearSession(appSessionId)
+    this.deps.contextUsage.deleteSession(appSessionId)
+    this.deps.projector.clearSession(appSessionId)
+
+    reportStage('runtime-cleanup-completed')
+    if (removal.wasActive) {
+      this.deps.pushEvent({
+        kind: 'system',
+        level: 'info',
+        sessionId: appSessionId,
+        title: 'Session deleted'
+      })
+      this.deps.emitState()
+    }
+
+    return this.deps.getSnapshot()
+  }
+
+  private async deleteProviderSession(providerSessionId: string): Promise<void> {
+    const connection = this.deps.currentConnection()
+    const generation = this.deps.currentGeneration()
+    if (connection && this.deps.supportsSessionDelete()) {
+      await this.requestProviderDeletion(
+        connection,
+        acp.methods.agent.session.delete,
+        providerSessionId
+      )
+    } else if (connection && this.deps.supportsSessionClose()) {
+      await this.requestProviderDeletion(
+        connection,
+        acp.methods.agent.session.close,
+        providerSessionId
+      )
+    } else {
+      await connection?.agent.notify(acp.methods.agent.session.cancel, {
+        sessionId: providerSessionId
+      })
+    }
+    if (
+      generation !== this.deps.currentGeneration() ||
+      connection !== this.deps.currentConnection()
+    ) {
+      throw new Error('ACP Session deletion connection was superseded.')
+    }
+  }
+
+  private async requestProviderDeletion(
+    connection: ClientConnection,
+    method: typeof acp.methods.agent.session.delete | typeof acp.methods.agent.session.close,
+    providerSessionId: string
+  ): Promise<void> {
+    const cancellation = new AbortController()
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const timeout = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => {
+        const error = new AcpProviderSessionDeletionTimeoutError()
+        cancellation.abort(error)
+        reject(error)
+      }, DEFAULT_PROVIDER_DELETE_TIMEOUT_MS)
+    })
+    try {
+      await Promise.race([
+        connection.agent.request(
+          method,
+          { sessionId: providerSessionId },
+          { cancellationSignal: cancellation.signal }
+        ),
+        timeout
+      ])
+    } finally {
+      if (timer) clearTimeout(timer)
+    }
+  }
+
+  private stillOwnsTarget(
+    appSessionId: string,
+    target: AcpSessionRegistryEntry | undefined
+  ): boolean {
+    const current = this.deps.registry.lookup(appSessionId)
+    return target ? current?.generation === target.generation : current === undefined
+  }
+}
+
+export { AcpSessionDeletionWorkflow }
+export type { AcpSessionDeletionWorkflowDependencies }

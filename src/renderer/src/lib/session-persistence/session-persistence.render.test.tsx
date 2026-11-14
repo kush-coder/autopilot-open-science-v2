@@ -1,0 +1,2332 @@
+// @vitest-environment jsdom
+import type { AcpRuntimeEvent } from '../../../../shared/acp'
+import {
+  DesktopRuntimeDisconnectedError,
+  DesktopRuntimeWriteNotSubmittedError
+} from '../../../../shared/desktop-runtime-recovery'
+import { useWorkspaceOperationErrors } from '../acp/workspace-operation-error'
+import { resetSessionConversationIntentsForTests } from '../../stores/session-conversation-intents'
+import { act } from 'react'
+import {
+  useDesktopRuntimeRecoveryStore,
+  waitForDesktopSessionRecovery
+} from '@/stores/desktop-runtime-recovery-store'
+import { createRoot, type Root } from 'react-dom/client'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+
+import {
+  SESSION_MANIFEST_VERSION,
+  materializeSessionConversationGraph,
+  setTurnOutcome,
+  resolveTurnOutcome,
+  type LoadAllSessionsResult,
+  type PersistedChatSession,
+  type SessionSummary
+} from '../../../../shared/session-persistence'
+import { i18next } from '@/i18n'
+import { resolveSessionRecoveryPresentation } from '../../pages/workspace/workspace-session-recovery'
+import { preserveImportedSession } from '../../../../main/session-persistence/imported-session'
+import {
+  createLinearConversationGraph,
+  forkEditedConversationMessage
+} from '../../../../shared/conversation-graph'
+import {
+  createInitialSessionState,
+  useSessionStore,
+  type ChatSession
+} from '../../stores/session-store'
+import {
+  flushSessionPersistence,
+  resetSessionPersistenceWriteFailuresForTests,
+  useSessionPersistence,
+  type SessionPersistenceState
+} from './session-persistence'
+
+const emptyLoadResult = (): LoadAllSessionsResult => ({
+  sessions: [],
+  manifest: { version: SESSION_MANIFEST_VERSION },
+  diagnostics: {
+    isComplete: true,
+    warnings: [],
+    isProjectDeletionRecoveryComplete: true
+  }
+})
+
+const createPersistedSession = (
+  overrides: Partial<PersistedChatSession> = {}
+): PersistedChatSession => ({
+  id: 'session-1',
+  projectId: 'project-a',
+  title: 'Restored',
+  cwd: '/workspace/project-a',
+  status: 'idle',
+  messages: [],
+  createdAt: 1,
+  updatedAt: 1,
+  ...overrides
+})
+
+describe('session persistence startup', () => {
+  let container: HTMLDivElement
+  let root: Root
+  let loadAll: ReturnType<typeof vi.fn>
+  let saveSession: ReturnType<typeof vi.fn>
+  let saveManifest: ReturnType<typeof vi.fn>
+  let reconcilePendingArtifactsApi: ReturnType<typeof vi.fn>
+  let recoveryEpoch = 0
+  let reportRendererFailure: ReturnType<typeof vi.fn>
+
+  beforeEach(async () => {
+    resetSessionConversationIntentsForTests()
+    resetSessionPersistenceWriteFailuresForTests()
+    await i18next.changeLanguage('en')
+    container = document.createElement('div')
+    document.body.appendChild(container)
+    root = createRoot(container)
+    loadAll = vi
+      .fn()
+      .mockRejectedValueOnce(
+        new Error('EACCES: /Users/private/.open-science/sessions could not be read')
+      )
+    saveSession = vi.fn(async (session) => session)
+    saveManifest = vi.fn().mockResolvedValue(undefined)
+    reconcilePendingArtifactsApi = vi.fn().mockResolvedValue([])
+    reportRendererFailure = vi.fn()
+    window.api = {
+      sessions: {
+        loadAll,
+        saveSession,
+        deleteSession: vi.fn().mockResolvedValue(undefined),
+        saveManifest
+      },
+      artifacts: {
+        reconcilePendingArtifacts: reconcilePendingArtifactsApi
+      },
+      diagnostics: {
+        reportRendererFailure
+      }
+    } as unknown as Window['api']
+    useSessionStore.setState(createInitialSessionState())
+    useWorkspaceOperationErrors.setState({ errors: {} })
+  })
+
+  afterEach(async () => {
+    await act(async () => {
+      root.unmount()
+      await i18next.changeLanguage('en')
+    })
+    container.remove()
+    useDesktopRuntimeRecoveryStore.setState({ phase: 'connected', epoch: 0, closing: false })
+  })
+
+  const Probe = (): React.JSX.Element => {
+    const persistence: SessionPersistenceState = useSessionPersistence()
+
+    return (
+      <div
+        data-hydrated={String(persistence.isHydrated)}
+        data-loading={String(persistence.isLoading)}
+        data-ready={String(persistence.isReady)}
+        data-catalog-complete={String(persistence.hasCompleteSessionCatalog)}
+        data-catalog-recovery={persistence.catalogRecovery.kind}
+        data-catalog-recovery-reason={
+          persistence.catalogRecovery.kind === 'repairable'
+            ? persistence.catalogRecovery.reason
+            : undefined
+        }
+        data-deletion-ready={String(persistence.canDeleteSessionsAndProjects)}
+        data-write-retryable={String(persistence.writeErrorRetryable)}
+        data-persistence-blocked={persistence.persistenceBlockedSessionIds.join(',')}
+        data-checking={String(persistence.isCheckingWrites)}
+        data-write-targets={persistence.writeIssues.map(({ target }) => target).join(',')}
+      >
+        <span data-testid="load-error">{persistence.loadError ?? 'sessions available'}</span>
+        <span data-testid="load-warning">{persistence.loadWarning ?? 'no load warnings'}</span>
+        <span data-testid="write-error">{persistence.writeError ?? 'changes saved'}</span>
+        <button type="button" data-testid="retry-load" onClick={persistence.retryLoad}>
+          Retry load
+        </button>
+        <button
+          type="button"
+          data-testid="dismiss-write-warning"
+          onClick={persistence.dismissWriteWarning}
+        >
+          Dismiss write warning
+        </button>
+        <button type="button" data-testid="retry-writes" onClick={persistence.retryWrites}>
+          Retry writes
+        </button>
+        <button type="button" data-testid="review-writes" onClick={persistence.reviewWriteIssues}>
+          Review writes
+        </button>
+        <button
+          type="button"
+          data-testid="discard-write"
+          onClick={() => {
+            void persistence.discardWrite('session:session-1')
+          }}
+        >
+          Discard retained changes
+        </button>
+        <button
+          type="button"
+          data-testid="new-conversation-after-size-limit"
+          onClick={persistence.startNewConversationAfterSizeLimit}
+        >
+          New conversation
+        </button>
+        <button
+          type="button"
+          data-testid="report-plan-size-limit"
+          onClick={() => persistence.reportSessionSizeLimit('session-plan')}
+        >
+          Report Plan size limit
+        </button>
+        <button
+          type="button"
+          data-testid="dismiss-load-warning"
+          onClick={persistence.dismissLoadWarning}
+        >
+          Dismiss warning
+        </button>
+      </div>
+    )
+  }
+
+  const installHistory = (persisted: PersistedChatSession[]): ReturnType<typeof vi.fn> => {
+    const loadOne = vi.fn(async ({ sessionId }: { sessionId: string }) =>
+      structuredClone(persisted.find((session) => session.id === sessionId))
+    )
+    window.api.sessions.list = vi.fn().mockResolvedValue({
+      sessions: persisted.map((session): SessionSummary => ({
+        number: session.number!,
+        id: session.id,
+        projectId: session.projectId,
+        title: session.title,
+        status: session.status,
+        presentedStatus: session.status,
+        pinned: false,
+        revision: 0,
+        activeMessageCount: session.messages.length,
+        artifactCount: 0,
+        filesRevision: 0,
+        createdAt: 1,
+        updatedAt: 1,
+        needsStartupRecovery: false
+      })),
+      manifest: { version: SESSION_MANIFEST_VERSION },
+      diagnostics: emptyLoadResult().diagnostics
+    })
+    window.api.sessions.loadOne = loadOne
+    return loadOne
+  }
+
+  it('shows retained terminal storage failures globally and retries only the exact execution', async () => {
+    loadAll.mockReset().mockResolvedValue(emptyLoadResult())
+    const event: AcpRuntimeEvent = {
+      id: 'terminal-failure',
+      timestamp: 1,
+      kind: 'error',
+      level: 'error',
+      sessionId: 'session-other',
+      promptMessageId: 'prompt-1',
+      terminalCommitFailure: 'storage',
+      interruptionCause: 'terminal-commit-failed',
+      terminalScope: {
+        projectId: 'project-other',
+        executionId: 'execution-1',
+        startedAt: 1,
+        agentFrameId: 'frame-1',
+        messageBranchId: 'branch-1',
+        runtimeSegmentId: 'segment-1'
+      }
+    }
+    const list = vi.fn().mockResolvedValue([event])
+    const retry = vi.fn(async () => {
+      list.mockResolvedValue([])
+    })
+    window.api.sessions.listRuntimeTerminalFailures = list
+    window.api.sessions.retryRuntimeTerminalCommit = retry
+    await act(async () => root.render(<Probe />))
+    expect(container.querySelector('[data-testid="write-error"]')?.textContent).toBe(
+      'Open-Science could not save the latest conversation changes. Retry before closing the app.'
+    )
+    await act(async () =>
+      (container.querySelector('[data-testid="retry-writes"]') as HTMLButtonElement).click()
+    )
+    expect(retry).toHaveBeenCalledExactlyOnceWith({
+      projectId: 'project-other',
+      sessionId: 'session-other',
+      promptMessageId: 'prompt-1',
+      executionId: 'execution-1'
+    })
+    expect(container.querySelector('[data-testid="write-error"]')?.textContent).toBe(
+      'changes saved'
+    )
+  })
+
+  it.each(['storage', 'missing-record'] as const)(
+    'clears the %s notice when another operation commits the retained result',
+    async (terminalCommitFailure) => {
+      loadAll.mockReset().mockResolvedValue(emptyLoadResult())
+      const event: AcpRuntimeEvent = {
+        id: 'failed-terminal',
+        timestamp: 1,
+        kind: 'error',
+        level: 'error',
+        sessionId: 'session-other',
+        promptMessageId: 'prompt-1',
+        terminalCommitFailure,
+        terminalScope: {
+          projectId: 'project-other',
+          executionId: 'execution-1',
+          startedAt: 1,
+          agentFrameId: 'frame-1',
+          messageBranchId: 'branch-1',
+          runtimeSegmentId: 'segment-1'
+        }
+      }
+      const list = vi.fn().mockResolvedValue([event])
+      window.api.sessions.listRuntimeTerminalFailures = list
+      let publish: (events: AcpRuntimeEvent[]) => void = () => undefined
+      window.api.acp = {
+        onEvent: (listener) => {
+          publish = listener
+          return () => undefined
+        }
+      } as Window['api']['acp']
+      await act(async () => root.render(<Probe />))
+      expect(list).toHaveBeenCalledTimes(1)
+      // A normal committed event only requests fresh authority; an unrelated success cannot
+      // erase this failed execution while Main still retains it.
+      const committed: AcpRuntimeEvent = {
+        ...event,
+        id: 'unrelated-commit',
+        kind: 'stop',
+        level: 'info',
+        publicationOwner: 'main',
+        terminalCommitFailure: undefined
+      }
+      await act(async () => publish([committed]))
+      expect(list).toHaveBeenCalledTimes(2)
+      if (terminalCommitFailure === 'storage')
+        expect(container.querySelector('[data-testid="write-error"]')?.textContent).not.toBe(
+          'changes saved'
+        )
+      else expect(useWorkspaceOperationErrors.getState().errors['session-other']).toBeDefined()
+      list.mockResolvedValue([])
+      await act(async () => publish([{ ...committed, id: 'recovered-commit' }]))
+      expect(container.querySelector('[data-testid="write-error"]')?.textContent).toBe(
+        'changes saved'
+      )
+      expect(useWorkspaceOperationErrors.getState().errors['session-other']).toBeUndefined()
+    }
+  )
+
+  it.each([
+    'matching',
+    'settled',
+    'newer-start',
+    'newer-execution',
+    'settled-newer-execution',
+    'settled-other-prompt',
+    'settled-other-frame',
+    'settled-other-branch',
+    'settled-other-segment',
+    'settled-no-admission',
+    'settled-no-authority',
+    'settled-new-run-during-load',
+    'settled-unmounted-during-load',
+    'settled-cleared-during-load'
+  ] as const)(
+    'applies a terminal failure overlay only to its admitted attempt (%s)',
+    async (attempt) => {
+      const settled = attempt.startsWith('settled')
+      const acceptsOverlay = attempt === 'matching' || attempt === 'settled'
+      const event: AcpRuntimeEvent = {
+        id: 'failed-terminal',
+        timestamp: 20,
+        kind: 'error',
+        level: 'error',
+        sessionId: 'session-1',
+        promptMessageId: 'prompt-1',
+        terminalCommitFailure: 'storage',
+        interruptionCause: 'terminal-commit-failed',
+        terminalScope: {
+          projectId: 'project-a',
+          executionId: 'execution-1',
+          startedAt: 10,
+          agentFrameId: 'frame-1',
+          messageBranchId: 'branch-1',
+          runtimeSegmentId: 'segment-1'
+        }
+      }
+      const admission = {
+        executionId: 'execution-1',
+        promptMessageId: 'prompt-1',
+        promptRuntimeSegmentId: 'segment-1',
+        rootFrameId: 'frame-1',
+        agentFrameId: 'frame-1',
+        messageBranchId: 'branch-1',
+        runtimeSegmentId: 'segment-1'
+      }
+      const live = createPersistedSession({
+        runtimeTranscriptOwner: 'main',
+        status: settled ? 'error' : 'running',
+        activeRun: settled
+          ? undefined
+          : { promptMessageId: 'prompt-1', startedAt: attempt === 'newer-start' ? 11 : 10 },
+        resumeRecovery: settled
+          ? {
+              kind: 'resume-required',
+              cause: 'connection-lost',
+              promptMessageId: attempt === 'settled-other-prompt' ? 'prompt-2' : 'prompt-1'
+            }
+          : undefined,
+        runtimeSessionAdmissions:
+          attempt === 'settled-no-admission'
+            ? undefined
+            : [
+                {
+                  ...admission,
+                  executionId: attempt.endsWith('newer-execution') ? 'execution-2' : 'execution-1',
+                  agentFrameId: attempt === 'settled-other-frame' ? 'frame-2' : 'frame-1',
+                  messageBranchId: attempt === 'settled-other-branch' ? 'branch-2' : 'branch-1',
+                  runtimeSegmentId: attempt === 'settled-other-segment' ? 'segment-2' : 'segment-1'
+                }
+              ],
+        messages: [
+          {
+            id: 'prompt-1',
+            role: 'user',
+            content: 'Run',
+            status: 'complete',
+            eventIds: [],
+            createdAt: 10,
+            updatedAt: 10
+          }
+        ]
+      })
+      const overlay = setTurnOutcome(
+        materializeSessionConversationGraph({
+          ...live,
+          status: 'idle',
+          activeRun: undefined,
+          resumeRecovery: {
+            kind: 'resume-required',
+            cause: 'connection-lost',
+            promptMessageId: 'prompt-1'
+          },
+          runtimeSessionAdmissions: [admission]
+        }),
+        'prompt-1',
+        {
+          kind: 'interrupted',
+          cause: 'terminal-commit-failed',
+          settledAt: 20,
+          recovery: 'resume'
+        }
+      )
+      loadAll.mockReset().mockResolvedValue({ ...emptyLoadResult(), sessions: [live] })
+      window.api.sessions.listRuntimeTerminalFailures = vi.fn().mockResolvedValue([event])
+      const delayed = attempt.endsWith('during-load')
+      let releaseAuthority: (value: PersistedChatSession) => void = () => undefined
+      const pendingAuthority = new Promise<PersistedChatSession>((resolve) => {
+        releaseAuthority = resolve
+      })
+      window.api.sessions.loadOne = vi
+        .fn()
+        .mockImplementation(() =>
+          delayed
+            ? pendingAuthority
+            : Promise.resolve(attempt === 'settled-no-authority' ? undefined : overlay)
+        )
+      let publish: (events: AcpRuntimeEvent[]) => void = () => undefined
+      const unsubscribe = vi.fn(() => undefined)
+      window.api.acp = {
+        onEvent: (listener) => {
+          publish = listener
+          return () => {
+            unsubscribe()
+          }
+        }
+      } as Window['api']['acp']
+      await act(async () => root.render(<Probe />))
+      if (delayed) {
+        expect(window.api.sessions.loadOne).toHaveBeenCalledOnce()
+        await act(async () => {
+          if (attempt === 'settled-new-run-during-load') {
+            useSessionStore.setState((state) => ({
+              sessions: state.sessions.map((session) => ({
+                ...session,
+                status: 'running',
+                activeRun: { promptMessageId: 'prompt-1', startedAt: 21 },
+                resumeRecovery: undefined,
+                runtimeSessionAdmissions: [{ ...admission, executionId: 'execution-2' }]
+              }))
+            }))
+          } else if (attempt === 'settled-unmounted-during-load') {
+            root.unmount()
+            expect(unsubscribe).toHaveBeenCalledOnce()
+            root = createRoot(container)
+          } else {
+            window.api.sessions.listRuntimeTerminalFailures = vi.fn().mockResolvedValue([])
+            publish([
+              {
+                ...event,
+                id: 'committed',
+                publicationOwner: 'main',
+                terminalCommitFailure: undefined
+              }
+            ])
+          }
+        })
+        const before = useSessionStore.getState().sessions
+        await act(async () => releaseAuthority(overlay))
+        expect(useSessionStore.getState().sessions).toEqual(before)
+        return
+      }
+      const source = useSessionStore.getState().sessions.find(({ id }) => id === live.id)!
+      expect(source.activeRunRuntimeSegmentId).toBeUndefined()
+      expect(source.activeRun).toEqual(acceptsOverlay ? undefined : live.activeRun)
+      if (acceptsOverlay) {
+        expect(resolveTurnOutcome(source, 'prompt-1')).toMatchObject({
+          kind: 'interrupted',
+          cause: 'terminal-commit-failed',
+          settledAt: 20,
+          recovery: 'resume'
+        })
+      } else {
+        expect(resolveTurnOutcome(source, 'prompt-1')).not.toEqual(
+          expect.objectContaining({ cause: 'terminal-commit-failed' })
+        )
+        expect(source.resumeRecovery).toEqual(live.resumeRecovery)
+        expect(source.runtimeSessionAdmissions).toEqual(live.runtimeSessionAdmissions)
+      }
+      expect(resolveSessionRecoveryPresentation(source)).toEqual(
+        settled && !acceptsOverlay ? { cause: 'connection-lost', error: undefined } : undefined
+      )
+      expect(source.status).toBe(acceptsOverlay ? 'idle' : live.status)
+    }
+  )
+
+  it('keeps a missing record notice scoped to its Session without a global storage retry', async () => {
+    loadAll.mockReset().mockResolvedValue(emptyLoadResult())
+    const event: AcpRuntimeEvent = {
+      id: 'missing-record',
+      timestamp: 1,
+      kind: 'error',
+      level: 'error',
+      sessionId: 'missing-session',
+      promptMessageId: 'prompt-1',
+      terminalCommitFailure: 'missing-record',
+      terminalScope: {
+        projectId: 'project-other',
+        executionId: 'execution-1',
+        startedAt: 1,
+        agentFrameId: 'frame-1',
+        messageBranchId: 'branch-1',
+        runtimeSegmentId: 'segment-1'
+      }
+    }
+    window.api.sessions.listRuntimeTerminalFailures = vi.fn().mockResolvedValue([event])
+    window.api.sessions.retryRuntimeTerminalCommit = vi.fn()
+    await act(async () => root.render(<Probe />))
+    expect(useWorkspaceOperationErrors.getState().errors).toEqual({
+      'missing-session': 'This session was deleted or is unavailable.'
+    })
+    expect(container.querySelector('[data-testid="write-error"]')?.textContent).toBe(
+      'changes saved'
+    )
+    await act(async () =>
+      (container.querySelector('[data-testid="retry-writes"]') as HTMLButtonElement).click()
+    )
+    expect(window.api.sessions.retryRuntimeTerminalCommit).not.toHaveBeenCalled()
+  })
+
+  it('releases a matching live run when Main reports a missing terminal record', async () => {
+    const event: AcpRuntimeEvent = {
+      id: 'missing-live-record',
+      timestamp: 1,
+      kind: 'error',
+      level: 'error',
+      sessionId: 'session-live',
+      promptMessageId: 'prompt-live',
+      terminalCommitFailure: 'missing-record',
+      terminalScope: {
+        projectId: 'project-a',
+        executionId: 'execution-live',
+        startedAt: 1,
+        agentFrameId: 'frame-live',
+        messageBranchId: 'branch-live',
+        runtimeSegmentId: 'segment-live'
+      }
+    }
+    const live = createPersistedSession({
+      id: 'session-live',
+      projectId: 'project-a',
+      status: 'running',
+      activeRun: { promptMessageId: 'prompt-live', startedAt: 1 }
+    })
+    loadAll.mockReset().mockResolvedValue({
+      sessions: [live],
+      manifest: { version: SESSION_MANIFEST_VERSION },
+      diagnostics: emptyLoadResult().diagnostics
+    })
+    window.api.sessions.listRuntimeTerminalFailures = vi.fn().mockResolvedValue([event])
+    window.api.sessions.loadOne = vi.fn().mockResolvedValue(undefined)
+    await act(async () => root.render(<Probe />))
+    await vi.waitFor(() => {
+      const session = useSessionStore.getState().sessions.find(({ id }) => id === 'session-live')
+      expect(session?.status).toBe('idle')
+      expect(session?.activeRun).toBeUndefined()
+      expect(session?.recordProblems).toEqual(['missing-record'])
+    })
+    expect(useWorkspaceOperationErrors.getState().errors['session-live']).toBe(
+      'This session was deleted or is unavailable.'
+    )
+  })
+
+  it.each(
+    (['read-only', 'failed-save', 'pending-save', 'running'] as const).flatMap((mode) => [
+      { mode, bodySize: 64 * 1024, count: 40, retained: 16 },
+      { mode, bodySize: 8 * 1024 * 1024, count: 6, retained: 3 }
+    ])
+  )(
+    'bounds $bodySize-character historical bodies without discarding $mode state',
+    async ({ mode, bodySize, count, retained }) => {
+      const persisted = Array.from({ length: count }, (_, index) =>
+        createPersistedSession({
+          id: `history-${index}`,
+          number: index + 1,
+          messages: [
+            {
+              id: `message-${index}`,
+              role: 'user',
+              status: 'complete',
+              eventIds: [],
+              content: `History ${index}: ${'x'.repeat(bodySize)}`,
+              createdAt: 1,
+              updatedAt: 1
+            }
+          ]
+        })
+      )
+      let finishSave: (() => void) | undefined
+      const loadOne = installHistory(persisted)
+      await act(async () => root.render(<Probe />))
+      for (let index = 0; index < persisted.length; index++) {
+        await act(async () => {
+          useSessionStore.getState().selectSession(persisted[index].id)
+          await Promise.resolve()
+        })
+        expect(
+          useSessionStore.getState().sessions.find((session) => session.id === persisted[index].id)
+            ?.messages[0]?.content
+        ).toBe(persisted[index].messages[0].content)
+        if (index === 0 && mode === 'running') {
+          await act(async () => {
+            useSessionStore.getState().appendUserMessage({
+              sessionId: persisted[0].id,
+              messageId: persisted[0].messages[0].id,
+              content: persisted[0].messages[0].content,
+              rearmExisting: true
+            })
+          })
+          expect(
+            useSessionStore.getState().sessions.find((session) => session.id === persisted[0].id)
+              ?.status
+          ).toBe('running')
+        }
+        if (index === 0 && mode === 'pending-save') {
+          saveSession.mockImplementation(
+            (session) =>
+              new Promise((resolve) => {
+                finishSave = () => resolve(session)
+              })
+          )
+          await act(async () => {
+            useSessionStore.getState().renameSession(persisted[0].id, 'Pending title')
+            await Promise.resolve()
+          })
+        }
+        if (index === 0 && mode === 'failed-save') {
+          saveSession.mockRejectedValue(new Error('disk unavailable'))
+          await act(async () => {
+            useSessionStore.getState().renameSession(persisted[0].id, 'Unsaved title')
+            await flushSessionPersistence().catch(() => undefined)
+          })
+        }
+      }
+      await act(async () => {
+        const flushed = flushSessionPersistence().catch(() => undefined)
+        // A write awaiting its durable acknowledgement must keep the source body alive.
+        await Promise.resolve()
+        if (mode === 'pending-save') {
+          expect(
+            useSessionStore.getState().sessions.find((session) => session.id === persisted[0].id)
+              ?.messages[0]?.content
+          ).toBe(persisted[0].messages[0].content)
+          expect(finishSave).toBeTypeOf('function')
+          finishSave?.()
+        }
+        await flushed
+      })
+      const state = useSessionStore.getState()
+      expect(
+        state.sessions.filter((session) => session.contentLoaded !== false).length
+      ).toBeLessThanOrEqual(mode === 'read-only' ? retained : retained + 1)
+      const first = state.sessions.find((session) => session.id === persisted[0].id)!
+      if (mode === 'read-only') {
+        expect(first.contentLoaded).toBe(false)
+        expect(first.messages).toEqual([])
+        expect(saveSession).not.toHaveBeenCalled()
+      } else {
+        expect(first.contentLoaded).not.toBe(false)
+        expect(first.messages[0].content).toBe(persisted[0].messages[0].content)
+        if (mode === 'failed-save') expect(first.title).toBe('Unsaved title')
+      }
+      // Navigating back loads the original body; unloading must neither save empty content nor
+      // trigger an immediate reload of every evicted summary through the saver subscription.
+      expect(loadOne).toHaveBeenCalledTimes(count)
+      await act(async () => {
+        useSessionStore.getState().selectSession(persisted[count - 2].id)
+      })
+      expect(loadOne).toHaveBeenCalledTimes(count)
+      await act(async () => {
+        useSessionStore.getState().selectSession(persisted[0].id)
+        await Promise.resolve()
+      })
+      expect(
+        useSessionStore.getState().sessions.find((session) => session.id === persisted[0].id)
+          ?.messages[0]?.content
+      ).toBe(persisted[0].messages[0].content)
+      expect(loadOne).toHaveBeenCalledTimes(mode === 'read-only' ? count + 1 : count)
+      expect(saveSession.mock.calls.every(([session]) => session.messages.length === 1)).toBe(true)
+      if (mode === 'read-only') {
+        await act(async () => {
+          useSessionStore.getState().renameSession(persisted[0].id, 'Renamed after reload')
+          await flushSessionPersistence()
+        })
+        expect(saveSession).toHaveBeenCalledOnce()
+        expect(saveSession.mock.calls[0][0]).toMatchObject({
+          id: persisted[0].id,
+          title: 'Renamed after reload',
+          messages: persisted[0].messages
+        })
+      }
+    }
+  )
+
+  it.each(['active', 'inactive'] as const)(
+    'keeps an oversized %s branch open, then releases and reloads it on navigation',
+    async (branch) => {
+      const message = {
+        id: 'large-message',
+        role: 'user' as const,
+        status: 'complete' as const,
+        eventIds: [],
+        content: '大'.repeat(33 * 1024 * 1024),
+        createdAt: 1,
+        updatedAt: 1
+      }
+      const graph = createLinearConversationGraph({
+        sessionId: 'large-history',
+        messages: [message],
+        createdAt: 1,
+        updatedAt: 1
+      })
+      const large = createPersistedSession({
+        id: 'large-history',
+        number: 1,
+        messages: branch === 'active' ? [message] : [],
+        conversationGraph:
+          branch === 'active'
+            ? graph
+            : forkEditedConversationMessage(graph, message.id, 'empty-revision', 2)
+      })
+      const small = createPersistedSession({ id: 'small-history', number: 2 })
+      const loadOne = installHistory([large, small])
+      await act(async () => root.render(<Probe />))
+      await act(async () => useSessionStore.getState().selectSession(large.id))
+      const loaded = (): ChatSession =>
+        useSessionStore.getState().sessions.find((item) => item.id === large.id)!
+      expect(loaded().contentLoaded).not.toBe(false)
+      expect(loaded().conversationGraph?.messages[0].content).toBe(message.content)
+      expect(loaded().messages.length).toBe(branch === 'active' ? 1 : 0)
+      expect(loadOne).toHaveBeenCalledOnce()
+      await act(async () => useSessionStore.getState().selectSession(small.id))
+      expect(loaded().contentLoaded).toBe(false)
+      expect(loaded().conversationGraph).toBeUndefined()
+      expect(saveSession).not.toHaveBeenCalled()
+      await act(async () => useSessionStore.getState().selectSession(large.id))
+      expect(loaded().conversationGraph?.messages[0].content).toBe(message.content)
+      expect(loaded().conversationGraph?.branches).toEqual(large.conversationGraph?.branches)
+      expect(loadOne).toHaveBeenCalledTimes(3)
+      expect(saveSession).not.toHaveBeenCalled()
+    }
+  )
+
+  it('saves imported history view changes without reporting a conversation storage failure', async () => {
+    loadAll.mockReset().mockResolvedValue(emptyLoadResult())
+    const imported = createPersistedSession({
+      conversationGraph: createLinearConversationGraph({
+        sessionId: 'session-1',
+        messages: [],
+        createdAt: 1,
+        updatedAt: 1
+      }),
+      runtimeContext: { version: 1, revision: 1 },
+      packageOrigin: {
+        importId: 'import-1',
+        sourceProjectId: 'source-project',
+        sourceSessionId: 'source-session',
+        importedAt: 1,
+        manifestChecksum: 'a'.repeat(64)
+      }
+    })
+    saveSession.mockImplementation(async (session) => preserveImportedSession(imported, session))
+    await act(async () => root.render(<Probe />))
+    await act(async () => useSessionStore.getState().upsertPersistedSession(imported))
+    await act(async () => {
+      useSessionStore.getState().renameSession(imported.id, 'Renamed imported history')
+      await flushSessionPersistence().catch(() => undefined)
+    })
+    expect(saveSession).toHaveBeenCalled()
+    expect(container.querySelector('[data-testid="write-error"]')?.textContent).toBe(
+      'changes saved'
+    )
+  })
+
+  it('does not reload persisted sessions when the locale changes', async () => {
+    loadAll.mockReset().mockResolvedValue(emptyLoadResult())
+    await act(async () => root.render(<Probe />))
+
+    expect(loadAll).toHaveBeenCalledOnce()
+
+    await act(async () => i18next.changeLanguage('ja'))
+
+    expect(loadAll).toHaveBeenCalledOnce()
+  })
+
+  it('does not resurrect a deleted Session when lazy hydration finishes', async () => {
+    const selected = createPersistedSession({ id: 'session-1' })
+    const lazy = createPersistedSession({ id: 'session-2', updatedAt: 2 })
+    let resolveLazyLoad: ((session: PersistedChatSession) => void) | undefined
+    const loadOne = vi.fn(({ sessionId }: { sessionId: string }): Promise<PersistedChatSession> => {
+      if (sessionId === selected.id) return Promise.resolve(selected)
+      return new Promise<PersistedChatSession>((resolve) => {
+        resolveLazyLoad = resolve
+      })
+    })
+    const summary = (persisted: PersistedChatSession, number: number): SessionSummary => ({
+      number,
+      id: persisted.id,
+      projectId: persisted.projectId,
+      title: persisted.title,
+      status: persisted.status,
+      presentedStatus: persisted.status,
+      pinned: false,
+      revision: 0,
+      activeMessageCount: persisted.messages.length,
+      artifactCount: 0,
+      filesRevision: 0,
+      createdAt: persisted.createdAt,
+      updatedAt: persisted.updatedAt,
+      needsStartupRecovery: false
+    })
+    loadAll.mockReset().mockResolvedValue(emptyLoadResult())
+    window.api = {
+      ...window.api,
+      sessions: {
+        list: vi.fn().mockResolvedValue({
+          sessions: [summary(selected, 1), summary(lazy, 2)],
+          manifest: { version: SESSION_MANIFEST_VERSION, lastSessionId: selected.id },
+          diagnostics: {
+            isComplete: true,
+            warnings: [],
+            isProjectDeletionRecoveryComplete: true
+          }
+        }),
+        loadAll,
+        loadOne,
+        saveSession,
+        deleteSession: vi.fn().mockResolvedValue(undefined),
+        saveManifest
+      }
+    } as unknown as Window['api']
+
+    await act(async () => root.render(<Probe />))
+    expect(useSessionStore.getState().selectedSessionId).toBe(selected.id)
+    expect(loadOne).not.toHaveBeenCalled()
+
+    // Entering Workspace selects the summary again. The whole-store subscription observes that
+    // navigation write even when the selected id is unchanged and starts transcript hydration.
+    await act(async () => {
+      useSessionStore.getState().selectSession(selected.id)
+      await Promise.resolve()
+    })
+    expect(loadOne).toHaveBeenCalledOnce()
+    expect(loadOne).toHaveBeenLastCalledWith({
+      projectId: selected.projectId,
+      sessionId: selected.id
+    })
+
+    await act(async () => {
+      useSessionStore.getState().selectSession(lazy.id)
+      await Promise.resolve()
+    })
+    expect(loadOne).toHaveBeenCalledTimes(2)
+    expect(loadOne).toHaveBeenLastCalledWith({ projectId: lazy.projectId, sessionId: lazy.id })
+
+    await act(async () => {
+      useSessionStore.getState().deleteSession(lazy.id)
+      resolveLazyLoad?.(lazy)
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    expect(useSessionStore.getState().sessions.map((session) => session.id)).toEqual([selected.id])
+  })
+
+  it('keeps session actions blocked after a load failure and recovers on retry', async () => {
+    await act(async () => root.render(<Probe />))
+
+    expect(container.querySelector('div')?.dataset.ready).toBe('false')
+    expect(container.querySelector('div')?.dataset.hydrated).toBe('false')
+    expect(container.querySelector('div')?.dataset.loading).toBe('false')
+    expect(container.querySelector('[data-testid="load-error"]')?.textContent).toBe(
+      'Open-Science could not read saved conversation data. Retry to continue.'
+    )
+    expect(container.querySelector('[data-testid="load-error"]')?.textContent).not.toContain(
+      '/Users/private'
+    )
+
+    loadAll.mockResolvedValueOnce(emptyLoadResult())
+    await act(async () =>
+      container.querySelector<HTMLButtonElement>('[data-testid="retry-load"]')?.click()
+    )
+
+    expect(loadAll).toHaveBeenCalledTimes(2)
+    expect(container.querySelector('div')?.dataset.ready).toBe('true')
+    expect(container.querySelector('div')?.dataset.catalogComplete).toBe('true')
+    expect(container.querySelector('div')?.dataset.deletionReady).toBe('true')
+    expect(container.querySelector('div')?.dataset.hydrated).toBe('true')
+    expect(container.querySelector('div')?.dataset.loading).toBe('false')
+    expect(container.querySelector('[data-testid="load-error"]')?.textContent).toContain(
+      'sessions available'
+    )
+  })
+
+  it('keeps startup blocked while a failed load retry is pending', async () => {
+    await act(async () => root.render(<Probe />))
+
+    let resolveRetry: ((result: LoadAllSessionsResult) => void) | undefined
+    loadAll.mockImplementationOnce(
+      () =>
+        new Promise<LoadAllSessionsResult>((resolve) => {
+          resolveRetry = resolve
+        })
+    )
+
+    await act(async () =>
+      container.querySelector<HTMLButtonElement>('[data-testid="retry-load"]')?.click()
+    )
+
+    expect(container.querySelector('div')?.dataset.hydrated).toBe('false')
+    expect(container.querySelector('div')?.dataset.loading).toBe('true')
+    expect(container.querySelector('div')?.dataset.ready).toBe('false')
+
+    await act(async () => resolveRetry?.(emptyLoadResult()))
+
+    expect(container.querySelector('div')?.dataset.hydrated).toBe('true')
+    expect(container.querySelector('div')?.dataset.loading).toBe('false')
+    expect(container.querySelector('div')?.dataset.ready).toBe('true')
+  })
+
+  it('surfaces a save failure and retries the latest in-memory session', async () => {
+    let writesFail = true
+    loadAll.mockReset().mockResolvedValue(emptyLoadResult())
+    saveSession.mockImplementation(async (session, options) => {
+      if (writesFail) {
+        throw new Error(
+          'ENOENT: could not write /Users/private/.open-science/sessions/project-a/session-1.json'
+        )
+      }
+      return {
+        ...session,
+        runtimeConversationCommandIds: [
+          ...new Set([
+            ...(session.runtimeConversationCommandIds ?? []),
+            ...(options?.conversationCommands?.map(({ id }: { id: string }) => id) ?? [])
+          ])
+        ]
+      }
+    })
+
+    await act(async () => root.render(<Probe />))
+
+    await act(async () => {
+      useSessionStore.getState().appendUserMessage({
+        sessionId: 'session-1',
+        content: 'First version',
+        cwd: '/workspace/project',
+        projectId: 'project-a'
+      })
+      await Promise.resolve()
+    })
+    expect(container.querySelector('[data-testid="write-error"]')?.textContent).toBe(
+      'Open-Science could not save the latest conversation changes. Retry before closing the app.'
+    )
+    expect(container.querySelector('[data-testid="write-error"]')?.textContent).not.toContain(
+      '/Users/private'
+    )
+    expect(reportRendererFailure).toHaveBeenCalledWith({
+      source: 'handled-error',
+      surface: 'unknown',
+      context: 'session-save',
+      errorCategory: 'error',
+      fingerprint: expect.stringMatching(/^[a-f0-9]{8}$/),
+      sessionWrite: {
+        target: 'session',
+        sessionId: 'session-1',
+        projectId: 'project-a',
+        code: 'unknown',
+        epoch: 0,
+        phase: 'rejected'
+      }
+    })
+    await expect(flushSessionPersistence()).rejects.toThrow('could not write')
+
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('[data-testid="dismiss-write-warning"]')?.click()
+    })
+    expect(container.querySelector('[data-testid="write-error"]')?.textContent).toBe(
+      'changes saved'
+    )
+    await expect(flushSessionPersistence()).rejects.toThrow('could not write')
+
+    await act(async () => {
+      useSessionStore.getState().appendUserMessage({
+        sessionId: 'session-1',
+        content: 'Latest version',
+        cwd: '/workspace/project'
+      })
+      await Promise.resolve()
+    })
+
+    await act(async () => {
+      await expect(flushSessionPersistence()).rejects.toThrow('could not write')
+    })
+    expect(container.querySelector('[data-testid="write-error"]')?.textContent).toContain(
+      'Open-Science could not save'
+    )
+
+    writesFail = false
+    await act(async () =>
+      container.querySelector<HTMLButtonElement>('[data-testid="retry-writes"]')?.click()
+    )
+
+    expect(saveSession.mock.calls.at(-1)?.[0].messages).toEqual(
+      expect.arrayContaining([expect.objectContaining({ content: 'Latest version' })])
+    )
+    expect(container.querySelector('[data-testid="write-error"]')?.textContent).toContain(
+      'changes saved'
+    )
+    await expect(flushSessionPersistence()).resolves.toBeUndefined()
+  })
+
+  it('classifies a Session size limit as non-retryable and blocks only that Session', async () => {
+    loadAll.mockReset().mockResolvedValue(emptyLoadResult())
+    saveSession.mockRejectedValue(
+      Object.assign(new Error('Session exceeds the persistence limit.'), {
+        code: 'session-size-limit'
+      })
+    )
+
+    await act(async () => root.render(<Probe />))
+    await act(async () => {
+      useSessionStore.getState().appendUserMessage({
+        sessionId: 'session-1',
+        content: 'Grow beyond the limit',
+        cwd: '/workspace/project',
+        projectId: 'project-a'
+      })
+      await Promise.resolve()
+    })
+
+    const probe = container.querySelector('div')
+    expect(probe?.dataset.writeRetryable).toBe('false')
+    expect(probe?.dataset.persistenceBlocked).toBe('session-1')
+    expect(container.querySelector('[data-testid="write-error"]')?.textContent).toContain(
+      'exceeded the 256 MiB storage limit'
+    )
+
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('[data-testid="retry-writes"]')?.click()
+      await Promise.resolve()
+    })
+    expect(saveSession).toHaveBeenCalledOnce()
+
+    await act(async () => {
+      container
+        .querySelector<HTMLButtonElement>('[data-testid="new-conversation-after-size-limit"]')
+        ?.click()
+    })
+    expect(useSessionStore.getState().selectedSessionId).toBeUndefined()
+    expect(container.querySelector('[data-testid="write-error"]')?.textContent).toBe(
+      'changes saved'
+    )
+    expect(probe?.dataset.persistenceBlocked).toBe('session-1')
+    await expect(flushSessionPersistence()).resolves.toBeUndefined()
+  })
+
+  it('accepts an external Plan size-limit report into the shared recovery state', async () => {
+    loadAll.mockReset().mockResolvedValue(emptyLoadResult())
+    await act(async () => root.render(<Probe />))
+
+    await act(async () =>
+      container.querySelector<HTMLButtonElement>('[data-testid="report-plan-size-limit"]')?.click()
+    )
+
+    const probe = container.querySelector('div')
+    expect(probe?.dataset.persistenceBlocked).toBe('session-plan')
+    expect(probe?.dataset.writeRetryable).toBe('false')
+    expect(container.querySelector('[data-testid="write-error"]')?.textContent).toContain(
+      'exceeded the 256 MiB storage limit'
+    )
+  })
+
+  it('keeps an unrelated Session write failure retryable after a size-limit failure', async () => {
+    loadAll.mockReset().mockResolvedValue(emptyLoadResult())
+    let ordinaryWriteFails = true
+    saveSession.mockImplementation(async (session) => {
+      if (session.id === 'session-1') {
+        throw Object.assign(new Error('Session exceeds the persistence limit.'), {
+          code: 'session-size-limit'
+        })
+      }
+      if (ordinaryWriteFails) throw new Error('disk full')
+      return session
+    })
+
+    await act(async () => root.render(<Probe />))
+    await act(async () => {
+      useSessionStore.getState().appendUserMessage({
+        sessionId: 'session-1',
+        content: 'Oversized Session',
+        cwd: '/workspace/project',
+        projectId: 'project-a'
+      })
+      await Promise.resolve()
+    })
+    await act(async () => {
+      useSessionStore.getState().appendUserMessage({
+        sessionId: 'session-2',
+        content: 'Ordinary failed Session',
+        cwd: '/workspace/project',
+        projectId: 'project-a'
+      })
+      await Promise.resolve()
+    })
+
+    const probe = container.querySelector('div')
+    expect(probe?.dataset.persistenceBlocked).toBe('session-1')
+    expect(probe?.dataset.writeRetryable).toBe('true')
+    expect(container.querySelector('[data-testid="write-error"]')?.textContent).toBe(
+      'Open-Science could not save the latest conversation changes. Retry before closing the app.'
+    )
+
+    ordinaryWriteFails = false
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('[data-testid="retry-writes"]')?.click()
+      await Promise.resolve()
+    })
+
+    expect(probe?.dataset.writeRetryable).toBe('false')
+    expect(container.querySelector('[data-testid="write-error"]')?.textContent).toContain(
+      'exceeded the 256 MiB storage limit'
+    )
+  })
+
+  it('keeps a failed Session blocking flush when another Session saves successfully', async () => {
+    let failedSessionWritesFail = true
+    loadAll.mockReset().mockResolvedValue(emptyLoadResult())
+    saveSession.mockImplementation(async (session) => {
+      if (session.id === 'session-1' && failedSessionWritesFail) throw new Error('disk full')
+      return session
+    })
+
+    await act(async () => root.render(<Probe />))
+
+    await act(async () => {
+      useSessionStore.getState().appendUserMessage({
+        sessionId: 'session-1',
+        content: 'Unsaved Session',
+        cwd: '/workspace/project',
+        projectId: 'project-a'
+      })
+      await Promise.resolve()
+    })
+    await act(async () => {
+      useSessionStore.getState().appendUserMessage({
+        sessionId: 'session-2',
+        content: 'Durable Session',
+        cwd: '/workspace/project',
+        projectId: 'project-a'
+      })
+      await Promise.resolve()
+    })
+
+    await expect(flushSessionPersistence()).rejects.toThrow('disk full')
+    expect(saveSession.mock.calls.map(([session]) => session.id)).toEqual([
+      'session-1',
+      'session-2'
+    ])
+
+    failedSessionWritesFail = false
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('[data-testid="retry-writes"]')?.click()
+      await Promise.resolve()
+    })
+
+    await expect(flushSessionPersistence()).resolves.toBeUndefined()
+    expect(saveSession.mock.calls.at(-1)?.[0].id).toBe('session-1')
+  })
+
+  it('retains conflicting local changes until the user explicitly discards them', async () => {
+    const restored = createPersistedSession({ revision: 1 })
+    const latest = createPersistedSession({ revision: 2, title: 'Durable title' })
+    loadAll.mockReset().mockResolvedValue({ ...emptyLoadResult(), sessions: [latest] })
+    loadAll.mockResolvedValueOnce({ ...emptyLoadResult(), sessions: [restored] })
+    saveSession.mockRejectedValue(
+      Object.assign(new Error('Session revision conflict: expected 1, actual 2.'), {
+        code: 'session-revision-conflict'
+      })
+    )
+    await act(async () => root.render(<Probe />))
+    await act(async () =>
+      useSessionStore.getState().renameSession('session-1', 'Unsaved local title')
+    )
+    expect(useSessionStore.getState().sessions[0].title).toBe('Unsaved local title')
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('[data-testid="retry-writes"]')!.click()
+    })
+    expect(useSessionStore.getState().sessions[0].title).toBe('Unsaved local title')
+    expect(saveSession).toHaveBeenCalledOnce()
+    await expect(flushSessionPersistence()).rejects.toThrow()
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('[data-testid="discard-write"]')!.click()
+    })
+    expect(useSessionStore.getState().sessions[0].title).toBe('Durable title')
+    await expect(flushSessionPersistence()).resolves.toBeUndefined()
+    expect(reportRendererFailure).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sessionWrite: expect.objectContaining({
+          sessionId: 'session-1',
+          recovery: expect.objectContaining({ event: 'forgotten', reason: 'explicit-discard' })
+        })
+      })
+    )
+  })
+
+  it('checks current authority before an explicit conflict retry without losing the local intent', async () => {
+    const restored = createPersistedSession({ revision: 1 })
+    loadAll.mockReset().mockResolvedValue({
+      ...emptyLoadResult(),
+      sessions: [restored]
+    })
+    saveSession.mockRejectedValue(
+      Object.assign(new Error('Session revision conflict: expected 1, actual 2.'), {
+        code: 'session-revision-conflict'
+      })
+    )
+
+    await act(async () => root.render(<Probe />))
+    await act(async () => {
+      useSessionStore.getState().renameSession('session-1', 'Local title')
+      await Promise.resolve()
+    })
+
+    expect(container.querySelector('[data-testid="write-error"]')?.textContent).toBe(
+      'This conversation changed in another window. Local changes are retained. Review the conversation, then retry or discard the retained changes.'
+    )
+    expect(saveSession).toHaveBeenCalledOnce()
+
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('[data-testid="retry-writes"]')?.click()
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    // An incomplete legacy authority cannot justify resending the retained graph.
+    expect(loadAll.mock.calls.length).toBeGreaterThanOrEqual(3)
+    expect(saveSession).toHaveBeenCalledOnce()
+    expect(useSessionStore.getState().sessions[0].title).toBe('Local title')
+    await expect(flushSessionPersistence()).rejects.toThrow()
+  })
+
+  it('clears an unresolved revision conflict after its Session is durably deleted', async () => {
+    const restored = createPersistedSession({ revision: 1 })
+    loadAll.mockReset().mockResolvedValue({
+      ...emptyLoadResult(),
+      sessions: [restored]
+    })
+    saveSession.mockRejectedValue(
+      Object.assign(new Error('Session revision conflict: expected 1, actual 2.'), {
+        code: 'session-revision-conflict'
+      })
+    )
+
+    await act(async () => root.render(<Probe />))
+    await act(async () => {
+      useSessionStore.getState().renameSession('session-1', 'Conflicting title')
+      await Promise.resolve()
+    })
+    await expect(flushSessionPersistence()).rejects.toMatchObject({
+      code: 'session-revision-conflict'
+    })
+
+    await act(async () => {
+      // Production removes renderer state only after the authoritative delete IPC succeeds.
+      useSessionStore.getState().deleteSession('session-1')
+      await Promise.resolve()
+    })
+
+    expect(container.querySelector('[data-testid="write-error"]')?.textContent).toContain(
+      'changes saved'
+    )
+    await expect(flushSessionPersistence()).resolves.toBeUndefined()
+  })
+
+  it('automatically clears a failed write target after its session is durably deleted', async () => {
+    loadAll.mockReset().mockResolvedValue(emptyLoadResult())
+    saveSession.mockRejectedValue(new Error('disk full'))
+
+    await act(async () => root.render(<Probe />))
+
+    await act(async () => {
+      useSessionStore.getState().appendUserMessage({
+        sessionId: 'session-1',
+        content: 'Delete me after the failed save',
+        cwd: '/workspace/project',
+        projectId: 'project-a'
+      })
+      await Promise.resolve()
+    })
+    expect(container.querySelector('[data-testid="write-error"]')?.textContent).toBe(
+      'Open-Science could not save the latest conversation changes. Retry before closing the app.'
+    )
+    await expect(flushSessionPersistence()).rejects.toThrow('disk full')
+
+    await act(async () => {
+      // Production removes renderer state only after the authoritative delete IPC succeeds.
+      useSessionStore.getState().deleteSession('session-1')
+      await Promise.resolve()
+    })
+
+    expect(saveSession).toHaveBeenCalledTimes(1)
+    expect(container.querySelector('[data-testid="write-error"]')?.textContent).toContain(
+      'changes saved'
+    )
+    await expect(flushSessionPersistence()).resolves.toBeUndefined()
+  })
+
+  it('ignores a save failure that arrives after its Session was deleted', async () => {
+    let rejectSave: ((reason: Error) => void) | undefined
+    loadAll.mockReset().mockResolvedValue(emptyLoadResult())
+    saveSession.mockImplementation(
+      () =>
+        new Promise<PersistedChatSession>((_resolve, reject) => {
+          rejectSave = reject
+        })
+    )
+
+    await act(async () => root.render(<Probe />))
+
+    await act(async () => {
+      useSessionStore.getState().appendUserMessage({
+        sessionId: 'session-1',
+        content: 'Delete me while the save is pending',
+        cwd: '/workspace/project',
+        projectId: 'project-a'
+      })
+      await Promise.resolve()
+    })
+    expect(saveSession).toHaveBeenCalledOnce()
+
+    await act(async () => {
+      useSessionStore.getState().deleteSession('session-1')
+      rejectSave?.(new Error('Session was deleted'))
+      await Promise.resolve()
+    })
+
+    expect(container.querySelector('[data-testid="write-error"]')?.textContent).toContain(
+      'changes saved'
+    )
+  })
+
+  it.each([false, true])(
+    'checks a late lost acknowledgement with diagnostics unavailable=%s',
+    async (diagnosticsUnavailable) => {
+      if (diagnosticsUnavailable)
+        reportRendererFailure.mockImplementation(() => {
+          throw new Error('diagnostics unavailable')
+        })
+      const original = createPersistedSession({ revision: 1, runtimeTranscriptOwner: 'main' })
+      loadAll.mockReset().mockResolvedValue({ ...emptyLoadResult(), sessions: [original] })
+      let resolveRead!: (session: PersistedChatSession) => void
+      window.api.sessions.loadOne = vi.fn(
+        () =>
+          new Promise<PersistedChatSession>((resolve) => {
+            resolveRead = resolve
+          })
+      )
+      saveSession.mockRejectedValueOnce(new DesktopRuntimeDisconnectedError())
+      await act(async () => root.render(<Probe />))
+      await act(async () =>
+        useSessionStore.getState().renameSession(original.id, 'Saved but reply lost')
+      )
+      expect(container.querySelector('div')?.dataset.checking).toBe('true')
+      expect(container.querySelector('[data-testid="write-error"]')?.textContent).toBe(
+        'changes saved'
+      )
+      expect(container.querySelector('div')?.dataset.writeTargets).toBe('session:session-1')
+      await expect(flushSessionPersistence()).rejects.toThrow()
+      await act(async () =>
+        resolveRead({ ...original, title: 'Saved but reply lost', revision: 2 })
+      )
+      expect(container.querySelector('div')?.dataset.checking).toBe('false')
+      expect(container.querySelector('div')?.dataset.writeTargets).toBe('')
+      await expect(flushSessionPersistence()).resolves.toBeUndefined()
+      expect(saveSession).toHaveBeenCalledOnce()
+      const notices = reportRendererFailure.mock.calls
+        .map(([report]) => report.sessionWrite)
+        .filter((write) => write?.recovery?.event === 'notice-changed')
+      expect(notices.map((write) => write.recovery.notice)).toEqual(['checking', 'hidden'])
+      expect(notices.every((write) => write.sessionId === original.id)).toBe(true)
+    }
+  )
+
+  it.each([false, true])(
+    'retries compact preferences only when their field remains safe (conflict: %s)',
+    async (conflict) => {
+      const original = createPersistedSession({
+        revision: undefined,
+        runtimeTranscriptOwner: 'main',
+        title: 'Original'
+      })
+      const latest = {
+        ...original,
+        revision: 4,
+        pinned: true,
+        title: conflict ? 'Remote edit' : 'Original'
+      }
+      loadAll.mockReset().mockResolvedValue({ ...emptyLoadResult(), sessions: [original] })
+      window.api.sessions.loadOne = vi.fn(async () => latest)
+      saveSession.mockRejectedValueOnce(new DesktopRuntimeDisconnectedError())
+      await act(async () => root.render(<Probe />))
+      await act(async () => useSessionStore.getState().renameSession(original.id, 'Local edit'))
+      await act(async () =>
+        useDesktopRuntimeRecoveryStore.setState({ phase: 'disconnected', epoch: ++recoveryEpoch })
+      )
+      await act(async () => useDesktopRuntimeRecoveryStore.setState({ phase: 'connected' }))
+      await act(async () =>
+        container.querySelector<HTMLButtonElement>('[data-testid="retry-writes"]')!.click()
+      )
+      if (conflict) {
+        expect(saveSession).toHaveBeenCalledTimes(1)
+        await expect(flushSessionPersistence()).rejects.toThrow()
+      } else {
+        expect(saveSession.mock.calls.at(-1)?.[0]).toMatchObject({
+          title: 'Local edit',
+          pinned: true
+        })
+        expect(saveSession.mock.calls.at(-1)?.[1]).toMatchObject({ expectedRevision: 4 })
+        await expect(flushSessionPersistence()).resolves.toBeUndefined()
+      }
+    }
+  )
+
+  it('retains a not-submitted preference across reconnect and retries only on user action', async () => {
+    const original = createPersistedSession({ revision: 1, runtimeTranscriptOwner: 'main' })
+    loadAll.mockReset().mockResolvedValue({ ...emptyLoadResult(), sessions: [original] })
+    window.api.sessions.loadOne = vi.fn(async () => original)
+    saveSession.mockRejectedValueOnce(new DesktopRuntimeWriteNotSubmittedError())
+    await act(async () => root.render(<Probe />))
+    await act(async () =>
+      useSessionStore.getState().renameSession(original.id, 'Retained local title')
+    )
+    await act(async () =>
+      useDesktopRuntimeRecoveryStore.setState({ phase: 'disconnected', epoch: ++recoveryEpoch })
+    )
+    await act(async () => useDesktopRuntimeRecoveryStore.setState({ phase: 'reconciling' }))
+    await act(async () => useDesktopRuntimeRecoveryStore.setState({ phase: 'connected' }))
+    expect(useSessionStore.getState().sessions[0].title).toBe('Retained local title')
+    expect(saveSession).toHaveBeenCalledOnce()
+    expect(container.querySelector('[data-testid="write-error"]')?.textContent).toContain(
+      'could not be confirmed as saved'
+    )
+    await expect(flushSessionPersistence()).rejects.toThrow()
+    await act(async () =>
+      container.querySelector<HTMLButtonElement>('[data-testid="retry-writes"]')!.click()
+    )
+    expect(saveSession.mock.calls.at(-1)?.[0].title).toBe('Retained local title')
+    expect(saveSession.mock.calls.at(-1)?.[1]).toMatchObject({
+      expectedRevision: 1,
+      conflictRebaseFields: ['title']
+    })
+    expect(useSessionStore.getState().sessions[0].title).toBe('Retained local title')
+    await expect(flushSessionPersistence()).resolves.toBeUndefined()
+    expect(reportRendererFailure).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sessionWrite: expect.objectContaining({
+          sessionId: original.id,
+          recovery: expect.objectContaining({ event: 'retry-started', expectedRevision: 1 })
+        })
+      })
+    )
+    expect(reportRendererFailure).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sessionWrite: expect.objectContaining({
+          sessionId: original.id,
+          recovery: expect.objectContaining({ event: 'resolved', reason: 'save-acknowledged' })
+        })
+      })
+    )
+  })
+
+  it.each(['full', 'metadata'] as const)(
+    'retries every coalesced preference after a not-submitted %s save',
+    async (mode) => {
+      let authority = createPersistedSession({
+        number: 1,
+        revision: 1,
+        runtimeTranscriptOwner: 'main',
+        title: 'Original',
+        pinned: false
+      })
+      const other = createPersistedSession({ id: 'other-session', number: 2 })
+      if (mode === 'metadata') installHistory([other, authority])
+      else loadAll.mockReset().mockResolvedValue({ ...emptyLoadResult(), sessions: [authority] })
+      window.api.sessions.loadOne = vi.fn(async ({ sessionId }) =>
+        structuredClone(sessionId === authority.id ? authority : other)
+      )
+      saveSession.mockImplementation(async (submitted, options) => {
+        const next = { ...authority, revision: (authority.revision ?? 0) + 1 }
+        for (const field of options?.conflictRebaseFields ?? []) {
+          Object.assign(next, { [field]: submitted[field] })
+        }
+        authority = next
+        return structuredClone(authority)
+      })
+      saveSession.mockRejectedValueOnce(new DesktopRuntimeWriteNotSubmittedError())
+      await act(async () => root.render(<Probe />))
+      const current = (): ChatSession =>
+        useSessionStore.getState().sessions.find(({ id }) => id === authority.id)!
+      expect(current().contentLoaded === false).toBe(mode === 'metadata')
+
+      await act(async () => {
+        useSessionStore.getState().togglePinned(authority.id)
+        useSessionStore.getState().renameSession(authority.id, 'Renamed')
+      })
+      expect(saveSession).toHaveBeenCalledOnce()
+      expect(saveSession.mock.calls[0][1]?.conflictRebaseFields).toEqual(['pinned', 'title'])
+      await expect(flushSessionPersistence()).rejects.toThrow()
+      expect(authority).toMatchObject({ title: 'Original', pinned: false })
+      await act(async () =>
+        container.querySelector<HTMLButtonElement>('[data-testid="dismiss-write-warning"]')!.click()
+      )
+      expect(container.querySelector('[data-testid="write-error"]')?.textContent).toBe(
+        'changes saved'
+      )
+      expect(container.querySelector('div')?.dataset.persistenceBlocked).toBe(authority.id)
+      await act(async () =>
+        container.querySelector<HTMLButtonElement>('[data-testid="review-writes"]')!.click()
+      )
+      expect(container.querySelector('[data-testid="write-error"]')?.textContent).toContain(
+        'could not be confirmed as saved'
+      )
+      expect(saveSession).toHaveBeenCalledOnce()
+
+      await act(async () =>
+        container.querySelector<HTMLButtonElement>('[data-testid="retry-writes"]')!.click()
+      )
+
+      expect(authority).toMatchObject({ title: 'Renamed', pinned: true })
+      expect(current()).toMatchObject({
+        title: 'Renamed',
+        pinned: true
+      })
+      expect(container.querySelector('[data-testid="write-error"]')?.textContent).toBe(
+        'changes saved'
+      )
+      await expect(flushSessionPersistence()).resolves.toBeUndefined()
+    }
+  )
+
+  it('retries an independent terminal failure alongside retained local changes', async () => {
+    const original = createPersistedSession({ revision: 1, runtimeTranscriptOwner: 'main' })
+    loadAll.mockReset().mockResolvedValue({ ...emptyLoadResult(), sessions: [original] })
+    window.api.sessions.loadOne = vi.fn(async ({ sessionId }) =>
+      sessionId === original.id ? original : undefined
+    )
+    const event: AcpRuntimeEvent = {
+      id: 'terminal-failure',
+      timestamp: 1,
+      kind: 'error',
+      level: 'error',
+      sessionId: 'other',
+      promptMessageId: 'prompt-other',
+      terminalCommitFailure: 'storage',
+      terminalScope: {
+        projectId: 'project-a',
+        executionId: 'other-execution',
+        startedAt: 1,
+        agentFrameId: 'frame',
+        messageBranchId: 'branch',
+        runtimeSegmentId: 'segment'
+      }
+    }
+    const list = vi.fn().mockResolvedValue([event])
+    const retryTerminal = vi.fn(async () => {
+      list.mockResolvedValue([])
+    })
+    window.api.sessions.listRuntimeTerminalFailures = list
+    window.api.sessions.retryRuntimeTerminalCommit = retryTerminal
+    saveSession.mockRejectedValueOnce(new DesktopRuntimeWriteNotSubmittedError())
+    await act(async () => root.render(<Probe />))
+    await act(async () =>
+      useSessionStore.getState().renameSession(original.id, 'Retained local title')
+    )
+    await act(async () =>
+      container.querySelector<HTMLButtonElement>('[data-testid="retry-writes"]')!.click()
+    )
+    expect(retryTerminal).toHaveBeenCalledExactlyOnceWith({
+      projectId: 'project-a',
+      sessionId: 'other',
+      promptMessageId: 'prompt-other',
+      executionId: 'other-execution'
+    })
+    expect(saveSession.mock.calls.at(-1)?.[0].title).toBe('Retained local title')
+    await expect(flushSessionPersistence()).resolves.toBeUndefined()
+  })
+
+  it('keeps a failed write visible when reloading the saved catalog fails', async () => {
+    const original = createPersistedSession({ revision: 1, runtimeTranscriptOwner: 'main' })
+    loadAll.mockReset().mockResolvedValueOnce({ ...emptyLoadResult(), sessions: [original] })
+    saveSession.mockRejectedValueOnce(new Error('disk full'))
+    await act(async () => root.render(<Probe />))
+    await act(async () => useSessionStore.getState().renameSession(original.id, 'Unsaved title'))
+    expect(container.querySelector('[data-testid="write-error"]')?.textContent).toContain(
+      'could not save'
+    )
+    loadAll.mockRejectedValueOnce(new Error('catalog unavailable'))
+
+    await act(async () =>
+      container.querySelector<HTMLButtonElement>('[data-testid="retry-load"]')!.click()
+    )
+
+    expect(container.querySelector('[data-testid="load-error"]')?.textContent).not.toBe(
+      'sessions available'
+    )
+    expect(container.querySelector('[data-testid="write-error"]')?.textContent).toContain(
+      'could not save'
+    )
+    expect(container.querySelector('div')?.dataset.writeTargets).toBe('session:session-1')
+    await expect(flushSessionPersistence()).rejects.toThrow()
+  })
+
+  it.each(['save', 'external'] as const)(
+    'keeps %s size-limit failures blocked while rechecking the catalog',
+    async (source) => {
+      const original = createPersistedSession({
+        id: source === 'save' ? 'session-1' : 'session-plan',
+        revision: 1,
+        runtimeTranscriptOwner: 'main'
+      })
+      loadAll.mockReset().mockResolvedValueOnce({ ...emptyLoadResult(), sessions: [original] })
+      saveSession.mockRejectedValueOnce(
+        Object.assign(new Error('Session exceeds the persistence limit.'), {
+          code: 'session-size-limit'
+        })
+      )
+      await act(async () => root.render(<Probe />))
+      await act(async () => {
+        if (source === 'save')
+          useSessionStore.getState().renameSession(original.id, 'Unsaved title')
+        else
+          container
+            .querySelector<HTMLButtonElement>('[data-testid="report-plan-size-limit"]')!
+            .click()
+      })
+      let rejectReload!: (error: Error) => void
+      loadAll.mockImplementationOnce(
+        () =>
+          new Promise((_resolve, reject) => {
+            rejectReload = reject
+          })
+      )
+
+      await act(async () =>
+        container.querySelector<HTMLButtonElement>('[data-testid="retry-load"]')!.click()
+      )
+
+      expect(container.querySelector('div')?.dataset.persistenceBlocked).toBe(original.id)
+      expect(container.querySelector('div')?.dataset.writeRetryable).toBe('false')
+      expect(container.querySelector('[data-testid="write-error"]')?.textContent).toContain(
+        'exceeded the 256 MiB storage limit'
+      )
+      await act(async () => rejectReload(new Error('catalog unavailable')))
+      expect(container.querySelector('div')?.dataset.persistenceBlocked).toBe(original.id)
+      expect(container.querySelector('div')?.dataset.writeRetryable).toBe('false')
+      if (source === 'save') await expect(flushSessionPersistence()).rejects.toThrow()
+    }
+  )
+
+  it('settles an incomplete reconnect read while keeping storage recovery and write gates active', async () => {
+    loadAll.mockReset().mockResolvedValue(emptyLoadResult())
+    await act(async () => root.render(<Probe />))
+    expect(container.querySelector('div')?.dataset.ready).toBe('true')
+    const epoch = ++recoveryEpoch
+    await act(async () => useDesktopRuntimeRecoveryStore.setState({ phase: 'disconnected', epoch }))
+    loadAll.mockResolvedValue({
+      ...emptyLoadResult(),
+      diagnostics: {
+        isComplete: false,
+        isProjectDeletionRecoveryComplete: false,
+        warnings: [],
+        failure: 'startup-reconciliation-failed'
+      }
+    })
+    const reconciled = vi.fn()
+    void waitForDesktopSessionRecovery(epoch).then(reconciled)
+    await act(async () => useDesktopRuntimeRecoveryStore.setState({ phase: 'reconciling' }))
+    expect(reconciled).toHaveBeenCalledOnce()
+    await act(async () => useDesktopRuntimeRecoveryStore.setState({ phase: 'connected' }))
+    expect(container.querySelector('div')?.dataset.ready).toBe('false')
+    expect(container.querySelector('div')?.dataset.loading).toBe('false')
+    expect(container.querySelector('div')?.dataset.deletionReady).toBe('false')
+    expect(container.querySelector('[data-testid="load-error"]')?.textContent).toContain(
+      'storage recovery could not finish'
+    )
+    await act(async () => {
+      useSessionStore.getState().appendUserMessage({
+        sessionId: 'session-2',
+        content: 'Must not save',
+        cwd: '/workspace/project',
+        projectId: 'project-a'
+      })
+    })
+    expect(saveSession).not.toHaveBeenCalled()
+    expect(saveManifest).not.toHaveBeenCalled()
+    loadAll.mockResolvedValue(emptyLoadResult())
+    await act(async () =>
+      (container.querySelector('[data-testid="retry-load"]') as HTMLButtonElement).click()
+    )
+    expect(container.querySelector('div')?.dataset.ready).toBe('true')
+    expect(container.querySelector('[data-testid="load-error"]')?.textContent).toBe(
+      'sessions available'
+    )
+  })
+
+  it('acknowledges reconnect reads while retaining a failed manifest write for explicit retry', async () => {
+    loadAll
+      .mockReset()
+      .mockResolvedValueOnce({
+        ...emptyLoadResult(),
+        diagnostics: { isComplete: false, warnings: [] }
+      })
+      .mockResolvedValue(emptyLoadResult())
+    saveManifest
+      .mockRejectedValueOnce(new Error('manifest disk full'))
+      .mockRejectedValueOnce(new Error('manifest still full'))
+      .mockResolvedValue(undefined)
+    await act(async () => root.render(<Probe />))
+    await act(async () =>
+      container.querySelector<HTMLButtonElement>('[data-testid="retry-load"]')!.click()
+    )
+    expect(saveManifest).toHaveBeenCalledOnce()
+    expect(container.querySelector('div')?.dataset.ready).toBe('false')
+
+    for (let recovery = 0; recovery < 2; recovery++) {
+      const epoch = ++recoveryEpoch
+      await act(async () =>
+        useDesktopRuntimeRecoveryStore.setState({ phase: 'disconnected', epoch })
+      )
+      const acknowledged = vi.fn()
+      void waitForDesktopSessionRecovery(epoch).then(acknowledged)
+      await act(async () => useDesktopRuntimeRecoveryStore.setState({ phase: 'reconciling' }))
+      expect(acknowledged).toHaveBeenCalledOnce()
+      expect(container.querySelector('div')?.dataset.loading).toBe('false')
+      await act(async () => useDesktopRuntimeRecoveryStore.setState({ phase: 'connected' }))
+      expect(container.querySelector('div')?.dataset.ready).toBe('false')
+    }
+
+    // A storage reload after transport recovery must not erase the outstanding write notice.
+    await act(async () =>
+      container.querySelector<HTMLButtonElement>('[data-testid="retry-load"]')!.click()
+    )
+    expect(saveManifest).toHaveBeenCalledOnce()
+    expect(container.querySelector('div')?.dataset.ready).toBe('false')
+    expect(container.querySelector('[data-testid="write-error"]')?.textContent).toContain(
+      'could not save'
+    )
+    await act(async () =>
+      container.querySelector<HTMLButtonElement>('[data-testid="retry-writes"]')!.click()
+    )
+    expect(saveManifest).toHaveBeenCalledTimes(2)
+    expect(container.querySelector('div')?.dataset.ready).toBe('false')
+    expect(container.querySelector('[data-testid="write-error"]')?.textContent).toContain(
+      'could not save'
+    )
+    await act(async () =>
+      container.querySelector<HTMLButtonElement>('[data-testid="retry-writes"]')!.click()
+    )
+    expect(saveManifest).toHaveBeenCalledTimes(3)
+    expect(container.querySelector('div')?.dataset.ready).toBe('true')
+    expect(container.querySelector('[data-testid="write-error"]')?.textContent).toBe(
+      'changes saved'
+    )
+    expect(saveSession).not.toHaveBeenCalled()
+    expect(reconcilePendingArtifactsApi).not.toHaveBeenCalled()
+  })
+
+  it('keeps persistence blocked when the durable Session scan is incomplete', async () => {
+    loadAll.mockReset().mockResolvedValue({
+      ...emptyLoadResult(),
+      diagnostics: {
+        isComplete: false,
+        isProjectDeletionRecoveryComplete: true,
+        warnings: [
+          {
+            kind: 'unreadable',
+            projectId: 'project-a',
+            fileName: 'session-1.json',
+            recovered: false
+          }
+        ]
+      }
+    })
+
+    await act(async () => root.render(<Probe />))
+
+    expect(container.querySelector('div')?.dataset.ready).toBe('false')
+    expect(container.querySelector('div')?.dataset.hydrated).toBe('true')
+    expect(container.querySelector('div')?.dataset.deletionReady).toBe('true')
+    expect(container.querySelector('div')?.dataset.catalogRecovery).toBe('repairable')
+    expect(container.querySelector('div')?.dataset.catalogRecoveryReason).toBe('session-scan')
+    expect(container.querySelector('[data-testid="load-error"]')?.textContent).toContain(
+      'could not be read'
+    )
+
+    await act(async () => {
+      useSessionStore.getState().appendUserMessage({
+        sessionId: 'session-2',
+        content: 'Must not save against a partial scan',
+        cwd: '/workspace/project',
+        projectId: 'project-a'
+      })
+      await Promise.resolve()
+    })
+    expect(saveSession).not.toHaveBeenCalled()
+  })
+
+  it('projects an unsupported Session version without starting persistence', async () => {
+    loadAll.mockReset().mockResolvedValue({
+      ...emptyLoadResult(),
+      diagnostics: {
+        isComplete: false,
+        isProjectDeletionRecoveryComplete: true,
+        warnings: [
+          {
+            kind: 'unsupported-version',
+            projectId: 'project-a',
+            fileName: 'future.json',
+            recovered: false
+          }
+        ]
+      }
+    })
+
+    await act(async () => root.render(<Probe />))
+
+    expect(container.querySelector('div')?.dataset.ready).toBe('false')
+    expect(container.querySelector('div')?.dataset.catalogRecovery).toBe('unsupported-version')
+
+    await act(async () => {
+      useSessionStore.getState().appendUserMessage({
+        sessionId: 'session-2',
+        content: 'Must not overwrite future Session authority',
+        cwd: '/workspace/project',
+        projectId: 'project-a'
+      })
+      await Promise.resolve()
+    })
+    expect(saveSession).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    { kind: 'unreadable', recovery: 'repairable' },
+    { kind: 'unsupported-version', recovery: 'unsupported-version' }
+  ] as const)(
+    'retains the loaded snapshot and $recovery guidance across failed list retries',
+    async ({ kind, recovery }) => {
+      const persisted = createPersistedSession({ number: 1 })
+      installHistory([persisted])
+      const list = vi.mocked(window.api.sessions.list!)
+      const complete = await list()
+      let rejectPending: (error: Error) => void = () => {}
+      const pending = new Promise<typeof complete>((_resolve, reject) => {
+        rejectPending = reject
+      })
+      list
+        .mockReset()
+        .mockResolvedValueOnce({
+          ...complete,
+          diagnostics: {
+            isComplete: false,
+            isProjectDeletionRecoveryComplete: true,
+            warnings: [{ kind, projectId: 'project-a', fileName: 'other.json', recovered: false }]
+          }
+        })
+        .mockReturnValueOnce(pending)
+        .mockRejectedValue(new Error('EACCES'))
+      await act(async () => root.render(<Probe />))
+      act(() => useSessionStore.getState().selectSession(persisted.id))
+      const snapshot = useSessionStore.getState().sessions
+      const retry = async (): Promise<void> => {
+        await act(async () =>
+          container.querySelector<HTMLButtonElement>('[data-testid="retry-load"]')!.click()
+        )
+      }
+      const expectReadOnlySnapshot = (): void => {
+        expect(container.querySelector('div')?.dataset.hydrated).toBe('true')
+        expect(container.querySelector('div')?.dataset.ready).toBe('false')
+        expect(container.querySelector('div')?.dataset.catalogComplete).toBe('false')
+        expect(container.querySelector('div')?.dataset.deletionReady).toBe('false')
+        expect(container.querySelector('div')?.dataset.catalogRecovery).toBe(recovery)
+        expect(useSessionStore.getState().sessions).toBe(snapshot)
+        expect(useSessionStore.getState().selectedSessionId).toBe(persisted.id)
+        expect(saveSession).not.toHaveBeenCalled()
+        expect(saveManifest).not.toHaveBeenCalled()
+        expect(window.api.sessions.deleteSession).not.toHaveBeenCalled()
+      }
+      await retry()
+      expect(container.querySelector('div')?.dataset.loading).toBe('true')
+      expectReadOnlySnapshot()
+      await act(async () => rejectPending(new Error('EACCES')))
+      expectReadOnlySnapshot()
+      for (let attempt = 0; attempt < 2; attempt++) {
+        await retry()
+        expectReadOnlySnapshot()
+      }
+      expect(list).toHaveBeenCalledTimes(4)
+      expect(container.querySelector('div')?.dataset.loading).toBe('false')
+      expect(container.querySelector('[data-testid="load-error"]')?.textContent).not.toBe(
+        'sessions available'
+      )
+
+      list.mockResolvedValueOnce(complete)
+      await retry()
+      expect(container.querySelector('div')?.dataset.hydrated).toBe('true')
+      expect(container.querySelector('div')?.dataset.ready).toBe('true')
+      expect(container.querySelector('div')?.dataset.catalogRecovery).toBe('ready')
+      expect(container.querySelector('div')?.dataset.deletionReady).toBe('true')
+      expect(useSessionStore.getState().selectedSessionId).toBe(persisted.id)
+    }
+  )
+
+  it('preserves a live session selection when retrying a partial recovery', async () => {
+    const manifestSession = createPersistedSession({ id: 'manifest-session' })
+    const selectedSession = createPersistedSession({
+      id: 'selected-session',
+      projectId: 'project-b',
+      cwd: '/workspace/project-b',
+      updatedAt: 2
+    })
+    const sessions = [manifestSession, selectedSession]
+    const manifest = {
+      version: SESSION_MANIFEST_VERSION,
+      lastSessionId: manifestSession.id
+    }
+    loadAll
+      .mockReset()
+      .mockResolvedValueOnce({
+        sessions,
+        manifest,
+        diagnostics: { isComplete: false, warnings: [] }
+      })
+      .mockResolvedValueOnce({ sessions, manifest })
+    let finishManifestSave: (() => void) | undefined
+    const manifestSave = new Promise<void>((resolve) => {
+      finishManifestSave = resolve
+    })
+    saveManifest.mockReturnValueOnce(manifestSave)
+
+    await act(async () => root.render(<Probe />))
+
+    expect(useSessionStore.getState().selectedSessionId).toBe(manifestSession.id)
+    act(() => useSessionStore.getState().selectSession(selectedSession.id))
+
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('[data-testid="retry-load"]')?.click()
+      await Promise.resolve()
+    })
+
+    expect(useSessionStore.getState().selectedSessionId).toBe(selectedSession.id)
+    expect(saveManifest).toHaveBeenCalledOnce()
+    expect(saveManifest).toHaveBeenCalledWith({
+      lastSessionId: selectedSession.id
+    })
+    expect(container.querySelector('div')?.dataset.ready).toBe('false')
+    expect(container.querySelector('div')?.dataset.loading).toBe('true')
+
+    await act(async () => {
+      finishManifestSave?.()
+      await manifestSave
+    })
+
+    expect(container.querySelector('div')?.dataset.ready).toBe('true')
+    expect(container.querySelector('div')?.dataset.loading).toBe('false')
+  })
+
+  it.each(['switch', 'clear'] as const)(
+    'preserves a user selection %s while the retry is pending',
+    async (navigation) => {
+      const first = createPersistedSession({ number: 1 })
+      const second = createPersistedSession({ id: 'session-2', number: 2 })
+      installHistory([first, second])
+      const list = vi.mocked(window.api.sessions.list!)
+      const complete = await list()
+      let finish: (result: typeof complete) => void = () => {}
+      const pending = new Promise<typeof complete>((resolve) => {
+        finish = resolve
+      })
+      list
+        .mockReset()
+        .mockResolvedValueOnce({
+          ...complete,
+          diagnostics: { isComplete: false, warnings: [] }
+        })
+        .mockReturnValueOnce(pending)
+      await act(async () => root.render(<Probe />))
+      act(() => useSessionStore.getState().selectSession(first.id))
+      await act(async () =>
+        container.querySelector<HTMLButtonElement>('[data-testid="retry-load"]')!.click()
+      )
+      act(() => {
+        if (navigation === 'switch') useSessionStore.getState().selectSession(second.id)
+        else useSessionStore.getState().clearSelection()
+      })
+      await act(async () => finish(complete))
+      const expectedId = navigation === 'switch' ? second.id : undefined
+      expect(useSessionStore.getState().selectedSessionId).toBe(expectedId)
+      expect(saveManifest).toHaveBeenCalledWith({ lastSessionId: expectedId })
+      expect(container.querySelector('div')?.dataset.ready).toBe('true')
+    }
+  )
+
+  it('preserves an explicitly empty selection when retrying a partial recovery', async () => {
+    const manifestSession = createPersistedSession({ id: 'manifest-session' })
+    const result = {
+      sessions: [manifestSession],
+      manifest: {
+        version: SESSION_MANIFEST_VERSION,
+        lastSessionId: manifestSession.id
+      }
+    }
+    loadAll
+      .mockReset()
+      .mockResolvedValueOnce({
+        ...result,
+        diagnostics: { isComplete: false, warnings: [] }
+      })
+      .mockResolvedValueOnce(result)
+
+    await act(async () => root.render(<Probe />))
+
+    act(() => useSessionStore.getState().clearSelection())
+    await act(async () =>
+      container.querySelector<HTMLButtonElement>('[data-testid="retry-load"]')?.click()
+    )
+
+    expect(container.querySelector('div')?.dataset.ready).toBe('true')
+    expect(useSessionStore.getState().selectedSessionId).toBeUndefined()
+    expect(saveManifest).toHaveBeenCalledOnce()
+    expect(saveManifest).toHaveBeenCalledWith({ lastSessionId: undefined })
+  })
+
+  it('keeps persistence blocked until a failed retry manifest write succeeds', async () => {
+    const pendingArtifactPath =
+      '/data/artifacts/project-a/manifest-session/.pending/run-1/chart.png'
+    const manifestSession = createPersistedSession({
+      id: 'manifest-session',
+      messages: [
+        {
+          id: 'message-1',
+          role: 'agent',
+          content: 'Recovered output',
+          status: 'complete',
+          eventIds: [],
+          artifactIds: ['artifact-session:run-1:chart.png'],
+          createdAt: 1,
+          updatedAt: 1
+        }
+      ],
+      artifacts: [
+        {
+          id: 'artifact-session:run-1:chart.png',
+          kind: 'managed-file',
+          path: pendingArtifactPath,
+          name: 'chart.png',
+          mimeType: 'image/png'
+        }
+      ]
+    })
+    const result = {
+      sessions: [manifestSession],
+      manifest: {
+        version: SESSION_MANIFEST_VERSION,
+        lastSessionId: manifestSession.id
+      }
+    }
+    loadAll
+      .mockReset()
+      .mockResolvedValueOnce({
+        ...result,
+        diagnostics: { isComplete: false, warnings: [] }
+      })
+      .mockResolvedValueOnce(result)
+    saveManifest
+      .mockRejectedValueOnce(new Error('manifest disk full'))
+      .mockResolvedValueOnce(undefined)
+
+    await act(async () => root.render(<Probe />))
+
+    act(() => useSessionStore.getState().clearSelection())
+    await act(async () =>
+      container.querySelector<HTMLButtonElement>('[data-testid="retry-load"]')?.click()
+    )
+
+    expect(saveManifest).toHaveBeenCalledOnce()
+    expect(container.querySelector('div')?.dataset.ready).toBe('false')
+    expect(container.querySelector('div')?.dataset.loading).toBe('false')
+    expect(container.querySelector('[data-testid="write-error"]')?.textContent).toBe(
+      'Open-Science could not save the latest conversation changes. Retry before closing the app.'
+    )
+    expect(reconcilePendingArtifactsApi).not.toHaveBeenCalled()
+
+    await act(async () =>
+      container.querySelector<HTMLButtonElement>('[data-testid="retry-writes"]')?.click()
+    )
+
+    expect(saveManifest).toHaveBeenCalledTimes(2)
+    expect(container.querySelector('div')?.dataset.ready).toBe('true')
+    expect(container.querySelector('[data-testid="write-error"]')?.textContent).toContain(
+      'changes saved'
+    )
+    expect(reconcilePendingArtifactsApi).not.toHaveBeenCalled()
+  })
+
+  it('keeps persistence blocked when startup storage recovery is incomplete', async () => {
+    loadAll.mockReset().mockResolvedValue({
+      ...emptyLoadResult(),
+      diagnostics: {
+        isComplete: false,
+        warnings: [],
+        failure: 'startup-reconciliation-failed',
+        isProjectDeletionRecoveryComplete: false
+      }
+    })
+
+    await act(async () => root.render(<Probe />))
+
+    expect(container.querySelector('div')?.dataset.ready).toBe('false')
+    expect(container.querySelector('div')?.dataset.deletionReady).toBe('false')
+    expect(container.querySelector('div')?.dataset.catalogRecovery).toBe(
+      'project-deletion-recovery'
+    )
+    expect(container.querySelector('[data-testid="load-error"]')?.textContent).toContain(
+      'storage recovery could not finish'
+    )
+  })
+
+  it('loads healthy conversations while warning about quarantined corrupt files', async () => {
+    loadAll.mockReset().mockResolvedValue({
+      ...emptyLoadResult(),
+      diagnostics: {
+        isComplete: true,
+        warnings: [
+          {
+            kind: 'corrupt',
+            projectId: 'project-a',
+            fileName: 'broken.json',
+            recovered: true
+          }
+        ]
+      }
+    })
+
+    await act(async () => root.render(<Probe />))
+
+    expect(container.querySelector('div')?.dataset.ready).toBe('true')
+    expect(container.querySelector('div')?.dataset.catalogComplete).toBe('false')
+    expect(container.querySelector('div')?.dataset.catalogRecovery).toBe('damaged-authority')
+    expect(container.querySelector('[data-testid="load-warning"]')?.textContent).toContain(
+      'damaged and moved aside'
+    )
+  })
+
+  it('dismisses a recovery warning without blocking healthy conversations', async () => {
+    loadAll.mockReset().mockResolvedValue({
+      ...emptyLoadResult(),
+      diagnostics: {
+        isComplete: true,
+        warnings: [
+          {
+            kind: 'corrupt',
+            projectId: 'project-a',
+            fileName: 'broken.json',
+            recovered: true
+          }
+        ]
+      }
+    })
+
+    await act(async () => root.render(<Probe />))
+
+    expect(container.querySelector('[data-testid="load-warning"]')?.textContent).toContain(
+      'damaged and moved aside'
+    )
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('[data-testid="dismiss-load-warning"]')?.click()
+    })
+    expect(container.querySelector('[data-testid="load-warning"]')?.textContent).toBe(
+      'no load warnings'
+    )
+    expect(container.querySelector('div')?.dataset.ready).toBe('true')
+  })
+
+  it('loads conversations after corrupt selection data is isolated', async () => {
+    loadAll.mockReset().mockResolvedValue({
+      ...emptyLoadResult(),
+      diagnostics: {
+        isComplete: true,
+        warnings: [
+          {
+            kind: 'manifest-corrupt',
+            fileName: 'manifest.json',
+            recovered: true
+          }
+        ]
+      }
+    })
+
+    await act(async () => root.render(<Probe />))
+
+    expect(container.querySelector('div')?.dataset.ready).toBe('true')
+    expect(container.querySelector('[data-testid="load-warning"]')?.textContent).toContain(
+      'Conversation selection data was damaged and moved aside'
+    )
+  })
+
+  it('keeps conversations writable when selection data is unreadable', async () => {
+    loadAll.mockReset().mockResolvedValue({
+      ...emptyLoadResult(),
+      diagnostics: {
+        isComplete: true,
+        warnings: [
+          {
+            kind: 'manifest-unreadable',
+            fileName: 'manifest.json',
+            recovered: false
+          }
+        ]
+      }
+    })
+
+    await act(async () => root.render(<Probe />))
+
+    expect(container.querySelector('div')?.dataset.ready).toBe('true')
+    expect(container.querySelector('div')?.dataset.catalogComplete).toBe('true')
+    expect(container.querySelector('[data-testid="load-warning"]')?.textContent).toContain(
+      'Conversation selection data could not be read, so no conversation was selected'
+    )
+  })
+
+  it('does not claim damaged selection data was moved when quarantine failed', async () => {
+    loadAll.mockReset().mockResolvedValue({
+      ...emptyLoadResult(),
+      diagnostics: {
+        isComplete: true,
+        warnings: [
+          {
+            kind: 'manifest-corrupt',
+            fileName: 'manifest.json',
+            recovered: false
+          }
+        ]
+      }
+    })
+
+    await act(async () => root.render(<Probe />))
+
+    expect(container.querySelector('div')?.dataset.ready).toBe('true')
+    expect(container.querySelector('[data-testid="load-warning"]')?.textContent).toContain(
+      'Conversation selection data was damaged and could not be moved aside'
+    )
+  })
+
+  it('loads the selected transcript when navigation changes during loadOne', async () => {
+    const first = createPersistedSession({ number: 1 })
+    const second = createPersistedSession({
+      id: 'session-2',
+      number: 2,
+      messages: [
+        {
+          id: 'm2',
+          role: 'user',
+          content: 'Retain visible history',
+          status: 'complete',
+          eventIds: [],
+          createdAt: 1,
+          updatedAt: 1
+        }
+      ]
+    })
+    const loadOne = installHistory([first, second])
+    const list = vi.mocked(window.api.sessions.list!)
+    const complete = await list()
+    list
+      .mockReset()
+      .mockResolvedValueOnce({ ...complete, diagnostics: { isComplete: false, warnings: [] } })
+      .mockResolvedValue(complete)
+    let release: (session: PersistedChatSession) => void = () => {}
+    loadOne.mockImplementationOnce(
+      () =>
+        new Promise<PersistedChatSession>((resolve) => {
+          release = resolve
+        })
+    )
+    await act(async () => root.render(<Probe />))
+    act(() => useSessionStore.getState().selectSession(first.id))
+    await act(async () =>
+      container.querySelector<HTMLButtonElement>('[data-testid="retry-load"]')!.click()
+    )
+    expect(loadOne).toHaveBeenCalledWith({ projectId: first.projectId, sessionId: first.id })
+    act(() => useSessionStore.getState().selectSession(second.id))
+    await act(async () => release(first))
+    expect(useSessionStore.getState().selectedSessionId).toBe(second.id)
+    expect(container.querySelector('div')?.dataset.ready).toBe('true')
+    expect(
+      useSessionStore.getState().sessions.find((s) => s.id === second.id)?.contentLoaded
+    ).not.toBe(false)
+    expect(
+      useSessionStore.getState().sessions.find((s) => s.id === second.id)?.messages[0]?.content
+    ).toBe('Retain visible history')
+    expect(loadOne).toHaveBeenCalledTimes(2)
+    expect(saveSession).not.toHaveBeenCalled()
+    expect(saveManifest).toHaveBeenCalledWith({ lastSessionId: second.id })
+  })
+})

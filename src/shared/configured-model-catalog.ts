@@ -1,0 +1,173 @@
+import { providerValidationRoute } from './settings'
+import {
+  type ModelProtocol,
+  type OfficialVendorId,
+  isVendorModelMultimodal,
+  resolveVendorModelApiEndpoints
+} from '@aipoch/providers'
+import { isModelBridgeSupported } from './provider-bridge-policy'
+
+import {
+  isClaudeSubscriptionProvider,
+  isCodexSubscriptionProvider,
+  isProviderUsableByFramework,
+  isXaiSubscriptionProvider,
+  DEFAULT_ENDPOINT_ORDER,
+  preferredEndpoint,
+  providerEndpoints,
+  providerValidationFailed,
+  requiresChatCompletionsBridge,
+  selectClaudeSubscriptionProvider,
+  type AgentFrameworkId,
+  type ClaudeSubscriptionProviderId,
+  type ProviderType,
+  type ProviderView
+} from './settings'
+
+export type ConfiguredModelCatalogEntry = Readonly<{
+  key: string
+  providerId: string
+  providerName: string
+  providerType: ProviderType
+  vendorId?: OfficialVendorId
+  model: string
+  label: string
+  selectable: boolean
+  supportsImageInput: boolean
+  unavailableReason?: 'framework-incompatible' | 'model-bridge-unsupported'
+}>
+
+export type ConfiguredModelInventoryEntry = Readonly<
+  Omit<ConfiguredModelCatalogEntry, 'selectable' | 'unavailableReason'>
+>
+
+export const configuredModelKey = (providerId: string, model: string): string =>
+  JSON.stringify([providerId, model])
+
+export const parseConfiguredModelKey = (
+  key: string
+): Readonly<{ providerId: string; model: string }> | undefined => {
+  try {
+    const value: unknown = JSON.parse(key)
+    return Array.isArray(value) &&
+      value.length === 2 &&
+      value.every((item) => typeof item === 'string')
+      ? { providerId: value[0], model: value[1] }
+      : undefined
+  } catch {
+    return undefined
+  }
+}
+
+export const configuredModelApiEndpoints = (
+  provider: Pick<ProviderView, 'type' | 'vendorId' | 'apiEndpoints'>,
+  model: string
+): readonly ModelProtocol[] =>
+  provider.type === 'official' && provider.vendorId
+    ? resolveVendorModelApiEndpoints(provider.vendorId, model)
+    : providerEndpoints(provider)
+
+export const buildConfiguredModelInventory = (
+  input: Readonly<{
+    providers: readonly ProviderView[]
+    activeProviderId?: string
+    claudeSubscriptionProviderId?: ClaudeSubscriptionProviderId
+    includeAllClaudeSubscriptions?: boolean
+  }>
+): readonly ConfiguredModelInventoryEntry[] => {
+  const selectedClaudeProvider = selectClaudeSubscriptionProvider(
+    input.providers,
+    input.activeProviderId,
+    input.claudeSubscriptionProviderId
+  )
+
+  const supportsImageInput = (provider: ProviderView, model: string): boolean => {
+    if (isClaudeSubscriptionProvider(provider.type) || isCodexSubscriptionProvider(provider.type)) {
+      return true
+    }
+    if (isXaiSubscriptionProvider(provider.type)) return isVendorModelMultimodal('xai', model)
+    if (provider.type === 'custom') return provider.supportsImageInput === true
+    return provider.vendorId ? isVendorModelMultimodal(provider.vendorId, model) : false
+  }
+
+  return input.providers
+    .filter(
+      (provider) =>
+        (!isClaudeSubscriptionProvider(provider.type) ||
+          input.includeAllClaudeSubscriptions === true ||
+          provider.id === selectedClaudeProvider?.id) &&
+        (!providerValidationFailed(provider) ||
+          provider.lastValidationFailure?.target !== undefined)
+    )
+    .flatMap((provider) =>
+      (provider.models.length > 0 ? provider.models : provider.model ? [provider.model] : ['']).map(
+        (model) =>
+          Object.freeze({
+            key: configuredModelKey(provider.id, model),
+            providerId: provider.id,
+            providerName: provider.name,
+            providerType: provider.type,
+            ...(provider.vendorId ? { vendorId: provider.vendorId } : {}),
+            model,
+            label: model || provider.name,
+            supportsImageInput: supportsImageInput(provider, model)
+          })
+      )
+    )
+}
+
+export const buildConfiguredModelCatalog = (
+  input: Readonly<{
+    providers: readonly ProviderView[]
+    activeProviderId?: string
+    claudeSubscriptionProviderId?: ClaudeSubscriptionProviderId
+    includeAllClaudeSubscriptions?: boolean
+    frameworkId: AgentFrameworkId
+    frameworkEndpoints: readonly ModelProtocol[]
+  }>
+): readonly ConfiguredModelCatalogEntry[] => {
+  return buildConfiguredModelInventory(input).flatMap((entry) => {
+    const provider = input.providers.find((candidate) => candidate.id === entry.providerId)!
+    const model = entry.model
+    const apiEndpoints = configuredModelApiEndpoints(provider, model)
+    const usesCompatibilityTransport = requiresChatCompletionsBridge(
+      { apiEndpoints },
+      { id: input.frameworkId, supportedApiTypes: input.frameworkEndpoints }
+    )
+    const frameworkCompatible = isProviderUsableByFramework(
+      { apiEndpoints, type: provider.type, codexHarnessAvailable: provider.codexHarnessAvailable },
+      { id: input.frameworkId, supportedApiTypes: input.frameworkEndpoints }
+    )
+    // The probe records its target against the provider's own best route when the framework cannot
+    // drive it (framework-agnostic probe), so the catalog must match validation records on the same
+    // endpoint — otherwise a verified entry still looks unvalidated and gets filtered out.
+    const validationEndpoint = preferredEndpoint(
+      apiEndpoints,
+      provider.type === 'xai-subscription'
+        ? (['responses'] as const)
+        : input.frameworkId === 'codex' || usesCompatibilityTransport || !frameworkCompatible
+          ? DEFAULT_ENDPOINT_ORDER
+          : input.frameworkEndpoints
+    )
+    if (
+      providerValidationFailed(provider, {
+        model,
+        endpoint: validationEndpoint,
+        ...providerValidationRoute({ ...provider, apiEndpoints }, input.frameworkId)
+      })
+    )
+      return []
+    const bridgeSupported = input.frameworkId !== 'codex' || isModelBridgeSupported(provider, model)
+    return [
+      Object.freeze({
+        ...entry,
+        selectable: frameworkCompatible && bridgeSupported,
+        ...(!frameworkCompatible
+          ? { unavailableReason: 'framework-incompatible' as const }
+          : !bridgeSupported
+            ? { unavailableReason: 'model-bridge-unsupported' as const }
+            : {})
+      })
+    ]
+  })
+}

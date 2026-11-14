@@ -1,0 +1,88 @@
+/* eslint-disable @typescript-eslint/explicit-function-return-type */
+import { lstat, readdir, rmdir, unlink } from 'node:fs/promises'
+import { join } from 'node:path'
+
+const names = {
+  '': /^(structure(?:\.pending)?\.json)$/,
+  geometry: /^(probe\.json|page-\d+(?:-candidates)?\.png)$/,
+  inference: /^(onnx-probe\.json|page-\d+-detected\.png|page-\d+-table-\d+\.(?:png|tsv))$/,
+  thumbnails:
+    /^(?:p\d+-(?:figure|table|algorithm|graphical-table|open-rule-table|native-ordinary-three-line)-\d+\.png|page-\d+-table-\d+\.png(?:\.(?:bottom-strip|native-marker)\.pending)?)$/
+}
+
+// Keep optional cell origins only when they fit the existing manifest byte limit.
+// Decoder node/text limits are checked again by main before cache publication.
+export function serializeWorkerResult(result) {
+  const serialize = (value, omitOrigins) =>
+    JSON.stringify(
+      value,
+      (key, value) =>
+        key === 'sourceTokens' ||
+        (omitOrigins &&
+          (key === 'sourceItems' ||
+            key === 'sourceSegments' ||
+            key === 'nativeBody' ||
+            key === 'unreliableMathSourceItems'))
+          ? undefined
+          : value,
+      2
+    ) + '\n'
+  const text = serialize(result, false)
+  if (Buffer.byteLength(text) <= 8 * 1024 ** 2) return text
+  const bareText = serialize(result, true),
+    bare = JSON.parse(bareText),
+    original = JSON.parse(text),
+    bundles = []
+  // Every element includes all its parts, body proof and mathematical annotations.
+  // A large element must not erase the complete evidence of smaller neighbours.
+  for (const kind of ['figures', 'tables', 'algorithms'])
+    for (const [index, element] of (original[kind] ?? []).entries()) {
+      const cost =
+        Buffer.byteLength(serialize(element, false)) -
+        Buffer.byteLength(serialize(bare[kind][index], false))
+      if (cost > 0) bundles.push({ kind, index, element, cost, order: bundles.length })
+    }
+  let selected = bareText
+  for (const { kind, index, element } of bundles.sort(
+    (a, b) => a.cost - b.cost || a.order - b.order
+  )) {
+    const previous = bare[kind][index]
+    bare[kind][index] = element
+    const candidate = serialize(bare, false)
+    if (Buffer.byteLength(candidate) <= 8 * 1024 ** 2) selected = candidate
+    else bare[kind][index] = previous
+  }
+  return selected
+}
+
+// Only paths produced by this extractor are owned. Unexpected entries remain a cleanup barrier.
+export async function inspectScratch(root, remove = false) {
+  let bytes = 0
+  const visit = async (directory, kind) => {
+    const info = await lstat(directory)
+    if (!info.isDirectory() || info.isSymbolicLink())
+      throw new Error('Unsafe PDF scratch directory.')
+    for (const name of await readdir(directory)) {
+      const path = join(directory, name)
+      const entry = await lstat(path)
+      if (
+        kind === '' &&
+        ['geometry', 'inference', 'thumbnails'].includes(name) &&
+        entry.isDirectory() &&
+        !entry.isSymbolicLink()
+      ) {
+        await visit(path, name)
+      } else if (entry.isFile() && !entry.isSymbolicLink() && names[kind].test(name)) {
+        bytes += entry.size
+        if (remove) await unlink(path)
+      } else throw new Error('Unexpected PDF scratch entry retained.')
+    }
+    if (remove) await rmdir(directory)
+  }
+  try {
+    await visit(root, '')
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error
+  }
+  return bytes
+}

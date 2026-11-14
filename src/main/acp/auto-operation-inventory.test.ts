@@ -1,0 +1,231 @@
+import { createHash } from 'node:crypto'
+import { readdirSync, readFileSync } from 'node:fs'
+import { join, relative } from 'node:path'
+import ts from 'typescript'
+import { describe, expect, it } from 'vitest'
+import { z } from 'zod'
+import { notebookRpcToolsForEnvironment } from '../notebook/mcp-server'
+import { generatePlanToolSchema } from '../session-plan/plan-mcp-server'
+import {
+  ACTIVITY_GROUP_MCP_SERVER_NAME,
+  BEGIN_ACTIVITY_GROUP_TOOL_NAME
+} from '../../shared/activity-groups'
+
+// This is an Auto review inventory, deliberately separate from remembered permission identities.
+// Legacy entries require no migration of their existing authorization contract.
+const registrations: Record<
+  string,
+  'allow_once' | 'inner_authorization' | 'legacy' | 'operations' | 'review'
+> = {
+  "artifacts/mcp-server.ts:'write_artifact_file'": 'allow_once',
+  'literature/library-mcp-server.ts:LITERATURE_LIBRARY_SEARCH_TOOL_NAME': 'allow_once',
+  'literature/library-mcp-server.ts:LITERATURE_LIBRARY_FORMAT_REFERENCES_TOOL_NAME': 'allow_once',
+  'literature/library-mcp-server.ts:LITERATURE_LIBRARY_FORMAT_DOCUMENT_TOOL_NAME': 'allow_once',
+  'literature/library-mcp-server.ts:LITERATURE_LIBRARY_PREPARE_LATEX_TOOL_NAME': 'allow_once',
+  'literature/library-mcp-server.ts:LITERATURE_LIBRARY_READ_ABSTRACT_TOOL_NAME': 'allow_once',
+  'literature/library-mcp-server.ts:LITERATURE_LIBRARY_READ_PDF_TOOL_NAME': 'allow_once',
+  'literature/library-mcp-server.ts:LITERATURE_LIBRARY_SAVE_TOOL_NAME': 'allow_once',
+  "literature/library-mcp-server.ts:'acquire_pdf'": 'allow_once',
+  'literature/mcp-server.ts:LITERATURE_READ_DOCUMENT_TOOL_NAME': 'allow_once',
+  "literature/mcp-server.ts:'list_pdf_elements'": 'allow_once',
+  "literature/mcp-server.ts:'read_pdf_element'": 'allow_once',
+  // Reading annotations use the verified Literature identity; read-only calls skip the prompt,
+  // while create remains a one-call Auto approval.
+  "literature/mcp-server.ts:'list_pdf_annotations'": 'allow_once',
+  "literature/mcp-server.ts:'locate_pdf_annotation_target'": 'allow_once',
+  "literature/mcp-server.ts:'create_pdf_annotation'": 'allow_once',
+  'notebook/mcp-server.ts:definition.name': 'operations',
+  'reviewer/mcp-server.ts:REVIEWER_MCP_TOOLS.readTurn': 'legacy',
+  'reviewer/mcp-server.ts:REVIEWER_MCP_TOOLS.queryExecutionLog': 'legacy',
+  'reviewer/mcp-server.ts:REVIEWER_MCP_TOOLS.readArtifact': 'legacy',
+  'reviewer/mcp-server.ts:REVIEWER_MCP_TOOLS.submitFindings': 'legacy',
+  "session-plan/plan-mcp-server.ts:'generate_plan'": 'operations',
+  "session-plan/plan-mcp-server.ts:'update_step_status'": 'legacy',
+  'side-chat/host-message-mcp-server.ts:HOST_SEND_MESSAGE_TOOL_NAME': 'legacy',
+  'skills/mcp-server.ts:REQUEST_SKILL_IMPORT_TOOL_NAME': 'inner_authorization',
+  'skills/runtime-mcp-server.ts:LOAD_SKILL_TOOL_NAME': 'legacy'
+}
+const notebookOperations: Record<string, 'inner_authorization' | 'legacy' | 'operations'> = {
+  ask_user_question: 'inner_authorization',
+  notebook_execute: 'legacy',
+  background_run: 'operations',
+  repl_execute: 'legacy',
+  bash_execute: 'legacy',
+  request_network_access: 'inner_authorization',
+  notebook_state: 'legacy',
+  list_authorized_directories: 'legacy',
+  list_notebook_runtimes: 'legacy',
+  notebook_bind_runtime: 'legacy',
+  notebook_switch_runtime: 'legacy',
+  notebook_restart: 'legacy',
+  notebook_shutdown: 'legacy',
+  inspect_packages: 'legacy',
+  manage_packages: 'legacy',
+  manage_environments: 'operations',
+  list_memory_categories: 'legacy',
+  search_memories: 'legacy',
+  remember_memory: 'legacy',
+  wsl_setup_diagnostics: 'legacy',
+  wsl_setup_install_platform: 'legacy',
+  wsl_setup_install_recommended_distro: 'legacy',
+  wsl_setup_select_profile: 'legacy',
+  wsl_setup_open_terminal: 'legacy'
+}
+const mainRoot = join(import.meta.dirname, '..')
+const readSource = (path: string): string => readFileSync(path, 'utf8').replaceAll('\r\n', '\n')
+const sourceFiles = (directory: string): string[] =>
+  readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
+    const path = join(directory, entry.name)
+    if (entry.isDirectory()) return sourceFiles(path)
+    if (entry.name.endsWith('.ts') && !entry.name.includes('.test.')) return [path]
+    return []
+  })
+const collectRegistrations = (source: string, filename: string): string[] => {
+  const file = ts.createSourceFile(filename, source, ts.ScriptTarget.Latest, true)
+  const names: string[] = []
+  const visit = (node: ts.Node): void => {
+    if (
+      ts.isCallExpression(node) &&
+      ts.isPropertyAccessExpression(node.expression) &&
+      node.expression.name.text === 'registerTool'
+    ) {
+      names.push(`${filename}:${node.arguments[0].getText(file)}`)
+    }
+    ts.forEachChild(node, visit)
+  }
+  visit(file)
+  return names
+}
+const digest = (value: unknown): string =>
+  createHash('sha256').update(JSON.stringify(value)).digest('hex')
+const tools = notebookRpcToolsForEnvironment({ memoryTools: true, wslSetupTools: true })
+const automaticSourceFingerprints = (read = readSource): Record<string, string> => {
+  const files = [
+    ...new Set(
+      Object.entries(registrations)
+        .filter(([, mode]) => mode !== 'legacy')
+        .map(([key]) => key.slice(0, key.indexOf(':')))
+    )
+  ]
+  return Object.fromEntries(files.sort().map((file) => [file, digest(read(join(mainRoot, file)))]))
+}
+
+describe('Auto operation completeness against real tool registrations', () => {
+  it('requires an explicit Auto disposition for every actual app tool', () => {
+    const actual = sourceFiles(mainRoot).flatMap((path) =>
+      collectRegistrations(readSource(path), relative(mainRoot, path).replaceAll('\\', '/'))
+    )
+    expect(actual.sort()).toEqual(Object.keys(registrations).sort())
+    expect(tools.map((tool) => tool.name).sort()).toEqual(Object.keys(notebookOperations).sort())
+    // Activity is a compatibility declaration identity, not a registered MCP server in this tree.
+    expect(`${ACTIVITY_GROUP_MCP_SERVER_NAME}/${BEGIN_ACTIVITY_GROUP_TOOL_NAME}`).toBe(
+      'open-science-activity/begin_activity_group'
+    )
+  })
+
+  it('detects a newly registered tool independently of the grant catalog', () => {
+    const added = collectRegistrations(
+      "server.registerTool('new_effect', {}, handler)",
+      'notebook/mcp-server.ts'
+    )
+    expect(added.filter((key) => !(key in registrations))).toEqual([
+      "notebook/mcp-server.ts:'new_effect'"
+    ])
+    expect('new_effect' in notebookOperations).toBe(false)
+  })
+
+  it('requires review when automatically handled schemas or handler branches change', () => {
+    // Update these fingerprints only after reviewing the new parameter/handler branches against
+    // the operation classifier and its positive/negative tests. Whole-source hashes intentionally
+    // err toward extra review; they cannot silently bless a newly added side-effect branch.
+    const definitions = automaticSourceFingerprints()
+    const notebookSchemas = Object.fromEntries(
+      tools
+        .filter((tool) => notebookOperations[tool.name] !== 'legacy')
+        .map((tool) => [
+          tool.name,
+          digest({
+            schema: z.toJSONSchema(z.strictObject(tool.inputSchema)),
+            method: tool.method,
+            resolveMethod: tool.resolveMethod?.toString()
+          })
+        ])
+    )
+    const sharedContracts = {
+      literatureDiscovery: digest(readSource(join(mainRoot, 'literature/discovery-contract.ts'))),
+      planSchema: digest(z.toJSONSchema(generatePlanToolSchema)),
+      planValidation: digest(readSource(join(mainRoot, '../shared/session-plan/contract.ts'))),
+      activityDeclaration: digest(readSource(join(mainRoot, '../shared/activity-groups.ts')))
+    }
+    expect({ definitions, notebookSchemas, sharedContracts }).toEqual({
+      definitions: {
+        // Reviewed: errors name a code and next step, and legacy top-level content/encoding is
+        // rejected in favor of source. Allow-once disposition and owner-checked source access are unchanged.
+        'artifacts/mcp-server.ts':
+          '9e0e7684e9ce91f56ba4e6bfc49bcd2a1bb97bf6dd2a22bd686307c9d634dde2',
+        // Reviewed: save_to_inbox/acquire_pdf advertise candidates as objects; the same strict
+        // candidate schema now validates inline records in the handler before any save or download.
+        // Citation tool descriptions are shortened only. Trusted origin, permission inputs and
+        // allow-once disposition are unchanged.
+        'literature/library-mcp-server.ts':
+          '400ea9fb1739b849dad3f55d453b02be9879bda3e86fde29ebb34084d3e7e33e',
+        // Reviewed: errors keep specific codes with a next step and annotation cursors are opaque
+        // strings. Strict inputs, mounted-server checks and single-use authorization are unchanged.
+        'literature/mcp-server.ts':
+          '561a62c02556d3677874d524dd7c9433b3131a42eda21f526d8684888a673cd9',
+        // Reviewed: interpreter descriptions now explain idle reclamation and volatile variables.
+        // Tool schemas, handlers, operation classifiers and Auto dispositions are unchanged.
+        'notebook/mcp-server.ts':
+          '40c4edee0775cde34095c02aee02764a465792fb657ed62a40b64dcf666b1718',
+        // Reviewed: invalid-plan errors carry repair guidance; the handler call, its result and the
+        // Plan operation dispositions are unchanged.
+        'session-plan/plan-mcp-server.ts':
+          '1451e969ed1af4ddea333c4005f11713d39f8590083099c0ce3c73b47937d326',
+        // Reviewed: import errors carry codes and next steps; the schema and preview handoff are unchanged.
+        'skills/mcp-server.ts': '75e23698e0b11be9919ae224e1516ba82241aa703a20ae29c50448c35ce1d8da'
+      },
+      notebookSchemas: {
+        // Reviewed: required question and option label strings must contain non-whitespace.
+        ask_user_question: 'eaf58cc178cc28d01fd208393f67dc394f374b4dd80f822158942db8a3c48afb',
+        background_run: '4198921bb3f61261431524f7e57c92d8713bfe5db49c360a30b66b3cc4e027fd',
+        manage_environments: '15d33c6e75c14aaddad62bc062f714238ae7c87ab08976d77efd1f77e8641675',
+        request_network_access: '019beadbad4627d5ad4dc2c1bfbf5cc3f777ecf5382df20291952cadbba3eeaf'
+      },
+      sharedContracts: {
+        activityDeclaration: '1739b6cfadd2912aa53f4d11bf69d908da37d5f822476a998b928e9de7ddffdc',
+        literatureDiscovery: '3ded9eab859b472f0d20d7a232c8971a517f3b493db318efb0a07753278fdee6',
+        planSchema: '16f6ba38e7ae9320c2fb9d1a215592c11ada256781882e5e3f16336eb303cfb7',
+        planValidation: 'fb649e539cdd8f71abd34ec329ca7ee378cf7605fcbe8d0123b7703ed7dedddb'
+      }
+    })
+  })
+
+  it('detects a permission-relevant Notebook callback change without a schema change', () => {
+    const path = join(mainRoot, 'notebook/mcp-server.ts')
+    const original = readSource(path)
+    const branch = 'const rpcMethod = definition.resolveMethod?.(input) ?? definition.method'
+    expect(original).toContain(branch)
+    const changed = original.replace(
+      branch,
+      `const rpcMethod = asRecord(input)?.name === 'analysis' ? 'executeShell' :
+        (definition.resolveMethod?.(input) ?? definition.method)`
+    )
+    // Same registered tools, same exported schemas and resolveMethod; only the callback changed.
+    expect(collectRegistrations(changed, path)).toEqual(collectRegistrations(original, path))
+    const reviewed = automaticSourceFingerprints()
+    const mutated = automaticSourceFingerprints((file) =>
+      file === path ? changed : readSource(file)
+    )
+    expect(mutated).not.toEqual(reviewed)
+    expect(mutated['notebook/mcp-server.ts']).not.toBe(reviewed['notebook/mcp-server.ts'])
+  })
+
+  it('detects an unmapped operation added to an automatic tool schema', () => {
+    const tool = tools.find((tool) => tool.name === 'background_run')!
+    const original = z.toJSONSchema(z.strictObject(tool.inputSchema))
+    const changed = z.toJSONSchema(
+      z.strictObject({ ...tool.inputSchema, action: z.enum(['query', 'cancel', 'start']) })
+    )
+    expect(digest(changed)).not.toBe(digest(original))
+  })
+})

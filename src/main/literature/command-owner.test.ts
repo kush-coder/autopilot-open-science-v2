@@ -1,0 +1,624 @@
+import { LiteratureReferenceResolver } from '@aipoch/literature-discovery'
+import { LiteratureCitationFormatter } from '@aipoch/literature-citations'
+import { LITERATURE_RECORD_IMPORT_MAX_BYTES } from '@aipoch/literature-citations/contracts'
+import { runInNewContext } from 'node:vm'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+import {
+  literatureItemInputSchema,
+  literatureRecordImportRequestSchema
+} from '@aipoch/literature-library/contracts'
+
+vi.mock('../renderer-broadcast', () => ({ broadcastToRenderers: vi.fn() }))
+vi.mock('../storage/migration-state', () => ({
+  withDataRootWrite: vi.fn(async (operation: () => Promise<unknown>) => operation())
+}))
+import { broadcastToRenderers } from '../renderer-broadcast'
+import { withDataRootWrite } from '../storage/migration-state'
+import { createLiteratureCommandOwner } from './command-owner'
+import { ApplicationCommandError } from '../../shared/application-command-contract'
+
+type Services = Parameters<typeof createLiteratureCommandOwner>[0]
+const request = {
+  projectId: 'project',
+  sessionId: 'session',
+  artifactId: 'artifact',
+  versionId: 'v1',
+  mode: 'save' as const,
+  styleId: 'apa',
+  locale: 'en-US' as const,
+  expectedHeadVersionId: 'v1',
+  operationId: 'op1'
+}
+type Mocks<Names extends string> = Record<Names, ReturnType<typeof vi.fn>>
+const fixture = (): {
+  owner: ReturnType<typeof createLiteratureCommandOwner>
+  lease: Mocks<'readRange' | 'close'> & { size: number }
+  versions: Mocks<'openVersion' | 'saveDerivedArtifactEdit'>
+  formatter: Mocks<'formatReferences' | 'parseReferences'>
+  catalog: Mocks<'inspectImportItems' | 'importItems'>
+  document: Mocks<'reformat'>
+} => {
+  const literature = { references: [{ itemId: 'item', item: { title: 'Reference' } }] }
+  const lease = {
+    size: 3,
+    readRange: vi.fn().mockResolvedValue(new Uint8Array([1, 2, 3])),
+    close: vi.fn()
+  }
+  const versions = {
+    openVersion: vi.fn().mockResolvedValue(lease),
+    saveDerivedArtifactEdit: vi.fn().mockResolvedValue({
+      kind: 'created',
+      replayed: false,
+      version: { id: 'v2', versionNumber: 2 }
+    })
+  }
+  const formatter = {
+    formatReferences: vi.fn().mockResolvedValue('references'),
+    parseReferences: vi
+      .fn()
+      .mockResolvedValue({ items: [{ title: 'Reference' }], errors: [], warnings: ['warning'] })
+  }
+  const catalog = {
+    inspectImportItems: vi.fn().mockResolvedValue(['entry']),
+    importItems: vi.fn().mockResolvedValue(['imported'])
+  }
+  const document = {
+    reformat: vi.fn().mockResolvedValue({ content: new Uint8Array([4]), literature })
+  }
+  const services = {
+    artifactProvenanceRepository: { getVersionLiterature: vi.fn().mockResolvedValue(literature) },
+    managedFileVersionService: versions,
+    literatureCitationDocument: document,
+    literatureCitationFormatter: formatter,
+    literatureCatalog: catalog
+  }
+  // Only these services participate in the document and import workflows under test.
+  const owner = createLiteratureCommandOwner(services as unknown as Services)
+  return { owner, lease, versions, formatter, catalog, document }
+}
+
+beforeEach(() => vi.clearAllMocks())
+
+describe('Literature command workflows', () => {
+  it.each([
+    'ZOTERO_BATCH_POLICY_CONFLICT',
+    'ZOTERO_FILL_TYPE_CONFLICT',
+    'ZOTERO_COLLECTION_CONFLICT',
+    'ZOTERO_PREVIEW_CHANGED',
+    'ZOTERO_CONNECTION_FAILED',
+    'ZOTERO_REQUEST_TIMED_OUT',
+    'ZOTERO_LOCAL_API_DISABLED'
+  ])('exposes the safe collector error %s to Web callers', async (message) => {
+    const owner = createLiteratureCommandOwner({
+      literatureCollector: { run: vi.fn().mockRejectedValue(new Error(message)) }
+    } as unknown as Services)
+    await expect(owner.collect({ kind: 'zotero-preview' })).rejects.toEqual(
+      new ApplicationCommandError('command-failed', message)
+    )
+  })
+
+  it('leaves unexpected collector errors private', async () => {
+    const error = new Error('private database path')
+    const owner = createLiteratureCommandOwner({
+      literatureCollector: { run: vi.fn().mockRejectedValue(error) }
+    } as unknown as Services)
+    await expect(owner.collect({ kind: 'zotero-preview' })).rejects.toBe(error)
+    expect(error).not.toBeInstanceOf(ApplicationCommandError)
+  })
+
+  it('forwards Zotero collection to its owner under the command write gate', async () => {
+    const result = { kind: 'preview' }
+    const run = vi.fn().mockResolvedValue(result)
+    const owner = createLiteratureCommandOwner({
+      literatureCollector: { run }
+    } as unknown as Services)
+    const request = { kind: 'zotero-preview' as const }
+    const signal = new AbortController().signal
+    await expect(owner.collect(request, signal)).resolves.toBe(result)
+    expect(run).toHaveBeenCalledWith(request, signal)
+    expect(withDataRootWrite).not.toHaveBeenCalled()
+  })
+  it('forwards study snapshot requests and cancellation without writing to the catalog', async () => {
+    const run = vi.fn().mockResolvedValue({ itemId: 'paper' })
+    const owner = createLiteratureCommandOwner({
+      literatureOverview: { run }
+    } as unknown as Services)
+    const request = { itemId: 'paper', expectedSourceKey: 'source-key', language: 'en' }
+    const signal = new AbortController().signal
+    await owner.studySnapshot(request, signal)
+    expect(run).toHaveBeenCalledWith(request, signal)
+    expect(withDataRootWrite).not.toHaveBeenCalled()
+    expect(broadcastToRenderers).not.toHaveBeenCalled()
+  })
+  it('forwards citation relationship queries and caller cancellation without publishing changes', async () => {
+    const run = vi.fn().mockResolvedValue({ records: [] })
+    const owner = createLiteratureCommandOwner({
+      literatureRelatedFinder: { run }
+    } as unknown as Services)
+    const request = {
+      itemId: 'paper',
+      expectedMetadataRevision: 1,
+      direction: 'references' as const,
+      offset: 0
+    }
+    const signal = new AbortController().signal
+    await owner.related(request, signal)
+    expect(run).toHaveBeenCalledWith(request, signal)
+    expect(withDataRootWrite).not.toHaveBeenCalled()
+    expect(broadcastToRenderers).not.toHaveBeenCalled()
+  })
+  it('forwards supplement queries and caller cancellation without publishing changes', async () => {
+    const run = vi.fn().mockResolvedValue({ records: [] })
+    const owner = createLiteratureCommandOwner({
+      literatureSupplementFinder: { run }
+    } as unknown as Services)
+    const request = { itemId: 'paper', expectedMetadataRevision: 1, provider: 'datacite' as const }
+    const signal = new AbortController().signal
+    await owner.supplements(request, signal)
+    expect(run).toHaveBeenCalledWith(request, signal)
+    expect(withDataRootWrite).not.toHaveBeenCalled()
+    expect(broadcastToRenderers).not.toHaveBeenCalled()
+  })
+  it('forwards publication checks with caller cancellation and leaves the write gate to persistence', async () => {
+    const result = { itemId: 'paper', metadataRevision: 1 }
+    const run = vi.fn().mockResolvedValue(result)
+    const owner = createLiteratureCommandOwner({
+      literaturePublicationChecker: { run }
+    } as unknown as Services)
+    const signal = new AbortController().signal
+    for (const mode of ['get', 'check'] as const) {
+      const request = { mode, itemId: 'paper', expectedMetadataRevision: 1 }
+      await expect(owner.publicationCheck(request, signal)).resolves.toBe(result)
+      expect(run).toHaveBeenLastCalledWith(request, signal)
+    }
+    expect(withDataRootWrite).not.toHaveBeenCalled()
+    expect(broadcastToRenderers).not.toHaveBeenCalled()
+  })
+
+  it('routes exact candidate reads through the catalog without publishing mutations', async () => {
+    const result = {
+      candidates: [{ candidateId: 'a', state: 'accepted', acceptedItemId: 'paper' }]
+    }
+    const getCandidateStates = vi.fn().mockResolvedValue(result)
+    const owner = createLiteratureCommandOwner({
+      literatureCatalog: { getCandidateStates }
+    } as unknown as Services)
+    const request = { candidateIds: ['a'] }
+    await expect(owner.getCandidateStates(request)).resolves.toBe(result)
+    expect(getCandidateStates).toHaveBeenCalledWith(request)
+    expect(broadcastToRenderers).not.toHaveBeenCalled()
+  })
+
+  it('routes journal requests through the dataset service', async () => {
+    const result = { datasets: [] }
+    const journalAttributes = { run: vi.fn().mockResolvedValue(result) }
+    const owner = createLiteratureCommandOwner({ journalAttributes } as unknown as Services)
+    const request = { action: 'list' as const }
+    await expect(owner.journals(request)).resolves.toBe(result)
+    expect(journalAttributes.run).toHaveBeenCalledWith(request)
+  })
+
+  it('uses the requested item order for citations and both export formats', async () => {
+    const first = { id: 'first', item: { title: 'First paper' } }
+    const second = { id: 'second', item: { title: 'Second paper' } }
+    const formatReferences = vi.fn()
+    const exportReferences = vi.fn()
+    const owner = createLiteratureCommandOwner({
+      literatureCatalog: { getMany: vi.fn().mockResolvedValue([first, second]) },
+      literatureCitationFormatter: { formatReferences, exportReferences }
+    } as unknown as Services)
+
+    await owner.formatReferences({ itemIds: ['second', 'first'], styleId: 'apa', locale: 'en-US' })
+
+    expect(formatReferences).toHaveBeenCalledWith([second, first], 'apa', 'en-US')
+    expect(exportReferences).toHaveBeenCalledWith([second, first], 'bibtex')
+    expect(exportReferences).toHaveBeenCalledWith([second, first], 'ris')
+  })
+
+  it('previews references without acquiring a file lease or creating a version', async () => {
+    const { owner, versions, formatter } = fixture()
+    await expect(owner.formatDocument({ ...request, mode: 'preview' })).resolves.toEqual({
+      mode: 'preview',
+      references: 'references'
+    })
+    expect(formatter.formatReferences).toHaveBeenCalledWith(
+      [{ id: 'item', item: { title: 'Reference' } }],
+      'apa',
+      'en-US'
+    )
+    expect(versions.openVersion).not.toHaveBeenCalled()
+    expect(versions.saveDerivedArtifactEdit).not.toHaveBeenCalled()
+    expect(broadcastToRenderers).not.toHaveBeenCalled()
+  })
+
+  it.each([false, true])(
+    'preserves revision and replay semantics (replayed=%s)',
+    async (replayed) => {
+      const { owner, versions, lease, document } = fixture()
+      versions.saveDerivedArtifactEdit.mockResolvedValue({
+        kind: 'created',
+        replayed,
+        version: { id: 'v2', versionNumber: 2 }
+      })
+      await expect(owner.formatDocument(request)).resolves.toEqual({
+        mode: 'save',
+        versionId: 'v2',
+        versionNumber: 2
+      })
+      expect(versions.saveDerivedArtifactEdit).toHaveBeenCalledWith(
+        expect.objectContaining({
+          basedOnVersionId: 'v1',
+          expectedHeadVersionId: 'v1',
+          operationId: 'op1',
+          content: new Uint8Array([4])
+        })
+      )
+      expect(withDataRootWrite).toHaveBeenCalledTimes(1)
+      expect(lease.close).toHaveBeenCalledTimes(1)
+      expect(lease.close.mock.invocationCallOrder[0]).toBeLessThan(
+        document.reformat.mock.invocationCallOrder[0]
+      )
+      expect(broadcastToRenderers).toHaveBeenCalledTimes(replayed ? 0 : 1)
+      if (!replayed)
+        expect(broadcastToRenderers).toHaveBeenCalledWith('project-files:changed', {
+          projectId: 'project',
+          sources: ['artifact'],
+          kind: 'upsert'
+        })
+    }
+  )
+
+  it('closes a failed read before propagating the error and never saves', async () => {
+    const { owner, versions, lease } = fixture()
+    const failure = new Error('read failed')
+    lease.readRange.mockRejectedValueOnce(failure)
+    await expect(owner.formatDocument(request)).rejects.toBe(failure)
+    expect(lease.close).toHaveBeenCalledTimes(1)
+    expect(versions.saveDerivedArtifactEdit).not.toHaveBeenCalled()
+    expect(broadcastToRenderers).not.toHaveBeenCalled()
+  })
+
+  it('reports revision conflicts without publishing a change event', async () => {
+    const { owner, versions } = fixture()
+    versions.saveDerivedArtifactEdit.mockResolvedValueOnce({ kind: 'conflict' })
+    await expect(owner.formatDocument(request)).rejects.toThrow('This file has a newer version.')
+    expect(broadcastToRenderers).not.toHaveBeenCalled()
+  })
+
+  it('keeps import preview read-only and passes the duplicate policy when importing', async () => {
+    const { owner, catalog } = fixture()
+    const input = {
+      content: 'citation',
+      collectionId: 'collection',
+      duplicatePolicy: 'reuse' as const
+    }
+    await expect(owner.importRecords({ ...input, mode: 'preview' })).resolves.toMatchObject({
+      entries: ['entry']
+    })
+    expect(catalog.importItems).not.toHaveBeenCalled()
+    await owner.importRecords({ ...input, mode: 'commit' })
+    expect(catalog.inspectImportItems).toHaveBeenCalledWith(
+      [{ title: 'Reference' }],
+      [],
+      ['warning']
+    )
+    expect(catalog.importItems).toHaveBeenCalledWith(
+      [{ title: 'Reference' }],
+      'collection',
+      'reuse'
+    )
+  })
+})
+
+it('maps package style errors to the existing application command error envelope', async () => {
+  const { CitationStyleError } = await import('@aipoch/literature-citations')
+  const { toApplicationCommandErrorEnvelope } =
+    await import('../../shared/application-command-contract')
+  const owner = createLiteratureCommandOwner({
+    literatureCitationFormatter: {
+      citationStyles: async () => {
+        throw new CitationStyleError('csl-undefined-macro', 'Unknown macro', { macro: 'missing' })
+      }
+    }
+  } as unknown as Services)
+  const error = await owner
+    .citationStyles({ kind: 'import', content: '<style/>' })
+    .catch((error) => error)
+  expect(toApplicationCommandErrorEnvelope(error)).toEqual({
+    code: 'csl-undefined-macro',
+    message: 'Unknown macro',
+    parameters: { macro: 'missing' }
+  })
+})
+
+describe('selected reference import', () => {
+  it('imports explicitly selected rows in source order and maps preview diagnostics to source indices', async () => {
+    const { owner, formatter, catalog } = fixture()
+    const items = [{ title: 'First' }, { title: 'Conflicting' }, { title: 'Last' }]
+    const entries = items.map((item, index) => ({
+      index,
+      item,
+      status: index === 1 ? 'conflict' : 'ready'
+    }))
+    formatter.parseReferences.mockResolvedValue({ items, errors: [], warnings: [] })
+    catalog.inspectImportItems.mockResolvedValue([entries[0], { ...entries[2], index: 1 }])
+    catalog.importItems.mockResolvedValue({
+      itemIds: ['first', 'last'],
+      createdCount: 2,
+      reusedCount: 0
+    })
+    const result = await owner.importRecords({
+      mode: 'commit',
+      content: 'source',
+      selectedItemIndexes: [2, 0],
+      collectionId: 'collection',
+      duplicatePolicy: 'reuse'
+    })
+    expect(catalog.importItems).toHaveBeenCalledWith([items[0], items[2]], 'collection', 'reuse')
+    expect(result.entries).toEqual([entries[0], entries[2]])
+    expect(result.items).toEqual(items)
+    expect(result.imported?.itemIds).toEqual(['first', 'last'])
+  })
+
+  it('previews only selected identities and maps conflicts and invalid rows back to source indices', async () => {
+    const { owner, formatter, catalog } = fixture()
+    const items = [{ title: 'Excluded' }, { title: 'First selected' }, { title: 'Second selected' }]
+    const errors = [{ preview: 'Invalid', error: 'Invalid input' }]
+    formatter.parseReferences.mockResolvedValue({
+      items,
+      errors,
+      warnings: [[], ['missing-year'], []]
+    })
+    catalog.inspectImportItems.mockResolvedValue([
+      { index: 0, item: items[1], status: 'ready', warnings: ['missing-year'] },
+      {
+        index: 1,
+        item: items[2],
+        status: 'conflict',
+        conflict: { identifiers: [], matches: [{ inputIndex: 0, title: 'First selected' }] }
+      },
+      { index: 2, status: 'invalid', error: 'Invalid input' }
+    ])
+    const result = await owner.importRecords({
+      mode: 'preview',
+      content: 'source',
+      selectedItemIndexes: [2, 1]
+    })
+    expect(catalog.inspectImportItems).toHaveBeenCalledWith([items[1], items[2]], errors, [
+      ['missing-year'],
+      []
+    ])
+    expect(result.items).toEqual(items)
+    expect(result.entries.map((entry) => entry.index)).toEqual([1, 2, 3])
+    expect(result.entries[1].conflict?.matches).toEqual([
+      { inputIndex: 1, title: 'First selected' }
+    ])
+    expect(catalog.importItems).not.toHaveBeenCalled()
+  })
+
+  it.each([[], [0, 0], [-1], [1.5], [1]].map((indexes) => ({ indexes })))(
+    'rejects invalid selections %j before any write',
+    async ({ indexes: selectedItemIndexes }) => {
+      const { owner, catalog } = fixture()
+      await expect(
+        owner.importRecords({ mode: 'commit', content: 'source', selectedItemIndexes })
+      ).rejects.toThrow('Import selection is invalid')
+      expect(catalog.importItems).not.toHaveBeenCalled()
+    }
+  )
+
+  it('keeps selected identity conflicts authoritative at commit', async () => {
+    const { owner, catalog } = fixture()
+    catalog.importItems.mockRejectedValue(new Error('conflicting identifiers'))
+    await expect(
+      owner.importRecords({ mode: 'commit', content: 'source', selectedItemIndexes: [0] })
+    ).rejects.toThrow('conflicting identifiers')
+  })
+
+  it('accepts legacy whole-file requests and validates the optional selection at the transport boundary', () => {
+    const request = { mode: 'commit', content: 'source' }
+    expect(literatureRecordImportRequestSchema.parse(request)).toEqual(request)
+    expect(
+      literatureRecordImportRequestSchema.parse({ ...request, selectedItemIndexes: [0, 2] })
+    ).toEqual({ ...request, selectedItemIndexes: [0, 2] })
+    for (const indexes of [
+      [],
+      [-1],
+      [0, 0],
+      [0.1],
+      Array.from({ length: 1001 }, (_, index) => index)
+    ]) {
+      expect(
+        literatureRecordImportRequestSchema.safeParse({ ...request, selectedItemIndexes: indexes })
+          .success
+      ).toBe(false)
+    }
+    expect(
+      literatureRecordImportRequestSchema.safeParse({
+        mode: 'preview',
+        content: 'source',
+        selectedItemIndexes: [0]
+      }).success
+    ).toBe(true)
+  })
+})
+
+it.each([
+  ['10.1234/paper', 'doi:10.1234/paper'],
+  ['pmid:12345', 'pmid:12345'],
+  [' PMID:12345 ', 'PMID:12345'],
+  ['pmcid:PMC12345', 'pmcid:PMC12345'],
+  [' PMCID:PMC12345 ', 'PMCID:PMC12345'],
+  ['arxiv:2401.12345', 'arxiv:2401.12345'],
+  [' ArXiv:2401.12345 ', 'ArXiv:2401.12345']
+])('looks up %s without mutating the library', async (input, reference) => {
+  const item = { title: 'Resolved reference' }
+  const lookup = vi.fn().mockResolvedValue({ item })
+  const owner = createLiteratureCommandOwner({
+    literatureReferenceResolver: { lookup }
+  } as unknown as Services)
+  await expect(owner.lookupMetadata(input)).resolves.toBe(item)
+  expect(lookup).toHaveBeenCalledWith(reference)
+  expect(broadcastToRenderers).not.toHaveBeenCalled()
+})
+
+it('accepts exactly one bounded import source at the transport boundary', () => {
+  const items = [literatureItemInputSchema.parse({ itemType: 'review', title: 'Native record' })]
+  for (const mode of ['preview', 'commit'] as const) {
+    expect(literatureRecordImportRequestSchema.parse({ mode, items })).toEqual({ mode, items })
+    for (const source of [
+      {},
+      { items: [] },
+      { items, content: 'ambiguous' },
+      { items: [{ title: 'Incomplete' }] },
+      { items: Array.from({ length: 1001 }, () => items[0]) }
+    ]) {
+      expect(literatureRecordImportRequestSchema.safeParse({ mode, ...source }).success).toBe(false)
+    }
+  }
+})
+
+it('looks up one PMID without repeating EFetch when the abstract needs a fallback', async () => {
+  const fetchFn = vi.fn<typeof fetch>(async (url) =>
+    new URL(String(url)).pathname.endsWith('/efetch.fcgi')
+      ? new Response('PMID- 35486828\nTI  - A PubMed paper.\nAU  - Author A\n')
+      : new Response(
+          JSON.stringify({
+            resultList: {
+              result: [
+                {
+                  id: '35486828',
+                  source: 'MED',
+                  title: 'A PubMed paper.',
+                  abstractText: 'A fallback abstract.'
+                }
+              ]
+            }
+          })
+        )
+  )
+  const owner = createLiteratureCommandOwner({
+    literatureReferenceResolver: new LiteratureReferenceResolver(
+      fetchFn,
+      new LiteratureCitationFormatter()
+    )
+  } as unknown as Services)
+  const item = await owner.lookupMetadata('pmid:35486828')
+  expect(item.abstract).toBe('A fallback abstract.')
+  expect(
+    fetchFn.mock.calls.filter(([url]) => new URL(String(url)).pathname.endsWith('/efetch.fcgi'))
+  ).toHaveLength(1)
+  expect(fetchFn).toHaveBeenCalledTimes(2)
+})
+
+it.each([
+  ['preview', 'items'],
+  ['commit', 'items'],
+  ['preview', 'content'],
+  ['commit', 'content']
+] as const)('bounds UTF-8 volume for %s %s independently of record count', (mode, kind) => {
+  const abstract = '科'.repeat(12_000)
+  const item = literatureItemInputSchema.parse({
+    itemType: 'journalArticle',
+    title: 'A paper',
+    abstract
+  })
+  // Legal record count and character count, but more than 32 MiB once encoded as UTF-8.
+  const source =
+    kind === 'items'
+      ? { items: Array.from({ length: 1000 }, () => item) }
+      : { content: abstract.repeat(1000) }
+  expect(literatureRecordImportRequestSchema.safeParse({ mode, ...source }).success).toBe(false)
+})
+
+it('accepts the exact native byte budget and rejects one additional byte', () => {
+  const item = literatureItemInputSchema.parse({ itemType: 'review', title: 'A paper' })
+  const overhead = new TextEncoder().encode(JSON.stringify([item])).byteLength
+  item.abstract = 'a'.repeat(LITERATURE_RECORD_IMPORT_MAX_BYTES - overhead)
+  expect(
+    literatureRecordImportRequestSchema.safeParse({ mode: 'preview', items: [item] }).success
+  ).toBe(true)
+  item.abstract += 'a'
+  expect(
+    literatureRecordImportRequestSchema.safeParse({ mode: 'preview', items: [item] }).success
+  ).toBe(false)
+})
+
+it.each(['bigint', 'cycle'] as const)(
+  'rejects unserializable %s metadata as a validation failure',
+  (kind) => {
+    const typeFields: Record<string, unknown> = { value: BigInt(1) }
+    if (kind === 'cycle') typeFields.value = typeFields
+    const item = literatureItemInputSchema.parse({
+      itemType: 'review',
+      title: 'A paper',
+      typeFields
+    })
+    expect(
+      literatureRecordImportRequestSchema.safeParse({ mode: 'preview', items: [item] }).success
+    ).toBe(false)
+  }
+)
+
+it.each([
+  { kind: 'NaN', value: NaN },
+  { kind: 'Infinity', value: Infinity },
+  { kind: '-Infinity', value: -Infinity },
+  { kind: 'function', value: (): number => 1 },
+  { kind: 'symbol', value: Symbol('unsupported') },
+  { kind: 'Date', value: new Date(0) },
+  { kind: 'Map', value: new Map([['key', 1]]) },
+  { kind: 'Set', value: new Set([1]) },
+  { kind: 'toJSON coercion', value: { toJSON: (): number => 1 } },
+  { kind: 'undefined array entry', value: [undefined] },
+  { kind: 'array hole', value: Array(1) }
+])('rejects extension values that JSON would silently alter: $kind', ({ value }) => {
+  const item = literatureItemInputSchema.parse({
+    itemType: 'review',
+    title: 'A paper',
+    typeFields: { nested: { value } }
+  })
+  expect(
+    literatureRecordImportRequestSchema.safeParse({ mode: 'preview', items: [item] }).success
+  ).toBe(false)
+})
+
+it('accepts ordinary JSON data independently of the JavaScript realm that created it', () => {
+  const typeFields: Record<string, unknown> = runInNewContext(
+    '({ nested: { scores: [0, 1, 2], flag: false, none: null } })'
+  )
+  const item = literatureItemInputSchema.parse({
+    itemType: 'review',
+    title: 'Cross-realm paper',
+    typeFields
+  })
+  const parsed = literatureRecordImportRequestSchema.safeParse({ mode: 'preview', items: [item] })
+  expect(parsed.success).toBe(true)
+  if (parsed.success && 'items' in parsed.data)
+    expect(JSON.stringify(parsed.data.items[0].typeFields)).toBe(JSON.stringify(typeFields))
+})
+
+it.each(['new Map([["key",1]])', 'new Set([1])', 'new Date(0)'])(
+  'rejects foreign non-JSON containers: %s',
+  (expression) => {
+    const value: unknown = runInNewContext(expression)
+    const item = literatureItemInputSchema.parse({
+      itemType: 'review',
+      title: 'A paper',
+      typeFields: { value }
+    })
+    expect(
+      literatureRecordImportRequestSchema.safeParse({ mode: 'preview', items: [item] }).success
+    ).toBe(false)
+  }
+)
+
+it('forwards batch controls and cancellation without constructing storage in the adapter', async () => {
+  const run = vi.fn().mockResolvedValue(null)
+  const owner = createLiteratureCommandOwner({
+    literatureOverviewBatch: { run }
+  } as unknown as Services)
+  const signal = new AbortController().signal
+  await expect(owner.overviewBatch({ action: 'read' }, signal)).resolves.toBeNull()
+  expect(run).toHaveBeenCalledExactlyOnceWith({ action: 'read' }, signal)
+})

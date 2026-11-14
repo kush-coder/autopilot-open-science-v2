@@ -1,0 +1,30 @@
+{
+  "ownerPaths": [
+    "src/renderer/src/office-preview/main.ts",
+    "src/renderer/src/office-preview/office-preview-controller.test.ts",
+    "src/renderer/src/office-preview/office-preview-controller.ts",
+    "src/renderer/src/office-preview/office-preview-frame-bridge.test.ts",
+    "src/renderer/src/office-preview/office-preview-frame-bridge.ts",
+    "src/renderer/src/office-preview/office-preview-runtime.test.ts",
+    "src/renderer/src/office-preview/office-preview-runtime.ts",
+    "src/renderer/src/office-preview/office-preview.css"
+  ],
+  "interfacePaths": ["src/renderer/src/office-preview/office-preview-runtime.ts"],
+  "consumerModules": [],
+  "testFiles": {
+    "owner": [
+      "src/renderer/src/office-preview/office-preview-controller.test.ts",
+      "src/renderer/src/office-preview/office-preview-frame-bridge.test.ts",
+      "src/renderer/src/office-preview/office-preview-runtime.test.ts"
+    ],
+    "contract": [
+      "src/main/host-layer-dependencies.architecture.test.ts",
+      "src/renderer/src/assets/diff-colors.test.ts",
+      "src/renderer/src/assets/pdf-text-layer.test.ts",
+      "src/renderer/src/assets/provider-icons.packaging.test.ts"
+    ],
+    "consumer": ["src/renderer/src/pages/workspace/previews/office-behavior-regressions.test.ts"]
+  },
+  "capabilityOverlays": [],
+  "fallbackCapability": "renderer_view"
+}

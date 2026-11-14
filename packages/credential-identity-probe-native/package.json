@@ -1,0 +1,12 @@
+{
+  "name": "@aipoch/credential-identity-probe-native",
+  "version": "0.0.0",
+  "private": true,
+  "license": "Apache-2.0",
+  "main": "index.cjs",
+  "types": "index.d.ts",
+  "gypfile": false,
+  "scripts": {
+    "test": "node --test test/probe.test.cjs test/validator.test.cjs"
+  }
+}

@@ -1,0 +1,738 @@
+import { windowsSupervisedLaunch } from '../../../packages/notebook-network-sandbox/runtime/src/platform/windows-appcontainer'
+import { configureTestRuntimeMetadata } from '../../../test/runtime-metadata'
+import {
+  access,
+  copyFile,
+  mkdir,
+  mkdtemp,
+  readFile,
+  realpath,
+  rm,
+  symlink,
+  writeFile
+} from 'node:fs/promises'
+import { join } from 'node:path'
+import { tmpdir } from 'node:os'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { buildShellEnv, NotebookShellProcessAdapter } from './shell-process'
+import { EXTRA_PATH_DIRS } from '../settings/shell-path'
+import type { NotebookShellProcessRequest } from './shell-process'
+import { NOTEBOOK_TEXT_LIMIT_BYTES, NOTEBOOK_DIAGNOSTIC_RESERVE_BYTES } from './content-limits'
+import { shellNpmPaths } from './shell-npm-environment'
+import { NotebookNetworkSandboxOwner } from './network-sandbox-owner'
+import { DEFAULT_NOTEBOOK_NETWORK_SETTINGS } from '../../shared/notebook-network'
+
+// Exercise the native platform interpreter through the actual adapter and cleanup owner.
+describe('persistent platform shell cells', () => {
+  let root: string
+  let adapter: NotebookShellProcessAdapter
+  let protectionAttempted = false
+  let sandbox: NotebookNetworkSandboxOwner | undefined
+  const windows = process.platform === 'win32'
+  const command = (posix: string, powershell: string): string => (windows ? powershell : posix)
+  const request = (code: string, sessionId = 'one'): NotebookShellProcessRequest => ({
+    projectId: 'project',
+    sessionId,
+    command: code,
+    cwd: join(root, 'workspace'),
+    // Protected application Sessions select the prepared PowerShell/Node runtime.
+    ...(windows && sandbox
+      ? { runtimeBinding: { kind: 'powershell' as const, version: '7.6' as const } }
+      : {}),
+    runtimeRoot: join(root, 'runtime'),
+    handoffDir: join(root, 'workspace')
+  })
+  beforeEach(async () => {
+    root = await mkdtemp(join(tmpdir(), 'shell-cells-'))
+    await mkdir(join(root, 'workspace'))
+    await mkdir(join(root, 'runtime'))
+    adapter = new NotebookShellProcessAdapter()
+  })
+  afterEach(async () => {
+    expect(await adapter.shutdown()).toEqual({ reaped: true })
+    if (protectionAttempted) {
+      expect(await sandbox!.removeWindows()).toEqual({ cancelled: false })
+      protectionAttempted = false
+    }
+    await sandbox?.dispose()
+    sandbox = undefined
+    vi.unstubAllEnvs()
+    await rm(root, { recursive: true, force: true })
+  })
+
+  it
+    .skipIf(
+      process.platform === 'win32' ||
+        (process.platform === 'linux' && process.env.VITEST_PORTABLE_CI === '1')
+    )
+    .each(['ro', 'rw'] as const)(
+    'keeps folder authority %s across Shell cd and relaunch',
+    async (access) => {
+      const workspace = join(root, 'workspace')
+      const granted = join(root, 'granted')
+      const outside = join(root, 'ungranted.txt')
+      await mkdir(granted)
+      await writeFile(join(granted, 'data.txt'), 'original')
+      await writeFile(outside, 'private')
+      sandbox = new NotebookNetworkSandboxOwner({
+        resourceRoot: join(process.cwd(), 'packages/notebook-network-sandbox/vendor'),
+        temporaryRoot: join(workspace, 'commands'),
+        getSettings: async () => DEFAULT_NOTEBOOK_NETWORK_SETTINGS,
+        getFolderRestrictionEnabled: async () => true,
+        getGrantedLocalRoots: async () => [
+          { id: 'folder', name: 'granted', path: await realpath(granted), access }
+        ],
+        persistAlwaysAllow: async () => DEFAULT_NOTEBOOK_NETWORK_SETTINGS,
+        requestDecision: async () => 'deny'
+      })
+      adapter = new NotebookShellProcessAdapter(process.platform, sandbox)
+      const execute = (code: string, cwd = workspace): ReturnType<typeof adapter.execute> =>
+        adapter.execute({
+          ...request(code),
+          cwd,
+          notebookSessionRoot: workspace,
+          environment: { PATH: '/usr/bin:/bin' }
+        })
+      expect(await execute(`printf workspace > workspace.txt`)).toMatchObject({ exitCode: 0 })
+      expect(await execute(`cd '${granted}'; cat data.txt`)).toMatchObject({
+        exitCode: 0,
+        stdout: 'original'
+      })
+      for (const restarted of [false, true]) {
+        if (restarted) {
+          expect(await adapter.shutdown()).toEqual({ reaped: true })
+          adapter = new NotebookShellProcessAdapter(process.platform, sandbox)
+        }
+        const cwd = restarted ? granted : workspace
+        expect(await execute('cat data.txt', cwd)).toMatchObject({ exitCode: 0 })
+        const write = await execute('printf changed > data.txt', cwd)
+        expect(write.exitCode === 0).toBe(access === 'rw')
+        expect((await execute(`cat '${outside}'`, cwd)).exitCode).not.toBe(0)
+        expect(
+          await execute(`printf still-writable > '${workspace}/workspace.txt'`, cwd)
+        ).toMatchObject({ exitCode: 0 })
+      }
+      expect(await adapter.shutdown()).toEqual({ reaped: true })
+      adapter = new NotebookShellProcessAdapter(process.platform, sandbox)
+      expect((await execute(`cat '${outside}'`, '/')).exitCode).not.toBe(0)
+      expect(await readFile(join(granted, 'data.txt'), 'utf8')).toBe(
+        access === 'rw' ? 'changed' : 'original'
+      )
+    },
+    30_000
+  )
+
+  it.skipIf(process.platform !== 'darwin')(
+    'runs diagnostic searches in fresh and live shells while enforcing filesystem grants',
+    async () => {
+      vi.stubEnv('OPEN_SCIENCE_E2E_STORAGE_ROOT', root)
+      sandbox = new NotebookNetworkSandboxOwner({
+        resourceRoot: join(process.cwd(), 'packages', 'notebook-network-sandbox', 'vendor'),
+        temporaryRoot: join(root, 'command-temp'),
+        getSettings: async () => DEFAULT_NOTEBOOK_NETWORK_SETTINGS,
+        persistAlwaysAllow: async () => DEFAULT_NOTEBOOK_NETWORK_SETTINGS,
+        requestDecision: async () => 'deny',
+        logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }
+      })
+      adapter = new NotebookShellProcessAdapter(process.platform, sandbox)
+      const home = join(root, 'tool-home')
+      const bin = join(home, '.diagnostic-tools')
+      const privateDir = join(root, 'private-files')
+      await mkdir(bin, { recursive: true })
+      await mkdir(privateDir)
+      await writeFile(join(bin, 'diagnostic-tool'), '#!/bin/sh\nprintf fixture\n', { mode: 0o700 })
+      await writeFile(join(privateDir, 'private.txt'), 'private')
+      const diagnosticRequest = (code: string, sessionId = 'one'): NotebookShellProcessRequest => ({
+        ...request(code, sessionId),
+        environment: { PATH: `${bin}:/usr/bin:/bin`, HOME: home }
+      })
+      expect(await adapter.execute(diagnosticRequest('printf ready'))).toMatchObject({
+        exitCode: 0,
+        stdout: 'ready'
+      })
+      for (const sessionId of ['one', 'fresh']) {
+        const diagnostics = await adapter.execute(
+          diagnosticRequest('command -v diagnostic-tool; ls ~/.diagnostic-tools', sessionId)
+        )
+        expect(diagnostics, JSON.stringify(diagnostics)).toMatchObject({ exitCode: 0, stderr: '' })
+        expect(diagnostics.stdout).toContain('diagnostic-tool')
+      }
+      const denied = await adapter.execute(diagnosticRequest(`ls '${privateDir}'`))
+      expect(denied, JSON.stringify(denied)).toMatchObject({ exitCode: 1 })
+      expect(denied.stderr).toMatch(/Operation not permitted|Permission denied/)
+      expect(denied.stdout).not.toContain('private.txt')
+      const readOnlyWrite = await adapter.execute(
+        diagnosticRequest('printf changed > ~/.diagnostic-tools/diagnostic-tool')
+      )
+      expect(readOnlyWrite.exitCode).not.toBe(0)
+      expect(await readFile(join(bin, 'diagnostic-tool'), 'utf8')).toContain('printf fixture')
+      // Changing cwd must not promote a read-only tool directory into a writable root.
+      expect(await adapter.execute(diagnosticRequest(`cd '${bin}'; ls .`))).toMatchObject({
+        exitCode: 0
+      })
+      const afterCd = await adapter.execute(diagnosticRequest('printf changed > diagnostic-tool'))
+      expect(afterCd.exitCode).not.toBe(0)
+      expect(await readFile(join(bin, 'diagnostic-tool'), 'utf8')).toContain('printf fixture')
+      expect(await adapter.execute(diagnosticRequest('cd /; pwd'))).toMatchObject({
+        exitCode: 0,
+        stdout: '/\n'
+      })
+      const afterRootCd = await adapter.execute(
+        diagnosticRequest(`printf changed > '${bin}/diagnostic-tool'`)
+      )
+      expect(afterRootCd.exitCode).not.toBe(0)
+      expect(await readFile(join(bin, 'diagnostic-tool'), 'utf8')).toContain('printf fixture')
+      const resetRequest = diagnosticRequest('pwd')
+      const reset = await adapter.execute({
+        ...resetRequest,
+        environment: { ...resetRequest.environment, DIAGNOSTIC_CONTEXT: 'reset' }
+      })
+      expect(reset.exitCode).toBe(0)
+      expect(await realpath(reset.stdout.trim())).toBe(await realpath(join(root, 'workspace')))
+    }
+  )
+
+  it.skipIf(process.platform !== 'darwin').each([false, true])(
+    'resolves external Node for npm CLIs with a GUI PATH (sandbox=%s)',
+    async (sandboxed) => {
+      const bin = join(root, 'external-node', 'bin')
+      await mkdir(bin, { recursive: true })
+      await symlink(process.execPath, join(bin, 'node'))
+      const npmBin = shellNpmPaths(join(root, 'runtime'), process.platform).bin
+      await mkdir(npmBin, { recursive: true })
+      await writeFile(
+        join(npmBin, 'node-path-probe'),
+        '#!/usr/bin/env node\nconsole.log(process.version)\n',
+        { mode: 0o755 }
+      )
+      // Use fixture install locations so this cannot pass because the host happens to have Node.
+      const originalDirs = EXTRA_PATH_DIRS.splice(0, EXTRA_PATH_DIRS.length, bin)
+      vi.stubEnv('PATH', '/usr/bin:/bin')
+      try {
+        if (sandboxed) {
+          vi.stubEnv('OPEN_SCIENCE_E2E_STORAGE_ROOT', root)
+          sandbox = new NotebookNetworkSandboxOwner({
+            resourceRoot: join(process.cwd(), 'packages/notebook-network-sandbox/vendor'),
+            temporaryRoot: join(root, 'command-temp'),
+            getSettings: async () => DEFAULT_NOTEBOOK_NETWORK_SETTINGS,
+            persistAlwaysAllow: async () => DEFAULT_NOTEBOOK_NETWORK_SETTINGS,
+            requestDecision: async () => 'deny'
+          })
+          adapter = new NotebookShellProcessAdapter(process.platform, sandbox)
+        }
+        // Cover the adapter fallback and the frozen environment supplied by the execution owner.
+        for (const frozen of [false, true]) {
+          const result = await adapter.execute({
+            ...request('node-path-probe', frozen ? 'frozen' : 'fallback'),
+            ...(frozen ? { environment: buildShellEnv(join(root, 'workspace')) } : {})
+          })
+          expect(result, JSON.stringify(result)).toMatchObject({
+            exitCode: 0,
+            stdout: `${process.version}\n`
+          })
+        }
+        expect(process.env.PATH).toBe('/usr/bin:/bin')
+      } finally {
+        EXTRA_PATH_DIRS.splice(0, EXTRA_PATH_DIRS.length, ...originalDirs)
+      }
+    }
+  )
+
+  it.for([false, true])(
+    'shares global npm tools without globalizing local installs (sandbox=%s)',
+    { timeout: windows ? 180_000 : 60_000 },
+    async (sandboxed, context) => {
+      // Portable CI does not provision bubblewrap/AppArmor. The Linux isolation job runs this
+      // same case with its native prerequisites; retain ordinary Shell coverage in portable CI.
+      if (sandboxed && process.platform === 'linux' && process.env.VITEST_PORTABLE_CI === '1') {
+        context.skip('Real sandbox execution runs in the Linux Notebook isolation job.')
+      }
+      if (sandboxed) {
+        vi.stubEnv('OPEN_SCIENCE_E2E_STORAGE_ROOT', root)
+        sandbox = new NotebookNetworkSandboxOwner({
+          resourceRoot: join(process.cwd(), 'packages', 'notebook-network-sandbox', 'vendor'),
+          temporaryRoot: join(root, 'command-temp'),
+          getSettings: async () => DEFAULT_NOTEBOOK_NETWORK_SETTINGS,
+          persistAlwaysAllow: async () => DEFAULT_NOTEBOOK_NETWORK_SETTINGS,
+          requestDecision: async () => 'deny',
+          logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }
+        })
+        if (windows) {
+          protectionAttempted = true
+          expect(await sandbox.installWindows()).toEqual({ cancelled: false })
+        }
+        adapter = new NotebookShellProcessAdapter(process.platform, sandbox)
+      }
+      const npmCli = process.env.npm_execpath
+      expect(npmCli, 'Run this test through the repository npm test command').toBeTruthy()
+      const quote = (value: string): string =>
+        windows ? `'${value.replaceAll("'", "''")}'` : `'${value.replaceAll("'", `'"'"'`)}'`
+      const npm =
+        windows && sandboxed
+          ? 'npm.cmd'
+          : `${windows ? '& ' : ''}${quote(process.execPath)} ${quote(npmCli!)}`
+      const workspace = join(root, 'workspace')
+      const secondWorkspace = join(root, 'second-workspace')
+      await mkdir(secondWorkspace)
+      // Keep npm's local prefix inside the fixture, even when TEMP is under the repository.
+      await writeFile(join(secondWorkspace, 'package.json'), JSON.stringify({ private: true }))
+      const second = (code: string): NotebookShellProcessRequest => ({
+        ...request(code, 'two'),
+        cwd: secondWorkspace,
+        handoffDir: secondWorkspace
+      })
+      // A session that was already running must see tools installed later by a different session.
+      const started = await adapter.execute(second(command('true', '$null = 1')))
+      expect(started, JSON.stringify(started)).toMatchObject({
+        exitCode: 0
+      })
+      const fixture = join(workspace, 'fixture')
+      const version = await adapter.execute(request(`${windows ? 'npm.cmd' : 'npm'} --version`))
+      expect(version, JSON.stringify(version)).toMatchObject({ exitCode: 0 })
+      expect(version.stdout.trim()).toMatch(/^\d+\.\d+\.\d+$/)
+      await mkdir(fixture)
+      await writeFile(
+        join(fixture, 'package.json'),
+        JSON.stringify({
+          name: 'open-science-npm-fixture',
+          version: '1.0.0',
+          bin: { 'os-npm-fixture': 'cli.js' }
+        })
+      )
+      await writeFile(
+        join(fixture, 'cli.js'),
+        '#!/usr/bin/env node\nprocess.stdout.write("shared-tool")\n'
+      )
+      const packed = await adapter.execute(
+        request(`${npm} pack ./fixture --ignore-scripts --offline`)
+      )
+      expect(packed, JSON.stringify(packed)).toMatchObject({ exitCode: 0 })
+      const installed = await adapter.execute(
+        request(
+          `${npm} install -g ./open-science-npm-fixture-1.0.0.tgz --offline --ignore-scripts --no-audit --no-fund`
+        )
+      )
+      expect(installed, JSON.stringify(installed)).toMatchObject({ exitCode: 0 })
+      const invoke = windows ? 'os-npm-fixture.cmd' : 'os-npm-fixture'
+      expect(await adapter.execute(request(invoke))).toMatchObject({
+        exitCode: 0,
+        stdout: 'shared-tool'
+      })
+      expect(await adapter.execute(second(invoke))).toMatchObject({
+        exitCode: 0,
+        stdout: 'shared-tool'
+      })
+      // Each sandbox can read its own workspace, not another session's temporary workspace.
+      // Stage the fixture as a local input without changing either session's read grants.
+      await copyFile(
+        join(workspace, 'open-science-npm-fixture-1.0.0.tgz'),
+        join(secondWorkspace, 'open-science-npm-fixture-1.0.0.tgz')
+      )
+      const local = await adapter.execute(
+        second(
+          `${npm} install ./open-science-npm-fixture-1.0.0.tgz --offline --ignore-scripts --no-audit --no-fund`
+        )
+      )
+      expect(local, JSON.stringify(local)).toMatchObject({ exitCode: 0 })
+      const localPackage = JSON.parse(
+        await readFile(
+          join(secondWorkspace, 'node_modules', 'open-science-npm-fixture', 'package.json'),
+          'utf8'
+        )
+      )
+      expect(localPackage.name).toBe('open-science-npm-fixture')
+      const { prefix } = shellNpmPaths(join(root, 'runtime'), process.platform)
+      await expect(
+        access(
+          join(
+            prefix,
+            ...(windows ? [] : ['lib']),
+            'node_modules',
+            'open-science-npm-fixture',
+            'package.json'
+          )
+        )
+      ).resolves.toBeUndefined()
+      expect(await adapter.shutdown()).toEqual({ reaped: true })
+      adapter = new NotebookShellProcessAdapter(process.platform, sandbox)
+      expect(await adapter.execute(second(invoke))).toMatchObject({
+        exitCode: 0,
+        stdout: 'shared-tool'
+      })
+
+      if (sandboxed && !windows) {
+        // A private Node layout must expose npm's package without exposing sibling data or
+        // turning the read grant into write access. Exercise real filesystem syscalls.
+        const hostBin = join(root, 'host-node', 'bin')
+        const hostNpm = join(root, 'host-node', 'lib', 'node_modules', 'npm')
+        const sibling = join(root, 'host-node', 'lib', 'private.txt')
+        const protectedRoot = join(root, 'runtime', 'envs', 'protected')
+        await mkdir(hostBin, { recursive: true })
+        await mkdir(join(hostNpm, 'bin'), { recursive: true })
+        await mkdir(protectedRoot, { recursive: true })
+        await writeFile(sibling, 'private')
+        await writeFile(join(hostNpm, 'package.json'), '{"name":"npm"}')
+        await writeFile(
+          join(hostNpm, 'bin', 'npm-cli.js'),
+          `#!/usr/bin/env node
+const fs = require('node:fs')
+const path = require('node:path')
+const result = { package: JSON.parse(fs.readFileSync(path.join(__dirname, '../package.json'), 'utf8')).name }
+for (const [name, target, write] of ${JSON.stringify([
+            ['sibling', sibling, false],
+            ['npmWrite', join(hostNpm, 'pwn.txt'), true],
+            ['runtimeWrite', join(protectedRoot, 'pwn.txt'), true]
+          ])}) {
+  try { write ? fs.writeFileSync(target, 'bad') : fs.readFileSync(target); result[name] = 'allowed' }
+  catch (error) { result[name] = error.code }
+}
+console.log(JSON.stringify(result))
+`,
+          { mode: 0o755 }
+        )
+        await symlink('../lib/node_modules/npm/bin/npm-cli.js', join(hostBin, 'npm'))
+        // Runtime packages are readable and inherit the runtime root's read-only mount.
+        // A denied-read directory would instead receive Linux's anonymous filesystem mask.
+        const isolated = await adapter.execute({
+          ...request('npm', 'private-node'),
+          environment: { ...process.env, PATH: `${hostBin}:${process.env.PATH}` }
+        })
+        const deniedRead =
+          process.platform === 'linux' ? /^(EPERM|EACCES|ENOENT)$/ : /^(EPERM|EACCES)$/
+        const deniedWrite =
+          process.platform === 'linux' ? /^(EPERM|EACCES|EROFS)$/ : /^(EPERM|EACCES)$/
+        expect(isolated, JSON.stringify(isolated)).toMatchObject({ exitCode: 0 })
+        expect(JSON.parse(isolated.stdout)).toEqual({
+          package: 'npm',
+          sibling: expect.stringMatching(deniedRead),
+          npmWrite: expect.stringMatching(deniedWrite),
+          runtimeWrite: expect.stringMatching(deniedWrite)
+        })
+        await expect(access(join(hostNpm, 'pwn.txt'))).rejects.toMatchObject({ code: 'ENOENT' })
+        await expect(access(join(protectedRoot, 'pwn.txt'))).rejects.toMatchObject({
+          code: 'ENOENT'
+        })
+        // A workload-created launcher must not turn its private symlink target into a host grant.
+        await symlink(join(hostNpm, 'bin', 'npm-cli.js'), join(prefix, 'bin', 'npm'))
+        const redirected = await adapter.execute(request('npm', 'redirected-global-npm'))
+        expect(redirected.exitCode).toBeGreaterThan(0)
+        const probe = await adapter.execute(
+          request(
+            `${quote(process.execPath)} -e ${quote(
+              `try { require('node:fs').readFileSync(${JSON.stringify(join(hostNpm, 'package.json'))}); console.log('allowed') } catch (error) { console.log(error.code) }`
+            )}`,
+            'redirected-global-npm'
+          )
+        )
+        expect(probe, JSON.stringify(probe)).toMatchObject({ exitCode: 0 })
+        expect(probe.stdout.trim()).toMatch(deniedRead)
+        expect(redirected.stdout).not.toContain('"package":"npm"')
+      }
+    }
+  )
+
+  it.each(['approve', 'cancel'] as const)(
+    'keeps Shell approval time outside the deadline and handles %s after client completion',
+    async (decision) => {
+      const pending = Promise.withResolvers<void>()
+      const entered = Promise.withResolvers<void>()
+      const controller = new AbortController()
+      let waiting = true
+      adapter = new NotebookShellProcessAdapter(process.platform, {
+        wrap: async (invocation) => {
+          // Preserve the native control-pipe transport while simulating only approval timing.
+          const launch = windows
+            ? windowsSupervisedLaunch({
+                command: invocation.commandText,
+                executable: invocation.executable,
+                args: [...invocation.args],
+                cwd: invocation.cwd,
+                hostPath: join(
+                  process.cwd(),
+                  'packages/notebook-network-sandbox/vendor/windows',
+                  process.arch,
+                  'notebook-appcontainer-host.exe'
+                ),
+                ownershipRoot: invocation.cwd,
+                gatewayPort: 49700,
+                gatewayCredentials: { username: 'unused', password: 'unused' },
+                env: invocation.env,
+                windowsShellControlPipe: invocation.windowsShellControlPipe
+              })
+            : { argv: [invocation.executable, ...invocation.args], env: invocation.env }
+          const { argv, ...spawnOptions } = launch
+          return {
+            ...spawnOptions,
+            executable: argv[0]!,
+            args: argv.slice(1),
+            annotateStderr: (stderr) => stderr,
+            beginExecution: (execution) => {
+              execution?.signal?.addEventListener('abort', () => pending.resolve(), { once: true })
+              queueMicrotask(() => {
+                execution?.onNetworkWaitChange?.(true)
+                entered.resolve()
+              })
+              return () => undefined
+            },
+            waitForNetworkApprovals: () => pending.promise,
+            networkApprovalRetryRequired: () => !waiting && !controller.signal.aborted,
+            cleanup: async () => ({
+              processesTerminated: true,
+              networkClosed: true,
+              temporaryResourcesRemoved: true
+            })
+          }
+        }
+      })
+      let settled = false
+      const run = adapter.execute({
+        ...request(
+          command(
+            'sleep 0.1; printf synthetic',
+            'Start-Sleep -Milliseconds 100; [Console]::Write("synthetic")'
+          )
+        ),
+        timeoutMs: 50,
+        signal: controller.signal
+      })
+      void run.then(() => {
+        settled = true
+      })
+      await entered.promise
+      await new Promise((resolve) => setTimeout(resolve, 200))
+      expect(settled).toBe(false)
+      waiting = false
+      if (decision === 'cancel') controller.abort()
+      else pending.resolve()
+      const result = await run
+      expect(result.stderr).not.toContain('timed out')
+      if (decision === 'cancel') expect(result.cancelled).toBe(true)
+      else {
+        expect(result).toMatchObject({ exitCode: 0, stdout: 'synthetic' })
+        expect(result.stderr).toContain('NETWORK_APPROVAL_RETRY_REQUIRED')
+      }
+    }
+  )
+
+  it('retains variables, exports, functions and cwd through ordered cells', async () => {
+    const first = await adapter.execute(
+      request(
+        command(
+          'value=41; export CELL_EXPORT=kept; greet() { printf hello; }; mkdir child; cd child',
+          '$value = 41; $env:CELL_EXPORT = "kept"; function greet { "hello" }; [IO.Directory]::CreateDirectory((Join-Path (Get-Location) child)) | Out-Null; Set-Location child'
+        )
+      )
+    )
+    expect(first, JSON.stringify(first)).toMatchObject({ exitCode: 0 })
+    const second = await adapter.execute(
+      request(
+        command(
+          'printf "%s:%s:" "$value" "$CELL_EXPORT"; greet; printf ":%s" "${PWD##*/}"',
+          '[Console]::Write("${value}:$($env:CELL_EXPORT):$(greet):$((Get-Item .).Name)")'
+        )
+      )
+    )
+    expect(second).toMatchObject({ exitCode: 0, stdout: '41:kept:hello:child' })
+  })
+
+  it.skipIf(!windows)('gives PowerShell cells EOF instead of the cell protocol input', async () => {
+    expect(await adapter.execute(request('[Console]::Write("ready")'))).toMatchObject({
+      stdout: 'ready',
+      exitCode: 0
+    })
+    const result = await adapter.execute({
+      ...request('[Console]::Write($null -eq [Console]::ReadLine())'),
+      timeoutMs: 1000
+    })
+    expect(result).toMatchObject({ stdout: 'True', exitCode: 0 })
+  })
+
+  it.skipIf(!windows)(
+    'gives native children EOF and still supports explicit pipeline input',
+    async () => {
+      const executable = process.execPath.replaceAll("'", "''")
+      const script = `process.stdout.write(require('node:fs').readFileSync(0,'utf8') || 'eof')`
+      const child = `& '${executable}' -e '${script.replaceAll("'", "''")}'`
+      expect(await adapter.execute(request(`$value = 'kept'; ${child}`))).toMatchObject({
+        stdout: 'eof',
+        exitCode: 0
+      })
+      const piped = await adapter.execute(request(`'payload' | ${child}`))
+      expect(piped.exitCode).toBe(0)
+      expect(piped.stdout.trim()).toBe('payload')
+      expect(await adapter.execute(request('[Console]::Write($value)'))).toMatchObject({
+        stdout: 'kept',
+        exitCode: 0
+      })
+    }
+  )
+
+  it('serializes concurrent submissions without sharing state between sessions', async () => {
+    const first = adapter.execute(request(command('value=41', '$value=41')))
+    const second = adapter.execute(
+      request(command('printf "%s" "$value"', '[Console]::Write($value)'))
+    )
+    expect(await first).toMatchObject({ exitCode: 0 })
+    expect(await second).toMatchObject({ exitCode: 0, stdout: '41' })
+    expect(
+      await adapter.execute(
+        request(
+          command(
+            'printf "%s" "${value-unset}"',
+            'if ($null -eq $value) { [Console]::Write("unset") }'
+          ),
+          'two'
+        )
+      )
+    ).toMatchObject({ exitCode: 0, stdout: 'unset' })
+  })
+
+  it('captures multiline output and continues after a failed cell', async () => {
+    const failed = await adapter.execute(
+      request(
+        command(
+          'value=kept\nprintf "out"\nprintf "err" >&2\nfalse',
+          '$value="kept"\n[Console]::Write("out")\n[Console]::Error.Write("err")\nthrow "failure"'
+        )
+      )
+    )
+    expect(failed).toMatchObject({ exitCode: 1, stdout: 'out' })
+    expect(failed.stderr).toContain('err')
+    expect(
+      await adapter.execute(request(command('printf "%s" "$value"', '[Console]::Write($value)')))
+    ).toMatchObject({ exitCode: 0, stdout: 'kept' })
+  })
+
+  it('reserves diagnostics when stdout exceeds the cell budget', async () => {
+    const size = NOTEBOOK_TEXT_LIMIT_BYTES + 1024
+    const result = await adapter.execute(
+      request(
+        command(
+          `printf '%*s' ${size} '' | tr ' ' x; printf important >&2; false`,
+          `[Console]::Write(('x' * ${size})); [Console]::Error.Write('important'); throw 'failure'`
+        )
+      )
+    )
+    expect(result.exitCode).toBe(1)
+    expect(result.truncated).toBe(true)
+    expect(Buffer.byteLength(result.stdout)).toBeLessThanOrEqual(
+      NOTEBOOK_TEXT_LIMIT_BYTES - NOTEBOOK_DIAGNOSTIC_RESERVE_BYTES
+    )
+    expect(result.stderr).toContain('important')
+    expect(
+      await adapter.execute(request(command('printf next', '[Console]::Write("next")')))
+    ).toMatchObject({ stdout: 'next', stderr: '', exitCode: 0 })
+  })
+
+  it('cancels a running cell, reaps the interpreter and starts with empty state', async () => {
+    expect(await adapter.execute(request(command('value=old', '$value="old"')))).toMatchObject({
+      exitCode: 0
+    })
+    const controller = new AbortController()
+    const running = adapter.execute({
+      ...request(
+        command(
+          'printf ready > running; sleep 30',
+          '[IO.File]::WriteAllText((Join-Path (Get-Location) running), "ready"); Start-Sleep -Seconds 30'
+        )
+      ),
+      signal: controller.signal
+    })
+    try {
+      await expect
+        .poll(async () =>
+          access(join(root, 'workspace', 'running')).then(
+            () => true,
+            () => false
+          )
+        )
+        .toBe(true)
+      controller.abort()
+      expect(await running).toMatchObject({ exitCode: null, cancelled: true })
+      expect(
+        await adapter.execute(
+          request(
+            command(
+              'printf "%s" "${value-unset}"',
+              'if ($null -eq $value) { [Console]::Write("unset") }'
+            )
+          )
+        )
+      ).toMatchObject({ exitCode: 0, stdout: 'unset' })
+    } finally {
+      controller.abort()
+      await running
+    }
+  })
+
+  it('cancels a queued cell without resetting the active interpreter', async () => {
+    const active = adapter.execute(
+      request(command('value=41; sleep 1', '$value=41; Start-Sleep -Milliseconds 1000'))
+    )
+    const controller = new AbortController()
+    const queued = adapter.execute({
+      ...request(command('value=99', '$value=99')),
+      signal: controller.signal
+    })
+    controller.abort()
+    expect(await queued).toMatchObject({ cancelled: true })
+    expect(await active).toMatchObject({ exitCode: 0 })
+    expect(
+      await adapter.execute(request(command('printf "%s" "$value"', '[Console]::Write($value)')))
+    ).toMatchObject({ exitCode: 0, stdout: '41' })
+  })
+
+  it('resets state after a timeout and an explicit interpreter exit', async () => {
+    expect(await adapter.execute(request(command('value=old', '$value="old"')))).toMatchObject({
+      exitCode: 0
+    })
+    const result = await adapter.execute({
+      ...request(command('sleep 30', 'Start-Sleep -Seconds 30')),
+      timeoutMs: 100
+    })
+    expect(result.exitCode).toBeNull()
+    expect(result.stderr).toContain('timed out')
+    expect(
+      await adapter.execute(
+        request(
+          command(
+            'printf "%s" "${value-unset}"',
+            'if ($null -eq $value) { [Console]::Write("unset") }'
+          )
+        )
+      )
+    ).toMatchObject({ exitCode: 0, stdout: 'unset' })
+    expect(await adapter.execute(request('exit 7'))).toMatchObject({ exitCode: 7 })
+    expect(
+      await adapter.execute(request(command('printf alive', '[Console]::Write("alive")')))
+    ).toMatchObject({ exitCode: 0, stdout: 'alive' })
+  })
+
+  it('restarts when launch grants change and closes only the requested session', async () => {
+    expect(await adapter.execute(request(command('value=old', '$value="old"')))).toMatchObject({
+      exitCode: 0
+    })
+    const result = await adapter.execute({
+      ...request(
+        command(
+          'printf "%s" "${value-unset}"',
+          'if ($null -eq $value) { [Console]::Write("unset") }'
+        )
+      ),
+      protectedDirs: [join(root, 'private')]
+    })
+    expect(result).toMatchObject({ exitCode: 0, stdout: 'unset' })
+    expect(result.stderr).toContain('interpreter state was reset')
+    expect(
+      await adapter.execute(request(command('value=other', '$value="other"'), 'two'))
+    ).toMatchObject({ exitCode: 0 })
+    expect(await adapter.shutdown({ sessionId: 'one' })).toEqual({ reaped: true })
+    expect(
+      await adapter.execute(
+        request(command('printf "%s" "$value"', '[Console]::Write($value)'), 'two')
+      )
+    ).toMatchObject({ exitCode: 0, stdout: 'other' })
+  })
+})
+
+configureTestRuntimeMetadata()

@@ -1,0 +1,1543 @@
+import { readdirSync, readFileSync } from 'node:fs'
+import { relative, resolve, sep } from 'node:path'
+
+import {
+  canHaveModifiers,
+  createSourceFile,
+  forEachChild,
+  getModifiers,
+  isArrayLiteralExpression,
+  isArrowFunction,
+  isAwaitExpression,
+  isBinaryExpression,
+  isCallExpression,
+  isClassDeclaration,
+  isConstructorDeclaration,
+  isEnumDeclaration,
+  isExportAssignment,
+  isExportDeclaration,
+  isFunctionDeclaration,
+  isFunctionExpression,
+  isGetAccessorDeclaration,
+  isIdentifier,
+  isImportDeclaration,
+  isInterfaceDeclaration,
+  isMethodDeclaration,
+  isModuleDeclaration,
+  isNamedExports,
+  isNamedImports,
+  isNamespaceImport,
+  isNewExpression,
+  isObjectLiteralExpression,
+  isParameter,
+  isPropertyAccessExpression,
+  isPropertyAssignment,
+  isPropertyDeclaration,
+  isReturnStatement,
+  isSetAccessorDeclaration,
+  isStringLiteralLike,
+  isTypeAliasDeclaration,
+  isVariableDeclaration,
+  isVariableStatement,
+  NodeFlags,
+  ScriptKind,
+  ScriptTarget,
+  SyntaxKind,
+  type ClassDeclaration,
+  type MethodDeclaration,
+  type Node,
+  type SourceFile
+} from 'typescript'
+import { describe, expect, it } from 'vitest'
+
+import { loadModuleImpactManifest } from '../../../scripts/ci/load-module-impact.mjs'
+
+const productionFiles = [
+  'coordinator.ts',
+  'delegated-question-owner.ts',
+  'delegated-work-owner.ts',
+  'delegated-work-store.ts',
+  'deletion-owner.ts',
+  'legacy-upload.ts',
+  'message-delivery-owner.ts',
+  'reconciliation-owner.ts',
+  'relay-projection.ts',
+  'session-details-authority.ts',
+  'side-chat-owner.ts',
+  'state-owner.ts'
+] as const
+type ProductionFile = (typeof productionFiles)[number]
+
+const projectRoot = resolve(__dirname, '../../..')
+const sources = new Map(
+  productionFiles.map((file) => [file, readFileSync(resolve(__dirname, file), 'utf8')])
+)
+const sourceFileFor = (file: ProductionFile): SourceFile =>
+  createSourceFile(file, sources.get(file)!, ScriptTarget.Latest, true, ScriptKind.TS)
+
+const classFrom = (file: ProductionFile, name: string): ClassDeclaration => {
+  const candidate = sourceFileFor(file).statements.find(
+    (statement) => isClassDeclaration(statement) && statement.name?.text === name
+  )
+  if (!candidate || !isClassDeclaration(candidate)) throw new Error(`${name} class not found`)
+  return candidate
+}
+
+const hasModifier = (node: Node, kind: SyntaxKind): boolean =>
+  canHaveModifiers(node) &&
+  (getModifiers(node)?.some((modifier) => modifier.kind === kind) ?? false)
+
+const memberName = (node: Node | undefined): string | undefined =>
+  node && isIdentifier(node) ? node.text : undefined
+
+const methods = (declaration: ClassDeclaration, visibility: 'public' | 'private'): string[] =>
+  declaration.members
+    .filter(isMethodDeclaration)
+    .filter((member) =>
+      visibility === 'private'
+        ? hasModifier(member, SyntaxKind.PrivateKeyword)
+        : !hasModifier(member, SyntaxKind.PrivateKeyword) &&
+          !hasModifier(member, SyntaxKind.ProtectedKeyword)
+    )
+    .map((member) => memberName(member.name))
+    .filter((name): name is string => name !== undefined)
+    .sort()
+
+const publicNonMethodMembers = (declaration: ClassDeclaration): string[] =>
+  declaration.members
+    .filter(
+      (member) =>
+        (isPropertyDeclaration(member) ||
+          isGetAccessorDeclaration(member) ||
+          isSetAccessorDeclaration(member)) &&
+        !hasModifier(member, SyntaxKind.PrivateKeyword) &&
+        !hasModifier(member, SyntaxKind.ProtectedKeyword)
+    )
+    .map((member) => memberName(member.name))
+    .filter((name): name is string => name !== undefined)
+    .sort()
+
+const fields = (declaration: ClassDeclaration): string[] => {
+  const result = declaration.members
+    .filter(isPropertyDeclaration)
+    .map((member) => memberName(member.name))
+    .filter((name): name is string => name !== undefined)
+
+  for (const constructor of declaration.members.filter(isConstructorDeclaration)) {
+    result.push(
+      ...constructor.parameters
+        .filter(
+          (parameter) =>
+            isParameter(parameter) &&
+            (hasModifier(parameter, SyntaxKind.PrivateKeyword) ||
+              hasModifier(parameter, SyntaxKind.PublicKeyword) ||
+              hasModifier(parameter, SyntaxKind.ProtectedKeyword))
+        )
+        .map((parameter) => memberName(parameter.name))
+        .filter((name): name is string => name !== undefined)
+    )
+  }
+  return result.sort()
+}
+
+const mutableFields = (declaration: ClassDeclaration): string[] => {
+  const result = declaration.members
+    .filter(isPropertyDeclaration)
+    .filter((member) => !hasModifier(member, SyntaxKind.ReadonlyKeyword))
+    .map((member) => memberName(member.name))
+    .filter((name): name is string => name !== undefined)
+
+  for (const constructor of declaration.members.filter(isConstructorDeclaration)) {
+    result.push(
+      ...constructor.parameters
+        .filter(
+          (parameter) =>
+            isParameter(parameter) &&
+            (hasModifier(parameter, SyntaxKind.PrivateKeyword) ||
+              hasModifier(parameter, SyntaxKind.PublicKeyword) ||
+              hasModifier(parameter, SyntaxKind.ProtectedKeyword)) &&
+            !hasModifier(parameter, SyntaxKind.ReadonlyKeyword)
+        )
+        .map((parameter) => memberName(parameter.name))
+        .filter((name): name is string => name !== undefined)
+    )
+  }
+  return result.sort()
+}
+
+const methodFrom = (declaration: ClassDeclaration, name: string): MethodDeclaration => {
+  const method = declaration.members.find(
+    (member) => isMethodDeclaration(member) && memberName(member.name) === name
+  )
+  if (!method || !isMethodDeclaration(method)) throw new Error(`${name} method not found`)
+  return method
+}
+
+const walk = (root: Node, predicate: (node: Node) => boolean): Node[] => {
+  const matches: Node[] = []
+  const visit = (node: Node): void => {
+    if (predicate(node)) matches.push(node)
+    forEachChild(node, visit)
+  }
+  visit(root)
+  return matches
+}
+
+const calledOwnerMethods = (method: MethodDeclaration): string[] =>
+  walk(
+    method,
+    (node) =>
+      isCallExpression(node) &&
+      isPropertyAccessExpression(node.expression) &&
+      isPropertyAccessExpression(node.expression.expression) &&
+      node.expression.expression.expression.kind === SyntaxKind.ThisKeyword &&
+      [
+        'stateOwner',
+        'deletionOwner',
+        'reconciliationOwner',
+        'sideChatOwner',
+        'messageDeliveryOwner',
+        'delegatedWorkOwner'
+      ].includes(node.expression.expression.name.text)
+  )
+    .map((node) => {
+      const call = node
+      if (!isCallExpression(call) || !isPropertyAccessExpression(call.expression)) return ''
+      const owner = call.expression.expression
+      if (!isPropertyAccessExpression(owner)) return ''
+      return `${owner.name.text}.${call.expression.name.text}`
+    })
+    .sort()
+
+const sessionDependencies = (file: ProductionFile): string[] =>
+  sourceFileFor(file)
+    .statements.filter(isImportDeclaration)
+    .flatMap((statement) => {
+      if (!isStringLiteralLike(statement.moduleSpecifier)) return []
+      const specifier = statement.moduleSpecifier.text
+      if (!specifier.startsWith('.')) return []
+      const target = resolve(__dirname, specifier)
+      const dependency = productionFiles.find(
+        (candidate) => resolve(__dirname, candidate.replace(/\.ts$/, '')) === target
+      )
+      return dependency ? [dependency] : []
+    })
+    .sort()
+
+const exportedNames = (sourceFile: SourceFile, kind: 'value' | 'type'): string[] => {
+  const names: string[] = []
+  for (const statement of sourceFile.statements) {
+    if (isExportDeclaration(statement)) {
+      if (!statement.exportClause || !isNamedExports(statement.exportClause)) {
+        if ((kind === 'type') === statement.isTypeOnly) {
+          names.push(`export-all:${statement.moduleSpecifier?.getText(sourceFile) ?? '<local>'}`)
+        }
+        continue
+      }
+      for (const element of statement.exportClause.elements) {
+        const isType = statement.isTypeOnly || element.isTypeOnly
+        if ((kind === 'type') === isType) names.push(element.name.text)
+      }
+      continue
+    }
+    if (isExportAssignment(statement) && kind === 'value') names.push('default')
+    if (!hasModifier(statement, SyntaxKind.ExportKeyword)) continue
+    const valueDeclaration =
+      isClassDeclaration(statement) ||
+      isFunctionDeclaration(statement) ||
+      isEnumDeclaration(statement) ||
+      isModuleDeclaration(statement)
+    const typeDeclaration = isInterfaceDeclaration(statement) || isTypeAliasDeclaration(statement)
+    if (kind === 'value' && valueDeclaration) {
+      const name = statement.name?.text ?? '<anonymous>'
+      names.push(hasModifier(statement, SyntaxKind.DefaultKeyword) ? `default:${name}` : name)
+    } else if (kind === 'type' && typeDeclaration && statement.name) {
+      names.push(statement.name.text)
+    } else if (kind === 'value' && isVariableStatement(statement)) {
+      names.push(...statement.declarationList.declarations.map((item) => item.name.getText()))
+    }
+  }
+  return names.sort()
+}
+
+const statefulTopLevelVariables = (file: ProductionFile): string[] =>
+  sourceFileFor(file)
+    .statements.filter(isVariableStatement)
+    .flatMap((statement) =>
+      statement.declarationList.declarations
+        .filter((declaration) => {
+          const initializer = declaration.initializer
+          if ((statement.declarationList.flags & NodeFlags.Const) === 0) return true
+          if (!initializer || isArrowFunction(initializer) || isFunctionExpression(initializer)) {
+            return false
+          }
+          return (
+            isNewExpression(initializer) ||
+            isArrayLiteralExpression(initializer) ||
+            isObjectLiteralExpression(initializer) ||
+            isCallExpression(initializer)
+          )
+        })
+        .map((declaration) => declaration.name.getText())
+    )
+    .sort()
+
+const staticStateFields = (file: ProductionFile): string[] =>
+  walk(
+    sourceFileFor(file),
+    (node) => isPropertyDeclaration(node) && hasModifier(node, SyntaxKind.StaticKeyword)
+  )
+    .filter(isPropertyDeclaration)
+    .map((field) => memberName(field.name) ?? '<computed>')
+    .sort()
+
+const findTypeScriptFiles = (directory: string): string[] =>
+  readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
+    const path = resolve(directory, entry.name)
+    if (entry.isDirectory()) return findTypeScriptFiles(path)
+    return entry.isFile() &&
+      entry.name.endsWith('.ts') &&
+      !entry.name.endsWith('.test.ts') &&
+      !entry.name.endsWith('.test-support.ts')
+      ? [path]
+      : []
+  })
+
+const constructionSites = (className: string): string[] => {
+  const sites: string[] = []
+  for (const path of findTypeScriptFiles(resolve(projectRoot, 'src/main'))) {
+    const source = readFileSync(path, 'utf8')
+    if (!source.includes(className)) continue
+    const sourceFile = createSourceFile(path, source, ScriptTarget.Latest, true, ScriptKind.TS)
+    const localNames = new Set([className])
+    const namespaceNames = new Set<string>()
+    for (const statement of sourceFile.statements.filter(isImportDeclaration)) {
+      const bindings = statement.importClause?.namedBindings
+      if (bindings && isNamedImports(bindings)) {
+        for (const element of bindings.elements) {
+          if ((element.propertyName ?? element.name).text === className) {
+            localNames.add(element.name.text)
+          }
+        }
+      } else if (bindings && isNamespaceImport(bindings)) {
+        namespaceNames.add(bindings.name.text)
+      }
+    }
+    let foundAlias = true
+    while (foundAlias) {
+      foundAlias = false
+      for (const declaration of walk(sourceFile, isVariableDeclaration).filter(
+        isVariableDeclaration
+      )) {
+        if (!isIdentifier(declaration.name) || !declaration.initializer) continue
+        const initializer = declaration.initializer
+        const aliasesClass =
+          (isIdentifier(initializer) && localNames.has(initializer.text)) ||
+          (isPropertyAccessExpression(initializer) &&
+            isIdentifier(initializer.expression) &&
+            namespaceNames.has(initializer.expression.text) &&
+            initializer.name.text === className)
+        if (aliasesClass && !localNames.has(declaration.name.text)) {
+          localNames.add(declaration.name.text)
+          foundAlias = true
+        }
+      }
+    }
+    for (const node of walk(
+      sourceFile,
+      (candidate) =>
+        isNewExpression(candidate) &&
+        ((isIdentifier(candidate.expression) && localNames.has(candidate.expression.text)) ||
+          (isPropertyAccessExpression(candidate.expression) &&
+            isIdentifier(candidate.expression.expression) &&
+            namespaceNames.has(candidate.expression.expression.text) &&
+            candidate.expression.name.text === className))
+    )) {
+      let current: Node | undefined = node.parent
+      while (current && !isConstructorDeclaration(current) && !isMethodDeclaration(current)) {
+        current = current.parent
+      }
+      sites.push(
+        `${relative(projectRoot, path).split(sep).join('/')}:${
+          current && isMethodDeclaration(current)
+            ? memberName(current.name)
+            : current
+              ? 'constructor'
+              : 'module'
+        }`
+      )
+    }
+  }
+  return sites.sort()
+}
+
+const concreteCoordinatorConsumerFiles = (): string[] =>
+  findTypeScriptFiles(resolve(projectRoot, 'src/main'))
+    .filter((path) => !path.endsWith('/session-persistence/coordinator.ts'))
+    .filter((path) => path !== resolve(projectRoot, 'src/main/composition/session-authority.ts'))
+    .filter((path) => {
+      const sourceFile = createSourceFile(
+        path,
+        readFileSync(path, 'utf8'),
+        ScriptTarget.Latest,
+        true,
+        ScriptKind.TS
+      )
+      return sourceFile.statements.filter(isImportDeclaration).some((statement) => {
+        if (!isStringLiteralLike(statement.moduleSpecifier)) return false
+        const importedPath = resolve(path, '..', statement.moduleSpecifier.text)
+        if (importedPath !== resolve(__dirname, 'coordinator')) return false
+        const bindings = statement.importClause?.namedBindings
+        return (
+          bindings !== undefined &&
+          isNamedImports(bindings) &&
+          bindings.elements.some(
+            (element) =>
+              (element.propertyName ?? element.name).text === 'SessionPersistenceCoordinator'
+          )
+        )
+      })
+    })
+    .map((path) => relative(projectRoot, path).split(sep).join('/'))
+    .sort()
+
+describe('Session persistence coordinator architecture', () => {
+  const facadeFile = sourceFileFor('coordinator.ts')
+  const facade = classFrom('coordinator.ts', 'SessionPersistenceCoordinator')
+  const stateOwner = classFrom('state-owner.ts', 'SessionPersistenceStateOwner')
+  const sideChatOwner = classFrom('side-chat-owner.ts', 'SessionSideChatPersistenceOwner')
+  const deletionOwner = classFrom('deletion-owner.ts', 'SessionPersistenceDeletionOwner')
+  const reconciliationOwner = classFrom(
+    'reconciliation-owner.ts',
+    'SessionPersistenceReconciliationOwner'
+  )
+  const messageDeliveryOwner = classFrom(
+    'message-delivery-owner.ts',
+    'SessionMessageDeliveryPersistenceOwner'
+  )
+  const delegatedWorkOwner = classFrom(
+    'delegated-work-owner.ts',
+    'SessionDelegatedWorkPersistenceOwner'
+  )
+  const delegatedWorkStore = classFrom('delegated-work-store.ts', 'SessionDelegatedWorkStore')
+  const delegatedQuestionOwner = classFrom(
+    'delegated-question-owner.ts',
+    'SessionDelegatedQuestionPersistenceOwner'
+  )
+
+  it('keeps the established facade, constructor, and module exports', () => {
+    expect(methods(facade, 'public')).toEqual(
+      [
+        'recordSessionRecordProblem',
+        'clearSessionRecordProblem',
+        'listSessionRecordProblems',
+        'recordRuntimeTerminalFailure',
+        'listRuntimeTerminalFailures',
+        'projectRuntimeSession',
+        'projectRuntimeSessionSummaries',
+        'retryRuntimeTerminalCommit',
+        'acknowledgeUncertainMessage',
+        'admitMessageCommand',
+        'admitQuestion',
+        'adoptPublishedSession',
+        'appendSideChatRelay',
+        'appendUserMessageToInteraction',
+        'applyAgentEvent',
+        'assertProjectArchivable',
+        'assertSessionAvailable',
+        'attachDelegatedMessageArtifacts',
+        'cancelQuestions',
+        'cleanupRecoveredSession',
+        'reconcileRecoveryCatalog',
+        'recoveryCatalogGeneration',
+        'clearSideChat',
+        'commitSideChatRelays',
+        'completeChildTurn',
+        'completeProjectSessionDeletion',
+        'confirmQuestion',
+        'containsMessageOnActiveBranch',
+        'createChildren',
+        'deleteProjectSessions',
+        'deleteRecoveryFile',
+        'deleteSession',
+        'failTaskRun',
+        'getProjectSessionDeletionState',
+        'listLegacyProjectSessionTombstones',
+        'loadAll',
+        'loadAllReadOnly',
+        'loadSessionForContinuation',
+        'loadPersistedSideChats',
+        'markCommittedProjectSessionsPrepared',
+        'mutateRuntimeSession',
+        'mutateSessionComputeHostAccess',
+        'mutateSessionDetailsAuthority',
+        'patchSessionRuntimeContext',
+        'pruneSessionEnabledComputeHosts',
+        'readChildren',
+        'withUnreferencedLiteratureAttachment',
+        'withLiteratureAttachmentRemoval',
+        'readSessionRuntimeContext',
+        'readSessionSnapshot',
+        'prepareSessionRecovery',
+        'commitSessionRecovery',
+        'recoverStartupSession',
+        'recoverInterruptedDelegatedWork',
+        'replaceSessionMetadata',
+        'repairProjectFiles',
+        'reserveSessionExport',
+        'retryArtifactFinalization',
+        'commitRecoveredArtifactReferences',
+        'runSessionMutation',
+        'saveManifest',
+        'saveSession',
+        'saveSessionSpecialistBinding',
+        'saveSideChatProjection',
+        'sessionMetadataSnapshot',
+        'sessionProjectId',
+        'setSessionComputeConcurrencyLimit',
+        'setSessionDelegationPolicy',
+        'setSessionDeletionHandlers',
+        'setSessionEnabledComputeHosts',
+        'settleMessage',
+        'settleTaskCompletion',
+        'bindTaskSession',
+        'prepareRuntimeResume',
+        'admitTaskTurn',
+        'stageTaskCompletion',
+        'startAttemptRuntime',
+        'startContinuationAttempt',
+        'startMessageDispatch',
+        'startPendingMessageTurn',
+        'submitStructuredOutput',
+        'transitionAttempt',
+        'updateArchive',
+        'updateSessionConfiguration',
+        'updateQuestionDraft'
+      ].sort()
+    )
+    expect(methods(facade, 'private')).toEqual(
+      [
+        'assertMutable',
+        'notifyFilesChanged',
+        'notifySessionsDeleted',
+        'recordProblemKey',
+        'withDeletionCleanup'
+      ].sort()
+    )
+    expect(publicNonMethodMembers(facade)).toEqual([])
+
+    const constructors = facade.members.filter(isConstructorDeclaration)
+    expect(constructors).toHaveLength(1)
+    expect(
+      constructors[0].parameters.map(
+        (parameter) =>
+          `${parameter.name.getText(facadeFile)}:${
+            parameter.initializer ? 'defaulted' : parameter.questionToken ? 'optional' : 'required'
+          }`
+      )
+    ).toEqual([
+      'repository:required',
+      'fileIndex:required',
+      'onFilesChanged:optional',
+      'provenance:optional',
+      'uploads:optional',
+      'artifactStorage:optional',
+      'permissionGrants:optional',
+      'log:defaulted',
+      'computeJobs:optional',
+      'onDelegatedWorkSessionUpdated:optional',
+      'onDelegationPolicyUpdated:optional',
+      'workspaceOwnership:optional',
+      'preparePackageDeletion:optional',
+      'deletionWork:optional'
+    ])
+    expect(exportedNames(facadeFile, 'value')).toEqual(
+      ['SessionPersistenceCoordinator', 'SessionRuntimeContextRevisionConflictError'].sort()
+    )
+    expect(exportedNames(facadeFile, 'type')).toEqual(
+      [
+        'ComputeJobDeletionParticipant',
+        'DelegatedWorkRecordCommands',
+        'PatchSessionRuntimeContextCommand',
+        'PreparedSessionRecovery',
+        'RecoveredSessionReference',
+        'ProjectSessionDeletionResult',
+        'PublishedSessionHandoff',
+        'SessionCatalog',
+        'SessionPersistenceCommands',
+        'SessionDeletion',
+        'SessionDeletionHandlers',
+        'SessionFileIndex',
+        'SessionMetadata',
+        'SessionMetadataSnapshot',
+        'SessionMutation',
+        'SessionMutationRepository',
+        'SessionProvenancePersistence',
+        'SessionRuntimeContextCommands'
+      ].sort()
+    )
+  })
+
+  it('keeps production consumers on named capability views', () => {
+    expect(concreteCoordinatorConsumerFiles()).toEqual([])
+  })
+
+  it('composes each owner once and keeps mutable state with its sole owner', () => {
+    expect(fields(facade)).toEqual(
+      [
+        'notifySessionRecordProblems',
+        'sessionRecordProblems',
+        'computeJobs',
+        'delegatedStartupRecoveryComplete',
+        'deletedProjects',
+        'deletedSessions',
+        'pendingDeletionCleanups',
+        'deletionOwner',
+        'deletionWork',
+        'destructiveStartupWindowOpen',
+        'exportingSessions',
+        'fileIndex',
+        'hydrationCache',
+        'log',
+        'delegatedWorkOwner',
+        'onFilesChanged',
+        'operationScheduler',
+        'reconciliationOwner',
+        'repository',
+        'sessionDeletionHandlers',
+        'sideChatOwner',
+        'stateOwner',
+        'workspaceOwnership'
+      ].sort()
+    )
+    expect(mutableFields(facade)).toEqual(
+      [
+        'delegatedStartupRecoveryComplete',
+        'destructiveStartupWindowOpen',
+        'sessionDeletionHandlers'
+      ].sort()
+    )
+    expect(mutableFields(stateOwner)).toEqual(
+      ['isSessionMetadataComplete', 'sessionMetadata'].sort()
+    )
+    expect(mutableFields(deletionOwner)).toEqual([])
+    expect(mutableFields(reconciliationOwner)).toEqual([])
+    expect(mutableFields(sideChatOwner)).toEqual([])
+    expect(mutableFields(messageDeliveryOwner)).toEqual([])
+    expect(mutableFields(delegatedWorkOwner)).toEqual([])
+    expect(mutableFields(delegatedWorkStore)).toEqual([])
+    expect(mutableFields(delegatedQuestionOwner)).toEqual([])
+    expect(publicNonMethodMembers(stateOwner)).toEqual([])
+    expect(publicNonMethodMembers(deletionOwner)).toEqual([])
+    expect(publicNonMethodMembers(reconciliationOwner)).toEqual([])
+    expect(publicNonMethodMembers(sideChatOwner)).toEqual([])
+    expect(publicNonMethodMembers(messageDeliveryOwner)).toEqual([])
+    expect(publicNonMethodMembers(delegatedWorkOwner)).toEqual([])
+    expect(publicNonMethodMembers(delegatedWorkStore)).toEqual([])
+    expect(publicNonMethodMembers(delegatedQuestionOwner)).toEqual([])
+    expect(fields(stateOwner)).toEqual(
+      [
+        'isSessionMetadataComplete',
+        'options',
+        'sessionMetadata',
+        'validatedBindingTopologies',
+        'runtimeTerminalFailures',
+        'promptPreparations'
+      ].sort()
+    )
+    expect(fields(deletionOwner)).toEqual(
+      [
+        'assertArchiveMutable',
+        'computeJobs',
+        'fileIndex',
+        'log',
+        'notifyDiscussionDetached',
+        'notifyFilesChanged',
+        'preparePackageDeletion',
+        'provenance',
+        'repository',
+        'stateOwner',
+        'uploads',
+        'workspaceOwnership'
+      ].sort()
+    )
+    expect(fields(reconciliationOwner)).toEqual(
+      [
+        'onSessionCommitted',
+        'ownsPromptPreparation',
+        'artifactStorage',
+        'fileIndex',
+        'permissionGrants',
+        'provenance',
+        'repository',
+        'uploads'
+      ].sort()
+    )
+    expect(fields(sideChatOwner)).toEqual(['options'])
+    for (const file of productionFiles) {
+      expect(statefulTopLevelVariables(file), file).toEqual(
+        file === 'deletion-owner.ts' ? ['ARCHIVE_BLOCKING_SESSION_STATUSES'] : []
+      )
+      expect(staticStateFields(file), file).toEqual([])
+    }
+
+    expect(constructionSites('SessionPersistenceCoordinator')).toEqual([
+      'src/main/composition/session-authority.ts:module'
+    ])
+    expect(constructionSites('SessionPersistenceStateOwner')).toEqual([
+      'src/main/session-persistence/coordinator.ts:constructor'
+    ])
+    expect(constructionSites('SessionPersistenceDeletionOwner')).toEqual([
+      'src/main/session-persistence/coordinator.ts:constructor'
+    ])
+    expect(constructionSites('SessionPersistenceReconciliationOwner')).toEqual([
+      'src/main/session-persistence/coordinator.ts:constructor'
+    ])
+    expect(constructionSites('SessionSideChatPersistenceOwner')).toEqual([
+      'src/main/session-persistence/coordinator.ts:constructor'
+    ])
+    expect(constructionSites('SessionMessageDeliveryPersistenceOwner')).toEqual([
+      'src/main/session-persistence/delegated-work-owner.ts:module'
+    ])
+    expect(constructionSites('SessionDelegatedWorkPersistenceOwner')).toEqual([
+      'src/main/session-persistence/coordinator.ts:constructor'
+    ])
+    expect(constructionSites('SessionDelegatedWorkStore')).toEqual([
+      'src/main/session-persistence/delegated-work-owner.ts:constructor'
+    ])
+    expect(constructionSites('SessionDelegatedQuestionPersistenceOwner')).toEqual([
+      'src/main/session-persistence/delegated-work-owner.ts:constructor'
+    ])
+    expect(constructionSites('SessionPersistenceOperationScheduler')).toEqual([
+      'src/main/session-persistence/coordinator.ts:module',
+      'src/main/session-persistence/repository.ts:module'
+    ])
+  })
+
+  it('routes every asynchronous public operation through its owning scheduler scope', () => {
+    const handlerSetter = methodFrom(facade, 'setSessionDeletionHandlers')
+    expect(hasModifier(handlerSetter, SyntaxKind.AsyncKeyword)).toBe(false)
+    expect(handlerSetter.type?.kind).toBe(SyntaxKind.VoidKeyword)
+    expect(walk(handlerSetter, isAwaitExpression)).toEqual([])
+    const schedulerRoutes: Record<string, string[]> = {
+      runGlobal: [
+        'withUnreferencedLiteratureAttachment',
+        'withLiteratureAttachmentRemoval',
+        'listLegacyProjectSessionTombstones',
+        'loadAll',
+        'loadAllReadOnly',
+        'loadPersistedSideChats',
+        'pruneSessionEnabledComputeHosts',
+        'repairProjectFiles',
+        'replaceSessionMetadata',
+        'sessionMetadataSnapshot'
+      ],
+      runManifest: ['saveManifest'],
+      runProject: [
+        'assertProjectArchivable',
+        'completeProjectSessionDeletion',
+        'deleteProjectSessions',
+        'getProjectSessionDeletionState',
+        'markCommittedProjectSessionsPrepared'
+      ],
+      runSession: [
+        'adoptPublishedSession',
+        'appendSideChatRelay',
+        'appendUserMessageToInteraction',
+        'assertSessionAvailable',
+        'clearSideChat',
+        'commitSideChatRelays',
+        'containsMessageOnActiveBranch',
+        'deleteRecoveryFile',
+        'failTaskRun',
+        'loadSessionForContinuation',
+        'mutateRuntimeSession',
+        'mutateSessionComputeHostAccess',
+        'mutateSessionDetailsAuthority',
+        'patchSessionRuntimeContext',
+        'readSessionRuntimeContext',
+        'readSessionSnapshot',
+        'prepareSessionRecovery',
+        'commitSessionRecovery',
+        'reserveSessionExport',
+        'retryArtifactFinalization',
+        'commitRecoveredArtifactReferences',
+        'saveSession',
+        'saveSessionSpecialistBinding',
+        'saveSideChatProjection',
+        'setSessionComputeConcurrencyLimit',
+        'settleTaskCompletion',
+        'bindTaskSession',
+        'prepareRuntimeResume',
+        'admitTaskTurn',
+        'stageTaskCompletion',
+        'setSessionDelegationPolicy',
+        'setSessionEnabledComputeHosts',
+        'updateSessionConfiguration',
+        'updateArchive'
+      ],
+      runSessionProjectExclusive: ['runSessionMutation'],
+      runSessionThenGlobalIfNeeded: ['deleteSession'],
+      runSessionIdentity: ['sessionProjectId']
+    }
+    const expectedSchedulerRoute = new Map(
+      Object.entries(schedulerRoutes).flatMap(([route, names]) =>
+        names.map((name) => [name, route] as const)
+      )
+    )
+    const asynchronousMethods = methods(facade, 'public').filter(
+      (name) => name !== 'setSessionDeletionHandlers'
+    )
+    for (const name of asynchronousMethods) {
+      const method = methodFrom(facade, name)
+      if (
+        [
+          'recordSessionRecordProblem',
+          'clearSessionRecordProblem',
+          'listSessionRecordProblems',
+          'recordRuntimeTerminalFailure',
+          'projectRuntimeSession',
+          'recoveryCatalogGeneration'
+        ].includes(name)
+      ) {
+        // Synchronous Main facts decorate projections; they never write durable Session state.
+        const text = method.getText(facadeFile)
+        expect(text).not.toContain('this.operationScheduler.')
+        expect(text).not.toContain('this.repository.')
+        expect(text).not.toContain('saveSession(')
+        continue
+      }
+      if (
+        [
+          'recordRuntimeTerminalFailure',
+          'listRuntimeTerminalFailures',
+          'projectRuntimeSession',
+          'retryRuntimeTerminalCommit'
+        ].includes(name)
+      ) {
+        // Ephemeral facts/projections do not mutate durable authority. Explicit Retry invokes the
+        // runtime's scheduled mutation callback; holding its lane here would deadlock that callback.
+        expect(calledOwnerMethods(method), name).toEqual([`stateOwner.${name}`])
+        expect(method.body?.statements, name).toHaveLength(1)
+        expect(
+          walk(method, isCallExpression).map(
+            (call) => isCallExpression(call) && call.expression.getText(facadeFile)
+          ),
+          name
+        ).toEqual([`this.stateOwner.${name}`])
+        continue
+      }
+      if (name === 'cleanupRecoveredSession' || name === 'reconcileRecoveryCatalog') {
+        const text = method.getText(facadeFile)
+        expect(text).toContain(
+          name === 'cleanupRecoveredSession'
+            ? 'this.operationScheduler.runSessionRecovery'
+            : 'this.operationScheduler.runGlobal'
+        )
+        expect(text).toContain('this.recoveryCatalogGeneration() !== expectedGeneration')
+        expect(text).toContain('cancelled()')
+        continue
+      }
+      if (name === 'replaceSessionMetadata') {
+        const text = method.getText(facadeFile)
+        expect(text).toContain('this.recoveryCatalogGeneration() === expectedGeneration')
+        expect(text).toContain('this.operationScheduler.runGlobal')
+        expect(text).toContain('this.stateOwner.metadataSnapshot().sessions, false')
+        continue
+      }
+      if (name === 'recoverStartupSession') {
+        // Orchestration releases the lane between attempts; prepare and commit own their guards.
+        expect(method.getText(facadeFile)).not.toContain('this.operationScheduler.')
+        expect(method.getText(facadeFile)).not.toContain('this.repository.')
+        expect(method.getText(facadeFile)).toContain('this.prepareSessionRecovery(')
+        expect(method.getText(facadeFile)).toContain('this.commitSessionRecovery(')
+        continue
+      }
+      if (name === 'prepareSessionRecovery' || name === 'commitSessionRecovery') {
+        // Production preparation reads a non-mutating snapshot off-lane; only legacy readers use
+        // the scoped fallback. Commit revalidates before effectful reconciliation in that lane.
+        const calls = walk(method, isCallExpression)
+          .filter(isCallExpression)
+          .map((call) => call.expression.getText(facadeFile))
+        expect(calls.filter((call) => call.startsWith('this.operationScheduler.'))).toEqual([
+          name === 'prepareSessionRecovery'
+            ? 'this.operationScheduler.runSession'
+            : 'this.operationScheduler.runSessionRecovery'
+        ])
+        if (name === 'prepareSessionRecovery') {
+          expect(calledOwnerMethods(method)).toEqual([])
+          expect(calls.filter((call) => call.startsWith('this.repository.'))).toEqual([
+            'this.repository.loadSessionRecoverySnapshot',
+            'this.repository.loadSessionWithDiagnostics'
+          ])
+        } else {
+          expect(calledOwnerMethods(method)).toEqual([
+            'reconciliationOwner.reconcileLoadedSessions',
+            'stateOwner.ownsPromptPreparation',
+            'stateOwner.recordSession'
+          ])
+        }
+        continue
+      }
+      if (name === 'projectRuntimeSessionSummaries') {
+        // Live release facts overlay returned summaries only; this path must never save them.
+        expect(calledOwnerMethods(method)).toEqual([])
+        const repositoryCalls = walk(method, isCallExpression)
+          .filter(isCallExpression)
+          .map((call) => call.expression.getText(facadeFile))
+          .filter((call) => call.startsWith('this.repository.'))
+        expect(repositoryCalls).toEqual(['this.repository.loadSessionWithDiagnostics'])
+        expect(method.getText(facadeFile)).toContain("mode: 'read-only'")
+        expect(method.getText(facadeFile)).not.toContain('this.operationScheduler.')
+        continue
+      }
+      if (name === 'deleteSession' || name === 'deleteProjectSessions') {
+        // Drain film publishers before taking a persistence lane; publication itself needs it.
+        const capture = method.body?.statements[0]
+        expect(method.body?.statements, name).toHaveLength(2)
+        expect(capture && isVariableStatement(capture), name).toBe(true)
+        if (!capture || !isVariableStatement(capture)) continue
+        const operation = capture.declarationList.declarations[0]
+        expect(operation.name.getText(facadeFile), name).toBe('operation')
+        expect(operation.initializer && isArrowFunction(operation.initializer), name).toBe(true)
+        const schedulerCalls = walk(method, isCallExpression)
+          .filter(isCallExpression)
+          .map((call) => call.expression.getText(facadeFile))
+          .filter((call) => call.startsWith('this.operationScheduler.'))
+        expect(schedulerCalls, name).toEqual([
+          `this.operationScheduler.${expectedSchedulerRoute.get(name)}`
+        ])
+        const route = name === 'deleteSession' ? 'withSessionStopped' : 'withProjectStopped'
+        const args = name === 'deleteSession' ? 'projectId, sessionId' : 'projectId'
+        expect(method.body?.statements[1].getText(facadeFile), name).toBe(
+          `return this.deletionWork\n      ? this.deletionWork.${route}(${args}, operation)\n      : operation()`
+        )
+        continue
+      }
+      if (name === 'saveSession' || name === 'reserveSessionExport') {
+        // Export release waits outside the lane; each actual save still enters the same Session
+        // scheduler. Behavioral coordinator tests cover release/retry and unrelated-lane progress.
+        const calls: string[] = []
+        const visit = (node: Node): void => {
+          if (
+            isCallExpression(node) &&
+            node.expression.getText(facadeFile).startsWith('this.operationScheduler.')
+          )
+            calls.push(node.expression.getText(facadeFile))
+          forEachChild(node, visit)
+        }
+        visit(method)
+        expect(calls).toEqual(['this.operationScheduler.runSession'])
+        continue
+      }
+      const statements = method.body?.statements
+      const capturesQueueTime = name === 'loadAll' || name === 'loadAllReadOnly'
+      if (name === 'adoptPublishedSession' || name === 'deleteRecoveryFile') {
+        // The package publisher has a different scheduler. Snapshot its handoff synchronously
+        // before this owner queues the ordinary read and catalog mutation in the Session lane.
+        // Recovery deletion similarly validates and captures its untrusted identity before queuing.
+        expect(statements, name).toHaveLength(name === 'adoptPublishedSession' ? 3 : 2)
+        if (name === 'adoptPublishedSession')
+          expect(statements?.[1].getText(facadeFile)).toBe('this.hydrationCache.invalidate()')
+        const capture = statements?.[0]
+        expect(capture && isVariableStatement(capture)).toBe(true)
+        expect(capture?.getText(facadeFile)).toBe(
+          name === 'adoptPublishedSession'
+            ? 'const { projectId, sessionId, session, pendingProjectImport } = structuredClone(publication)'
+            : 'const validated = deleteSessionRecoveryFileRequestSchema.parse(request)'
+        )
+      } else if (capturesQueueTime) {
+        // Capture the enqueue clock only; all authority work must still enter the global lane.
+        expect(statements, name).toHaveLength(2)
+        expect(statements?.[0].getText(facadeFile)).toBe('const queuedAt = performance.now()')
+      } else {
+        expect(statements, name).toHaveLength(1)
+      }
+      const statement =
+        statements?.[
+          name === 'adoptPublishedSession'
+            ? 2
+            : name === 'deleteRecoveryFile' || capturesQueueTime
+              ? 1
+              : 0
+        ]
+      expect(statement, name).toBeDefined()
+      if (!statement) continue
+      expect(isReturnStatement(statement), name).toBe(true)
+      if (!isReturnStatement(statement) || !statement.expression) continue
+      expect(isCallExpression(statement.expression), name).toBe(true)
+      if (!isCallExpression(statement.expression)) continue
+      const target = statement.expression.expression
+      expect(isPropertyAccessExpression(target), name).toBe(true)
+      if (!isPropertyAccessExpression(target)) continue
+      const owner = target.expression
+      expect(isPropertyAccessExpression(owner), name).toBe(true)
+      if (!isPropertyAccessExpression(owner)) continue
+      expect(owner.expression.kind, name).toBe(SyntaxKind.ThisKeyword)
+      const schedulerRoute = expectedSchedulerRoute.get(name)
+      if (schedulerRoute) {
+        expect(owner.name.text, name).toBe('operationScheduler')
+        expect(target.name.text, name).toBe(schedulerRoute)
+      } else {
+        expect(owner.name.text, name).toBe('delegatedWorkOwner')
+      }
+    }
+
+    for (const owner of [
+      stateOwner,
+      deletionOwner,
+      reconciliationOwner,
+      sideChatOwner,
+      messageDeliveryOwner,
+      delegatedWorkOwner,
+      delegatedWorkStore,
+      delegatedQuestionOwner
+    ]) {
+      expect(fields(owner)).not.toContain('queue')
+      expect(methods(owner, 'public')).not.toContain('enqueue')
+      expect(methods(owner, 'private')).not.toContain('enqueue')
+    }
+
+    expect(expectedSchedulerRoute.size).toBe(53)
+    const constructorSource = facade.members.filter(isConstructorDeclaration)[0].getText(facadeFile)
+    expect(constructorSource).toContain('this.operationScheduler.runSession(')
+    expect(constructorSource).toContain('this.operationScheduler.runGlobal(work)')
+  })
+
+  it('closes the destructive startup window before awaiting and never reopens it', () => {
+    const field = facade.members.find(
+      (member) =>
+        isPropertyDeclaration(member) && memberName(member.name) === 'destructiveStartupWindowOpen'
+    )
+    expect(field && isPropertyDeclaration(field) ? field.initializer?.kind : undefined).toBe(
+      SyntaxKind.TrueKeyword
+    )
+
+    const assignments = walk(
+      facade,
+      (node) =>
+        isBinaryExpression(node) &&
+        node.operatorToken.kind === SyntaxKind.EqualsToken &&
+        isPropertyAccessExpression(node.left) &&
+        node.left.expression.kind === SyntaxKind.ThisKeyword &&
+        node.left.name.text === 'destructiveStartupWindowOpen'
+    ).filter(isBinaryExpression)
+    expect(assignments).toHaveLength(2)
+    expect(
+      assignments.every((assignment) => assignment.right.kind === SyntaxKind.FalseKeyword)
+    ).toBe(true)
+
+    for (const name of ['loadAllReadOnly', 'loadAll']) {
+      const method = methodFrom(facade, name)
+      const assignment = assignments.find(
+        (candidate) => candidate.pos >= method.pos && candidate.end <= method.end
+      )
+      const firstAwait = walk(method, isAwaitExpression)[0]
+      expect(assignment, name).toBeDefined()
+      expect(firstAwait, name).toBeDefined()
+      expect(assignment!.pos, name).toBeLessThan(firstAwait.pos)
+    }
+
+    expect(calledOwnerMethods(methodFrom(facade, 'loadAllReadOnly'))).toEqual([
+      'stateOwner.beginHydration',
+      'stateOwner.replaceMetadata'
+    ])
+    const loadAll = methodFrom(facade, 'loadAll')
+    expect(
+      calledOwnerMethods(loadAll).filter(
+        (call) => call === 'reconciliationOwner.reconcileLoadedSessions'
+      )
+    ).toHaveLength(1)
+    const gateCapture = walk(
+      loadAll,
+      (node) =>
+        isVariableDeclaration(node) &&
+        isIdentifier(node.name) &&
+        node.name.text === 'mayRunDestructiveStartupCleanup' &&
+        node.initializer !== undefined &&
+        isPropertyAccessExpression(node.initializer) &&
+        node.initializer.expression.kind === SyntaxKind.ThisKeyword &&
+        node.initializer.name.text === 'destructiveStartupWindowOpen'
+    )[0]
+    const cleanupOption = walk(
+      loadAll,
+      (node) =>
+        isPropertyAssignment(node) &&
+        memberName(node.name) === 'allowDestructiveCleanup' &&
+        isIdentifier(node.initializer) &&
+        node.initializer.text === 'mayRunDestructiveStartupCleanup'
+    )[0]
+    const loadAllAssignment = assignments.find(
+      (candidate) => candidate.pos >= loadAll.pos && candidate.end <= loadAll.end
+    )
+    expect(gateCapture).toBeDefined()
+    expect(cleanupOption).toBeDefined()
+    expect(gateCapture.pos).toBeLessThan(loadAllAssignment!.pos)
+    expect(loadAllAssignment!.pos).toBeLessThan(cleanupOption.pos)
+    expect(sources.get('reconciliation-owner.ts')).not.toContain('markMetadataIncomplete')
+    expect(sources.get('reconciliation-owner.ts')).not.toContain('markReconciliationIncomplete')
+  })
+
+  it('keeps tombstones in the coordinator and mutates them only in deletion workflows', () => {
+    const mutationSites = new Map<string, string[]>()
+    for (const tombstone of ['deletedProjects', 'deletedSessions']) mutationSites.set(tombstone, [])
+    const usages = walk(
+      facade,
+      (node) =>
+        isPropertyAccessExpression(node) &&
+        node.expression.kind === SyntaxKind.ThisKeyword &&
+        mutationSites.has(node.name.text)
+    ).filter(isPropertyAccessExpression)
+    for (const usage of usages) {
+      const operation = usage.parent
+      const call = operation.parent
+      expect(isPropertyAccessExpression(operation) && operation.expression === usage).toBe(true)
+      expect(isCallExpression(call) && call.expression === operation).toBe(true)
+      if (!isPropertyAccessExpression(operation) || !isCallExpression(call)) continue
+      expect(['add', 'delete', 'has']).toContain(operation.name.text)
+      if (!['add', 'delete'].includes(operation.name.text)) continue
+      let current: Node | undefined = call.parent
+      while (current && !isMethodDeclaration(current)) current = current.parent
+      expect(current && isMethodDeclaration(current)).toBe(true)
+      if (!current || !isMethodDeclaration(current)) continue
+      mutationSites.get(usage.name.text)!.push(`${memberName(current.name)}:${operation.name.text}`)
+    }
+    expect(mutationSites.get('deletedProjects')?.sort()).toEqual([
+      'deleteProjectSessions:add',
+      'deleteProjectSessions:delete'
+    ])
+    expect(mutationSites.get('deletedSessions')?.sort()).toEqual([
+      'deleteSession:add',
+      'deleteSession:delete'
+    ])
+    for (const file of [
+      'state-owner.ts',
+      'deletion-owner.ts',
+      'message-delivery-owner.ts',
+      'reconciliation-owner.ts',
+      'message-delivery-owner.ts',
+      'side-chat-owner.ts'
+    ] as const) {
+      expect(sources.get(file), file).not.toMatch(/deletedProjects|deletedSessions/)
+    }
+  })
+
+  it('keeps owner interfaces narrow and facade routes explicit', () => {
+    expect(methods(stateOwner, 'public')).toEqual(
+      [
+        'recordRuntimeTerminalFailure',
+        'listRuntimeTerminalFailures',
+        'projectRuntimeSession',
+        'retryRuntimeTerminalCommit',
+        'assertRuntimeTerminalWriteAvailable',
+        'appendUserMessage',
+        'beginHydration',
+        'containsMessageOnActiveBranch',
+        'failTaskRun',
+        'invalidateBindingTopology',
+        'markMetadataIncomplete',
+        'metadataSnapshot',
+        'mutateRuntimeSession',
+        'patchRuntimeContext',
+        'pruneEnabledComputeHosts',
+        'readRuntimeContext',
+        'ownsPromptPreparation',
+        'releaseAbandonedPreparation',
+        'recordSession',
+        'removeProject',
+        'removeSession',
+        'replaceMetadata',
+        'replaceProjectMetadata',
+        'saveSession',
+        'saveSessionSpecialistBinding',
+        'sessionProjectId',
+        'setComputeConcurrencyLimit',
+        'setDelegationPolicy',
+        'setEnabledComputeHosts',
+        'settleTaskCompletion',
+        'bindTaskSession',
+        'prepareRuntimeResume',
+        'admitTaskTurn',
+        'stageTaskCompletion',
+        'updateSessionConfiguration'
+      ].sort()
+    )
+    expect(methods(stateOwner, 'private')).toEqual(
+      [
+        'clearRuntimeTerminalFailure',
+        'loadRuntimeContextSession',
+        'loadTaskRunAuthority',
+        'persistTaskSession',
+        'persistTaskTerminalState',
+        'saveSessionWithAuthority'
+      ].sort()
+    )
+    expect(methods(deletionOwner, 'public')).toEqual(
+      [
+        'assertProjectArchivable',
+        'assertSessionAvailable',
+        'completeProjectSessionDeletion',
+        'deleteProjectSessions',
+        'deleteSession',
+        'getProjectSessionDeletionState',
+        'listLegacyProjectSessionTombstones',
+        'markCommittedProjectSessionsPrepared',
+        'reconcileProjectSessionDeletion',
+        'reconcileSessionDeletion',
+        'updateArchive'
+      ].sort()
+    )
+    expect(methods(deletionOwner, 'private')).toEqual(
+      [
+        'prepareProjectSessionUploadsForTerminalDelete',
+        'prepareSessionUploadsForTerminalDelete'
+      ].sort()
+    )
+    expect(methods(reconciliationOwner, 'public')).toEqual(
+      [
+        'commitRecoveredArtifacts',
+        'cleanupVersionedUploadSources',
+        'planOrphanStagingCleanup',
+        'planNativeCleanup',
+        'reconcileCatalogIdentities',
+        'reconcileLoadedSessions',
+        'repairFileProjection',
+        'retryArtifactFinalization'
+      ].sort()
+    )
+    expect(methods(reconciliationOwner, 'private')).toEqual(['confirmPublishedVersions'])
+    expect(methods(sideChatOwner, 'public')).toEqual(
+      ['appendRelay', 'clear', 'commitRelays', 'loadCatalog', 'saveProjection'].sort()
+    )
+    expect(methods(sideChatOwner, 'private')).toEqual(
+      ['loadMutable', 'requireSideChat', 'save'].sort()
+    )
+    expect(methods(messageDeliveryOwner, 'public')).toEqual(
+      [
+        'acknowledge',
+        'admit',
+        'completeChildTurn',
+        'settle',
+        'startChildTurn',
+        'startDispatch'
+      ].sort()
+    )
+    expect(methods(messageDeliveryOwner, 'private')).toEqual(['assertWritable'])
+
+    const expectedCalls: Record<string, string[]> = {
+      acknowledgeUncertainMessage: ['delegatedWorkOwner.acknowledgeUncertainMessage'],
+      admitMessageCommand: ['delegatedWorkOwner.admitMessageCommand'],
+      admitQuestion: ['delegatedWorkOwner.admitQuestion'],
+      appendSideChatRelay: ['sideChatOwner.appendRelay'],
+      appendUserMessageToInteraction: ['stateOwner.appendUserMessage'],
+      assertProjectArchivable: ['deletionOwner.assertProjectArchivable'],
+      assertSessionAvailable: ['deletionOwner.assertSessionAvailable'],
+      clearSideChat: ['sideChatOwner.clear'],
+      commitSideChatRelays: ['sideChatOwner.commitRelays'],
+      completeProjectSessionDeletion: ['deletionOwner.completeProjectSessionDeletion'],
+      completeChildTurn: ['delegatedWorkOwner.completeChildTurn'],
+      confirmQuestion: ['delegatedWorkOwner.confirmQuestion'],
+      createChildren: ['delegatedWorkOwner.createChildren'],
+      containsMessageOnActiveBranch: ['stateOwner.containsMessageOnActiveBranch'],
+      deleteProjectSessions: [
+        'deletionOwner.deleteProjectSessions',
+        'deletionOwner.getProjectSessionDeletionState'
+      ],
+      deleteSession: [
+        'deletionOwner.deleteSession',
+        'deletionOwner.reconcileProjectSessionDeletion',
+        'deletionOwner.reconcileSessionDeletion',
+        'stateOwner.metadataSnapshot'
+      ],
+      failTaskRun: ['stateOwner.failTaskRun'],
+      getProjectSessionDeletionState: ['deletionOwner.getProjectSessionDeletionState'],
+      listLegacyProjectSessionTombstones: ['deletionOwner.listLegacyProjectSessionTombstones'],
+      loadPersistedSideChats: ['sideChatOwner.loadCatalog'],
+      markCommittedProjectSessionsPrepared: ['deletionOwner.markCommittedProjectSessionsPrepared'],
+      mutateSessionComputeHostAccess: ['stateOwner.setEnabledComputeHosts'],
+      patchSessionRuntimeContext: ['stateOwner.patchRuntimeContext'],
+      pruneSessionEnabledComputeHosts: ['stateOwner.pruneEnabledComputeHosts'],
+      readSessionRuntimeContext: ['stateOwner.readRuntimeContext'],
+      replaceSessionMetadata: [
+        'stateOwner.metadataSnapshot',
+        'stateOwner.replaceMetadata',
+        'stateOwner.replaceMetadata',
+        'stateOwner.replaceMetadata'
+      ],
+      saveSession: [
+        'stateOwner.assertRuntimeTerminalWriteAvailable',
+        'stateOwner.listRuntimeTerminalFailures',
+        'stateOwner.retryRuntimeTerminalCommit',
+        'stateOwner.saveSession'
+      ],
+      saveSessionSpecialistBinding: ['stateOwner.saveSessionSpecialistBinding'],
+      saveSideChatProjection: ['sideChatOwner.saveProjection'],
+      sessionMetadataSnapshot: ['stateOwner.metadataSnapshot'],
+      sessionProjectId: ['stateOwner.sessionProjectId'],
+      setSessionComputeConcurrencyLimit: ['stateOwner.setComputeConcurrencyLimit'],
+      setSessionDelegationPolicy: ['stateOwner.setDelegationPolicy'],
+      setSessionEnabledComputeHosts: ['stateOwner.setEnabledComputeHosts'],
+      readChildren: ['delegatedWorkOwner.readChildren'],
+      recoverInterruptedDelegatedWork: ['delegatedWorkOwner.recoverInterruptedDelegatedWork'],
+      settleMessage: ['delegatedWorkOwner.settleMessage'],
+      settleTaskCompletion: ['stateOwner.settleTaskCompletion'],
+      bindTaskSession: ['stateOwner.bindTaskSession'],
+      prepareRuntimeResume: ['stateOwner.prepareRuntimeResume'],
+      admitTaskTurn: ['stateOwner.admitTaskTurn'],
+      stageTaskCompletion: ['stateOwner.stageTaskCompletion'],
+      startMessageDispatch: ['delegatedWorkOwner.startMessageDispatch'],
+      startPendingMessageTurn: ['delegatedWorkOwner.startPendingMessageTurn'],
+      updateArchive: ['deletionOwner.updateArchive']
+    }
+    for (const [method, calls] of Object.entries(expectedCalls)) {
+      expect(calledOwnerMethods(methodFrom(facade, method)), method).toEqual(calls)
+    }
+    expect(calledOwnerMethods(methodFrom(facade, 'repairProjectFiles'))).toEqual([
+      'reconciliationOwner.repairFileProjection'
+    ])
+  })
+
+  it('keeps owner dependencies one-way and free of coordinator back-edges', () => {
+    expect(sessionDependencies('coordinator.ts')).toEqual(
+      [
+        'deletion-owner.ts',
+        'delegated-work-owner.ts',
+        'reconciliation-owner.ts',
+        'session-details-authority.ts',
+        'side-chat-owner.ts',
+        'state-owner.ts'
+      ].sort()
+    )
+    expect(sessionDependencies('state-owner.ts')).toEqual(['relay-projection.ts'])
+    expect(sessionDependencies('deletion-owner.ts')).toEqual(
+      ['legacy-upload.ts', 'state-owner.ts'].sort()
+    )
+    expect(sessionDependencies('reconciliation-owner.ts')).toEqual(['legacy-upload.ts'])
+    expect(sessionDependencies('session-details-authority.ts')).toEqual([])
+    expect(sessionDependencies('side-chat-owner.ts')).toEqual([])
+    expect(sessionDependencies('message-delivery-owner.ts')).toEqual([])
+    expect(sessionDependencies('delegated-question-owner.ts')).toEqual(
+      ['delegated-work-store.ts', 'message-delivery-owner.ts'].sort()
+    )
+    expect(sessionDependencies('delegated-work-owner.ts')).toEqual(
+      ['delegated-question-owner.ts', 'delegated-work-store.ts', 'message-delivery-owner.ts'].sort()
+    )
+    expect(sessionDependencies('delegated-work-store.ts')).toEqual(['state-owner.ts'])
+    for (const file of [
+      'state-owner.ts',
+      'delegated-question-owner.ts',
+      'delegated-work-owner.ts',
+      'delegated-work-store.ts',
+      'deletion-owner.ts',
+      'message-delivery-owner.ts',
+      'reconciliation-owner.ts',
+      'relay-projection.ts',
+      'side-chat-owner.ts'
+    ] as const) {
+      expect(sessionDependencies(file), file).not.toContain('coordinator.ts')
+    }
+  })
+
+  it('keeps the module-impact manifest closed over owners and certification tests', () => {
+    const manifest = loadModuleImpactManifest(resolve(projectRoot, 'scripts/ci/module-impact.json'))
+    const sessionPersistence = manifest.modules.session_persistence
+
+    expect(sessionPersistence.ownerPaths).toEqual([
+      'src/main/session-persistence/coordinator.ts',
+      'src/main/session-persistence/delegated-question-owner.ts',
+      'src/main/session-persistence/delegated-work-owner.ts',
+      'src/main/session-persistence/delegated-work-store.ts',
+      'src/main/session-persistence/deletion-owner.ts',
+      'src/main/session-persistence/legacy-upload.ts',
+      'src/main/session-persistence/message-delivery-owner.ts',
+      'src/main/session-persistence/reconciliation-owner.ts',
+      'src/main/session-persistence/relay-projection.ts',
+      'src/main/session-persistence/session-details-authority.ts',
+      'src/main/session-persistence/side-chat-owner.ts',
+      'src/main/session-persistence/state-owner.ts',
+      'src/main/session-persistence/application-command-errors.ts',
+      'src/main/session-persistence/artifact-alias-repair.test.ts',
+      'src/main/session-persistence/artifact-alias-repair.ts',
+      'src/main/session-persistence/artifact-finalization-recovery.integration.test.ts',
+      'src/main/session-persistence/auxiliary-turn-usage.test.ts',
+      'src/main/session-persistence/auxiliary-turn-usage.ts',
+      'src/main/session-persistence/catalog-authority.ts',
+      'src/main/session-persistence/claude-replay.test.ts',
+      'src/main/session-persistence/claude-replay.ts',
+      'src/main/session-persistence/compute-policy.test.ts',
+      'src/main/session-persistence/compute-policy.ts',
+      'src/main/session-persistence/conversation-export.test.ts',
+      'src/main/session-persistence/conversation-export.ts',
+      'src/main/session-persistence/coordinator-contract.test.ts',
+      'src/main/session-persistence/coordinator.architecture.test.ts',
+      'src/main/session-persistence/coordinator.test.ts',
+      'src/main/session-persistence/data-path-roundtrip.test.ts',
+      'src/main/session-persistence/delegated-work-records.test.ts',
+      'src/main/session-persistence/deletion-integration.test.ts',
+      'src/main/session-persistence/imported-session.test.ts',
+      'src/main/session-persistence/imported-session.ts',
+      'src/main/session-persistence/ipc.test.ts',
+      'src/main/session-persistence/ipc.ts',
+      'src/main/session-persistence/literature-attachment-removal.ts',
+      'src/main/session-persistence/message-attribution-authority.ts',
+      'src/main/session-persistence/message-search.test.ts',
+      'src/main/session-persistence/message-search.ts',
+      'src/main/session-persistence/operation-scheduler.test.ts',
+      'src/main/session-persistence/operation-scheduler.ts',
+      'src/main/session-persistence/paths.ts',
+      'src/main/session-persistence/pdf-context-link-workflow.test.ts',
+      'src/main/session-persistence/pdf-context-link-workflow.ts',
+      'src/main/session-persistence/pdf-context-owner.test.ts',
+      'src/main/session-persistence/pdf-context-owner.ts',
+      'src/main/session-persistence/projection-diagnostics.test.ts',
+      'src/main/session-persistence/projection-diagnostics.ts',
+      'src/main/session-persistence/projection.test.ts',
+      'src/main/session-persistence/startup-hydration.integration.test.ts',
+      'src/main/session-persistence/recovery-commit.integration.test.ts',
+      'src/main/session-persistence/projection.ts',
+      'src/main/session-persistence/renderer-flush.test.ts',
+      'src/main/session-persistence/renderer-flush.ts',
+      'src/main/session-persistence/renderer-save-options.test.ts',
+      'src/main/session-persistence/renderer-save-options.ts',
+      'src/main/session-persistence/repository-queue.test.ts',
+      'src/main/session-persistence/repository.test.ts',
+      'src/main/session-persistence/repository.ts',
+      'src/main/session-persistence/revision-conflict.test.ts',
+      'src/main/session-persistence/revision-conflict.ts',
+      'src/main/session-persistence/runtime-lookup.test.ts',
+      'src/main/session-persistence/runtime-lookup.ts',
+      'src/main/session-persistence/save-session.test.ts',
+      'src/main/session-persistence/save-session.ts',
+      'src/main/session-persistence/session-data-paths.ts',
+      'src/main/session-persistence/session-update-publication.ts',
+      'src/main/session-persistence/task-admission.ts',
+      'src/main/session-persistence/usage-regressions.test.ts',
+      'src/main/session-persistence/runtime-authority.test.ts',
+      'src/main/session-persistence/runtime-session-owner.test.ts',
+      'src/main/session-persistence/runtime-session-owner.ts',
+      'src/main/session-persistence/runtime-writer.test.ts',
+      'src/main/session-persistence/runtime-writer.ts',
+      'src/main/session-persistence/runtime-resume-recovery.test.ts',
+      'src/main/session-persistence/resumed-artifact-publication.integration.test.ts',
+      'src/main/session-persistence/missing-runtime-session-repro.test.ts',
+      'src/main/session-persistence/prompt-preparation-owner.test.ts',
+      'src/main/session-persistence/prompt-preparation-owner.ts',
+      'src/main/session-persistence/prompt-preparation-restart.test.ts',
+      'src/main/session-persistence/reconciliation-renderer-parity.test.ts',
+      'src/main/session-persistence/runtime-attachment-recovery.test.ts',
+      'src/main/session-persistence/runtime-attachment-recovery.ts',
+      'src/main/session-persistence/session-state-authority.test.ts',
+      'src/main/session-persistence/terminal-commit-recovery.test.ts',
+      'src/main/session-persistence/terminal-commit-scheduler.test.ts',
+      'src/main/session-persistence/terminal-live-projection.test.ts',
+      'src/main/session-persistence/turn-outcome-authority.ts',
+      'src/main/session-persistence/turn-outcome-reconciliation.test.ts',
+      'src/main/session-persistence/record-facts.ts',
+      'src/main/session-persistence/attention-projection.test.ts',
+      'src/main/session-persistence/turn-outcome-authority.test.ts',
+      'src/main/session-persistence/flush-protocol.ts',
+      'src/main/session-persistence/conversation-pdf-electron.ts',
+      'src/main/session-persistence/deferred-recovery.ts'
+    ])
+    expect(sessionPersistence.interfacePaths).toEqual([
+      'src/main/session-persistence/coordinator.ts',
+      'src/main/session-persistence/application-command-errors.ts',
+      'src/main/session-persistence/auxiliary-turn-usage.ts',
+      'src/main/session-persistence/catalog-authority.ts',
+      'src/main/session-persistence/claude-replay.ts',
+      'src/main/session-persistence/compute-policy.ts',
+      'src/main/session-persistence/conversation-export.ts',
+      'src/main/session-persistence/deletion-owner.ts',
+      'src/main/session-persistence/imported-session.ts',
+      'src/main/session-persistence/ipc.ts',
+      'src/main/session-persistence/message-attribution-authority.ts',
+      'src/main/session-persistence/message-search.ts',
+      'src/main/session-persistence/paths.ts',
+      'src/main/session-persistence/pdf-context-link-workflow.ts',
+      'src/main/session-persistence/pdf-context-owner.ts',
+      'src/main/session-persistence/projection-diagnostics.ts',
+      'src/main/session-persistence/projection.ts',
+      'src/main/session-persistence/renderer-flush.ts',
+      'src/main/session-persistence/repository.ts',
+      'src/main/session-persistence/runtime-lookup.ts',
+      'src/main/session-persistence/session-data-paths.ts',
+      'src/main/session-persistence/state-owner.ts',
+      'src/main/session-persistence/task-admission.ts',
+      'src/main/session-persistence/runtime-session-owner.ts',
+      'src/main/session-persistence/runtime-writer.ts',
+      'src/main/session-persistence/flush-protocol.ts',
+      'src/main/session-persistence/conversation-pdf-electron.ts',
+      'src/main/session-persistence/deferred-recovery.ts'
+    ])
+    expect(sessionPersistence.consumerModules).toEqual(['project_lifecycle'])
+    expect(sessionPersistence.testFiles.owner).toEqual([
+      'src/main/session-persistence/coordinator.architecture.test.ts',
+      'src/main/session-persistence/coordinator.test.ts',
+      'src/main/session-persistence/delegated-work-records.test.ts',
+      'src/main/session-persistence/artifact-alias-repair.test.ts',
+      'src/main/session-persistence/auxiliary-turn-usage.test.ts',
+      'src/main/session-persistence/claude-replay.test.ts',
+      'src/main/session-persistence/compute-policy.test.ts',
+      'src/main/session-persistence/conversation-export.test.ts',
+      'src/main/session-persistence/data-path-roundtrip.test.ts',
+      'src/main/session-persistence/imported-session.test.ts',
+      'src/main/session-persistence/message-search.test.ts',
+      'src/main/session-persistence/operation-scheduler.test.ts',
+      'src/main/session-persistence/pdf-context-link-workflow.test.ts',
+      'src/main/session-persistence/pdf-context-owner.test.ts',
+      'src/main/session-persistence/projection-diagnostics.test.ts',
+      'src/main/session-persistence/projection.test.ts',
+      'src/main/session-persistence/startup-hydration.integration.test.ts',
+      'src/main/session-persistence/recovery-commit.integration.test.ts',
+      'src/main/session-persistence/renderer-flush.test.ts',
+      'src/main/session-persistence/renderer-save-options.test.ts',
+      'src/main/session-persistence/repository-queue.test.ts',
+      'src/main/session-persistence/repository.test.ts',
+      'src/main/session-persistence/revision-conflict.test.ts',
+      'src/main/session-persistence/runtime-lookup.test.ts',
+      'src/main/session-persistence/save-session.test.ts',
+      'src/main/session-persistence/usage-regressions.test.ts',
+      'src/main/session-persistence/runtime-authority.test.ts',
+      'src/main/session-persistence/runtime-session-owner.test.ts',
+      'src/main/session-persistence/runtime-writer.test.ts',
+      'src/main/session-persistence/runtime-resume-recovery.test.ts',
+      'src/main/session-persistence/resumed-artifact-publication.integration.test.ts',
+      'src/main/session-persistence/missing-runtime-session-repro.test.ts',
+      'src/main/session-persistence/prompt-preparation-owner.test.ts',
+      'src/main/session-persistence/prompt-preparation-restart.test.ts',
+      'src/main/session-persistence/reconciliation-renderer-parity.test.ts',
+      'src/main/session-persistence/runtime-attachment-recovery.test.ts',
+      'src/main/session-persistence/session-state-authority.test.ts',
+      'src/main/session-persistence/terminal-commit-recovery.test.ts',
+      'src/main/session-persistence/terminal-commit-scheduler.test.ts',
+      'src/main/session-persistence/terminal-live-projection.test.ts',
+      'src/main/session-persistence/turn-outcome-reconciliation.test.ts',
+      'src/main/session-persistence/attention-projection.test.ts',
+      'src/main/session-persistence/turn-outcome-authority.test.ts'
+    ])
+    expect(sessionPersistence.testFiles.contract).toEqual([
+      'src/shared/session-persistence.test.ts',
+      'src/main/session-persistence/coordinator-contract.test.ts',
+      'src/main/session-persistence/ipc.test.ts',
+      'src/preload/index.test.ts',
+      'src/renderer/web/api-installer.test.ts',
+      'src/shared/renderer-contract-catalog.test.ts',
+      'src/main/host-layer-dependencies.architecture.test.ts'
+    ])
+    // Integrity validates every retirement against source evidence. Keep this owner guard
+    // focused on its injected lifecycle and delegated-work consumer contracts.
+    expect(sessionPersistence.testFiles.consumer).toEqual(
+      expect.arrayContaining([
+        'src/main/composition/project-lifecycle.test.ts',
+        'src/main/delegation/session-record-adapter.test.ts',
+        'src/main/acp/prompt-preparation-owner.test.ts'
+      ])
+    )
+    expect(sessionPersistence.capabilityOverlays).toEqual([
+      'windows_sensitive',
+      'e2e_regressions',
+      'e2e_delegation'
+    ])
+    expect(sessionPersistence.fallbackCapability).toBe('main_runtime')
+  })
+})

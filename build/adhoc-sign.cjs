@@ -1,0 +1,89 @@
+/* eslint-disable @typescript-eslint/no-require-imports */
+
+// electron-builder afterPack hook: sign loose resources before the outer application.
+//
+// Without an Apple "Developer ID Application" certificate, electron-builder skips code
+// signing entirely. That leaves the bundle with only Electron's linker-level ad-hoc
+// signature on the main binary and no sealed resources (`_CodeSignature`), so
+// `codesign --verify` reports "code has no resources but signature indicates they must
+// be present". On any *downloaded* (quarantined) copy, Gatekeeper reads that broken
+// signature and refuses to launch the app with the un-bypassable "… is damaged and
+// can't be opened" error — hence "installs but no window appears".
+//
+// A deep ad-hoc sign (`codesign --sign -`) produces a valid, self-consistent signature.
+// The app still has no Developer ID, so a quarantined copy is still blocked by
+// Gatekeeper — but now with the *bypassable* "unidentified developer" prompt, so
+// recipients can right-click → Open (or run `xattr -dr com.apple.quarantine <app>`).
+//
+// This hook runs during the pack phase, before electron-builder's own (skipped) signing
+// step, so the ad-hoc signature survives into the DMG/zip. If a real signing identity is
+// ever configured, electron-builder's signing step overrides this ad-hoc signature.
+const { execFileSync } = require('node:child_process')
+const fs = require('node:fs')
+const path = require('node:path')
+const verifyPackagedNativeComponents = require('./verify-native-components.cjs')
+
+/** @param {import('electron-builder').AfterPackContext} context */
+exports.default = async function adhocSign(context) {
+  const arch = require('builder-util').Arch[context.arch]
+  if (context.electronPlatformName !== 'darwin') {
+    await verifyPackagedNativeComponents(
+      path.join(context.appOutDir, 'resources'),
+      `${context.electronPlatformName}-${arch}`
+    )
+    return
+  }
+
+  let appPath = path.join(context.appOutDir, `${context.packager.appInfo.productFilename}.app`)
+  if (!fs.existsSync(appPath)) {
+    const found = fs.readdirSync(context.appOutDir).find((entry) => entry.endsWith('.app'))
+    if (!found) throw new Error(`[adhoc-sign] no .app bundle found in ${context.appOutDir}`)
+    appPath = path.join(context.appOutDir, found)
+  }
+
+  const preserved = await verifyPackagedNativeComponents(
+    path.join(appPath, 'Contents/Resources'),
+    `darwin-${arch}`
+  )
+
+  const entitlements = path.join(__dirname, 'entitlements.mac.plist')
+
+  const macho = new Set(['feedface', 'feedfacf', 'cefaedfe', 'cffaedfe', 'cafebabe', 'bebafeca'])
+  // eslint-disable-next-line @typescript-eslint/explicit-function-return-type
+  const signLoose = (directory) => {
+    if (!fs.existsSync(directory)) return
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+      const file = path.join(directory, entry.name)
+      if (entry.isDirectory()) {
+        signLoose(file)
+        continue
+      }
+      if (!entry.isFile() || preserved.has(file)) continue
+      const fd = fs.openSync(file, 'r')
+      const magic = Buffer.alloc(4)
+      try {
+        fs.readSync(fd, magic, 0, 4, 0)
+      } finally {
+        fs.closeSync(fd)
+      }
+      if (macho.has(magic.toString('hex')))
+        execFileSync(
+          'codesign',
+          ['--force', '--options', 'runtime', '--sign', '-', '--entitlements', entitlements, file],
+          { stdio: 'inherit' }
+        )
+    }
+  }
+  signLoose(path.join(appPath, 'Contents/Resources/node-runtime'))
+  // Includes backend/resources/micromamba: --deep does not sign loose resource executables.
+  signLoose(path.join(appPath, 'Contents/Resources/backend'))
+
+  // --deep signs nested frameworks, helpers and the bundled native `claude` binary.
+  execFileSync(
+    'codesign',
+    ['--force', '--deep', '--sign', '-', '--entitlements', entitlements, appPath],
+    { stdio: 'inherit' }
+  )
+
+  console.log(`[adhoc-sign] deep ad-hoc signed ${path.basename(appPath)}`)
+}

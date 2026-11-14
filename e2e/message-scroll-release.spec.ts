@@ -1,0 +1,85 @@
+import { expect } from '@playwright/test'
+import { writeFile } from 'node:fs/promises'
+import { join } from 'node:path'
+
+import { test } from './fixtures/electron-app'
+import { createProjectViaUi } from './fixtures/project'
+
+const PROJECT_NAME = 'Scroll release project'
+const USER_MESSAGE = 'Summarize the deterministic fixture.'
+const LONG_STREAM_PROMPT = 'Stream the long scroll journey.'
+const AGENT_REPLY = 'Deterministic reply: Summarize the deterministic fixture.'
+
+test('releases follow-output when the reader scrolls up mid-stream', async ({ app }) => {
+  let page = await app.completeOnboarding()
+  page = await app.configureFakeAgent()
+
+  await createProjectViaUi(page, PROJECT_NAME)
+  await expect(page.getByRole('heading', { name: 'New conversation' })).toBeVisible()
+
+  const conversation = page.getByRole('region', { name: 'Conversation' })
+  const textbox = page.getByRole('textbox', { name: 'Ask anything' })
+  const sendButton = page.getByRole('button', { name: 'Send message' })
+
+  for (let turn = 0; turn < 6; turn += 1) {
+    await textbox.fill(`Turn ${turn}: ${USER_MESSAGE}`)
+    await expect(sendButton).toBeEnabled()
+    await sendButton.click()
+    await expect(conversation.getByText(AGENT_REPLY, { exact: true })).toHaveCount(turn + 1)
+  }
+
+  const releaseFile = join(await app.createTestDirectory('scroll-stream'), 'release')
+  await textbox.fill(`${LONG_STREAM_PROMPT} Release file: ${JSON.stringify(releaseFile)}`)
+  await expect(sendButton).toBeEnabled()
+  await sendButton.click()
+
+  const readScrollTop = (): Promise<number> =>
+    page.evaluate(
+      () => document.querySelector('[data-slot="message-scroller-viewport"]')?.scrollTop ?? -1
+    )
+
+  // Historical turns can already exceed 1100px before this reply starts.
+  // Wait for the current reply's presented text before scrolling.
+  const paragraphs = conversation.getByText(/^Segment \d+ paragraph \d+\./)
+  await expect(
+    conversation.getByText('Segment 1 paragraph 11. The quick brown fox jumps over the lazy dog.', {
+      exact: true
+    })
+  ).toBeVisible()
+
+  // Reader scrolls up inside the transcript viewport.
+  const viewportBox = await conversation.boundingBox()
+  await page.mouse.move(
+    viewportBox!.x + viewportBox!.width / 2,
+    viewportBox!.y + viewportBox!.height / 2
+  )
+  await page.mouse.wheel(0, -600)
+  await page.mouse.wheel(0, -600)
+  // macOS can continue dispatching wheel momentum after Playwright returns. Establish the
+  // reader's position only after that input has settled, otherwise the remaining native scroll
+  // is mistaken for the app re-following the streaming output.
+  await expect
+    .poll(
+      async () => {
+        const before = await readScrollTop()
+        await page.waitForTimeout(120)
+        return Math.abs((await readScrollTop()) - before)
+      },
+      { timeout: 5_000 }
+    )
+    .toBeLessThan(2)
+  const afterWheel = await readScrollTop()
+  const textAfterWheel = await paragraphs.allTextContents()
+
+  // While the reply keeps streaming, the reader's position must hold (no re-follow).
+  await writeFile(releaseFile, '')
+  await expect.poll(() => paragraphs.allTextContents()).not.toEqual(textAfterWheel)
+  await expect(
+    conversation.getByText('Segment 3 paragraph 7. The quick brown fox jumps over the lazy dog.', {
+      exact: true
+    })
+  ).toBeVisible()
+  const later = await readScrollTop()
+  expect(later - afterWheel).toBeLessThan(120)
+  expect(await paragraphs.allTextContents()).not.toEqual(textAfterWheel)
+})

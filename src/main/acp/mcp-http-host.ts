@@ -1,0 +1,587 @@
+import {
+  HarnessToolReceipts,
+  HARNESS_RECEIPTS,
+  HARNESS_INVOCATION,
+  HARNESS_RECEIPT_METHOD,
+  receiptQuerySchema
+} from '../harness-acp/tool-receipts'
+import { randomUUID } from 'node:crypto'
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
+import type { McpServer } from '@agentclientprotocol/sdk'
+import {
+  createSkillRuntimeMcpServer,
+  environmentFromProcess,
+  isOwnedSkillRuntimeAcpServer,
+  type SkillRuntimeEnvironment
+} from '../skills/runtime-mcp-server'
+
+import type { McpServer as ModelContextProtocolServer } from '@modelcontextprotocol/sdk/server/mcp.js'
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
+import { CancelledNotificationSchema, isJSONRPCRequest } from '@modelcontextprotocol/sdk/types.js'
+
+import { createArtifactMcpServer, type ArtifactMcpEnvironment } from '../artifacts/mcp-server'
+import { ArtifactRepository } from '../artifacts/repository'
+import { createNotebookMcpServer, type NotebookMcpEnvironment } from '../notebook/mcp-server'
+import {
+  createLiteratureLibraryMcpServer,
+  type LiteratureLibraryMcpHandler
+} from '../literature/library-mcp-server'
+import { createLiteratureMcpServer, type LiteratureMcpHandler } from '../literature/mcp-server'
+import {
+  callGitHubSkillImportRpc,
+  callSkillImportRpc,
+  createSkillImportMcpServer,
+  type SkillImportMcpEnvironment
+} from '../skills/mcp-server'
+import {
+  createPlanMcpServerForEnvironment,
+  type PlanMcpEnvironment
+} from '../session-plan/plan-mcp-server'
+import {
+  createHostMessageMcpServer,
+  type HostMessageMcpHandler
+} from '../side-chat/host-message-mcp-server'
+import { createLogger } from '@aipoch/diagnostics/node'
+import {
+  LOCAL_RESOURCE_BUDGETS,
+  ResourceBudgetExceededError,
+  readBoundedJsonBody
+} from '../resource-budget'
+
+const log = createLogger('mcp-http-host')
+
+type HostConnection = {
+  endpoint: string
+  token: string
+}
+
+// The MCP server kinds this host serves; each maps to a factory + a per-session environment.
+const SERVER_KINDS = [
+  'artifact',
+  'notebook',
+  'skill-import',
+  'skills',
+  'plan',
+  'host-message',
+  'library',
+  'literature'
+] as const
+type ServerKind = (typeof SERVER_KINDS)[number]
+
+const isServerKind = (value: string): value is ServerKind =>
+  (SERVER_KINDS as readonly string[]).includes(value)
+
+// The per-session environment registered for each kind, used to build a fresh MCP server per request.
+type SessionEntry = {
+  receiptScopes?: Partial<Record<ServerKind, string>>
+  skills?: SkillRuntimeEnvironment
+  artifact?: ArtifactMcpEnvironment
+  notebook?: NotebookMcpEnvironment
+  skillImport?: SkillImportMcpEnvironment
+  plan?: PlanMcpEnvironment
+  planRouteToken?: string
+  hostMessage?: HostMessageMcpHandler
+  library?: { handler: LiteratureLibraryMcpHandler; token: symbol }
+  literature?: { handler: LiteratureMcpHandler; token: symbol }
+}
+
+const RECEIPT_AUTHORITY_KEYS = {
+  artifact: 'artifact',
+  notebook: 'notebook',
+  'skill-import': 'skillImport',
+  skills: 'skills',
+  plan: 'planRouteToken',
+  'host-message': 'hostMessage',
+  library: 'library',
+  literature: 'literature'
+} as const
+const receiptAuthority = (entry: SessionEntry | undefined, kind: ServerKind): unknown =>
+  entry?.[RECEIPT_AUTHORITY_KEYS[kind]]
+
+const writeJson = (response: ServerResponse, statusCode: number, payload: unknown): void => {
+  response.writeHead(statusCode, { 'content-type': 'application/json' })
+  response.end(`${JSON.stringify(payload)}\n`)
+}
+
+// Hosts the app's session-scoped MCP servers over a local, token-authenticated HTTP endpoint, for
+// agent frameworks that only accept http/sse MCP. The runtime registers
+// each session's per-kind environment and passes the agent an http McpServer config pointing here;
+// requests are routed by `/mcp/<kind>/<sessionId>`. Stateless: a fresh MCP server + transport is built
+// per request from the registered environment, mirroring the one-server-per-spawn stdio model.
+class AgentMcpHttpHost {
+  private readonly receipts?: HarnessToolReceipts
+  private readonly token: string
+  private readonly host: string
+  private readonly requestBytes: number
+  private server: Server | undefined
+  private startPromise: Promise<HostConnection> | undefined
+  private endpoint: string | undefined
+  private readonly sessions = new Map<string, SessionEntry>()
+  // HTTP POSTs are stateless, but cancellation must reach the still-running Library or linked-PDF POST.
+  // Entries live only until that response closes; request IDs are scoped to the bound route.
+  private readonly toolRequests = new Map<
+    string,
+    {
+      routingId: string
+      kind: ServerKind
+      receive: NonNullable<StreamableHTTPServerTransport['onmessage']>
+      response: ServerResponse
+    }
+  >()
+
+  // Keep cancellations only for POSTs already arriving; never retain unknown IDs for future calls.
+  private readonly readingToolRequests = new Map<
+    ServerResponse,
+    {
+      routingId: string
+      kind: ServerKind
+      cancelledIds: Set<string>
+      cancellationBytes: number
+    }
+  >()
+
+  constructor(
+    options: {
+      token?: string
+      host?: string
+      requestBytes?: number
+      receiptDirectory?: string
+    } = {}
+  ) {
+    if (options.receiptDirectory) this.receipts = new HarnessToolReceipts(options.receiptDirectory)
+    this.token = options.token ?? randomUUID()
+    this.host = options.host ?? '127.0.0.1'
+    this.requestBytes = options.requestBytes ?? LOCAL_RESOURCE_BUDGETS.requestBytes
+  }
+
+  // Starts the HTTP server once on an ephemeral port and returns its connection details.
+  async ensureStarted(): Promise<HostConnection> {
+    if (this.startPromise) {
+      return this.startPromise
+    }
+
+    const server = createServer((request, response) => {
+      void this.handleRequest(request, response).catch(() => {
+        if (response.headersSent) response.destroy()
+        else writeJson(response, 500, { error: 'MCP request failed.' })
+      })
+    })
+    this.server = server
+    this.startPromise = new Promise((resolve, reject) => {
+      server.once('error', reject)
+      server.listen(0, this.host, () => {
+        const address = server.address()
+
+        if (typeof address !== 'object' || address === null) {
+          reject(new Error('MCP HTTP host did not return a TCP address.'))
+          return
+        }
+
+        this.endpoint = `http://${address.address}:${address.port}`
+        resolve({ endpoint: this.endpoint, token: this.token })
+      })
+    })
+
+    return this.startPromise
+  }
+
+  async close(): Promise<void> {
+    const server = this.server
+
+    this.server = undefined
+    this.startPromise = undefined
+    this.endpoint = undefined
+    this.clear()
+
+    if (!server) return
+
+    const closing = new Promise<void>((resolve, reject) => {
+      server.close((error) => (error ? reject(error) : resolve()))
+    })
+    server.closeAllConnections()
+    await closing
+  }
+
+  // Registers (or replaces) the artifact environment for one routing id; re-registration on resume
+  // simply overwrites, mirroring the stdio path which respawns with fresh env each connect.
+  registerArtifact(routingId: string, environment: ArtifactMcpEnvironment): void {
+    const entry = this.sessions.get(routingId) ?? {}
+    entry.artifact = environment
+    this.sessions.set(routingId, entry)
+  }
+
+  registerNotebook(routingId: string, environment: NotebookMcpEnvironment): void {
+    const entry = this.sessions.get(routingId) ?? {}
+    entry.notebook = environment
+    this.sessions.set(routingId, entry)
+  }
+
+  registerSkillImport(routingId: string, environment: SkillImportMcpEnvironment): void {
+    const entry = this.sessions.get(routingId) ?? {}
+    entry.skillImport = environment
+    this.sessions.set(routingId, entry)
+  }
+
+  registerReceiptScope(routingId: string, scope: string, kind: ServerKind = 'notebook'): void {
+    // Optional services may be installed after Session commit; a scope alone exposes no endpoint.
+    const entry = this.sessions.get(routingId) ?? {}
+    entry.receiptScopes = { ...entry.receiptScopes, [kind]: scope }
+    this.sessions.set(routingId, entry)
+  }
+
+  registerSkillRuntime(server: McpServer): {
+    server: McpServer
+    routingId: string
+    release(): void
+  } {
+    if (!isOwnedSkillRuntimeAcpServer(server) || !('env' in server))
+      throw new Error('Only host-owned Skill loaders may use the HTTP facade')
+    const environment = environmentFromProcess(
+      Object.fromEntries(server.env.map(({ name, value }) => [name, value]))
+    )
+    // Unique per provision: rollback or a stale generation cannot revoke its successor.
+    const routingId = randomUUID()
+    const url = this.urlFor('skills', routingId)
+    this.sessions.set(routingId, { skills: environment })
+    return {
+      routingId,
+      server: {
+        type: 'http',
+        name: server.name,
+        url,
+        headers: [{ name: 'authorization', value: `Bearer ${this.token}` }]
+      },
+      release: () => this.unregister(routingId)
+    }
+  }
+
+  registerPlan(routingId: string, environment: PlanMcpEnvironment): () => (() => void) | undefined {
+    const entry = this.sessions.get(routingId) ?? {}
+    const previousPlan = entry.plan
+    const previousRouteToken = entry.planRouteToken
+    const routeToken = randomUUID()
+    entry.plan = environment
+    entry.planRouteToken = routeToken
+    this.sessions.set(routingId, entry)
+    return () => {
+      if (this.sessions.get(routingId)?.planRouteToken !== routeToken) return undefined
+      return () => {
+        if (!previousPlan || !previousRouteToken) return
+        const restored = this.sessions.get(routingId) ?? {}
+        restored.plan = previousPlan
+        restored.planRouteToken = previousRouteToken
+        this.sessions.set(routingId, restored)
+      }
+    }
+  }
+
+  registerHostMessage(routingId: string, handler: HostMessageMcpHandler): void {
+    const entry = this.sessions.get(routingId) ?? {}
+    entry.hostMessage = handler
+    this.sessions.set(routingId, entry)
+  }
+
+  registerLiterature(routingId: string, handler: LiteratureMcpHandler): () => void {
+    this.cancelLiteratureRoute('literature', routingId)
+    const entry = this.sessions.get(routingId) ?? {}
+    const token = Symbol('literature')
+    entry.literature = { handler, token }
+    this.sessions.set(routingId, entry)
+    return () => {
+      const current = this.sessions.get(routingId)
+      if (current?.literature?.token !== token) return
+      delete current.literature
+      this.cancelLiteratureRoute('literature', routingId)
+    }
+  }
+
+  registerLiteratureLibrary(routingId: string, handler: LiteratureLibraryMcpHandler): () => void {
+    this.cancelLiteratureRoute('library', routingId)
+    const entry = this.sessions.get(routingId) ?? {}
+    const token = Symbol('library')
+    entry.library = { handler, token }
+    this.sessions.set(routingId, entry)
+    return () => {
+      const current = this.sessions.get(routingId)
+      if (current?.library?.token !== token) return
+      delete current.library
+      this.cancelLiteratureRoute('library', routingId)
+    }
+  }
+
+  private cancelLiteratureRoute(kind: 'literature' | 'library', routingId: string): void {
+    for (const [response, pending] of this.readingToolRequests) {
+      if (pending.routingId !== routingId || pending.kind !== kind) continue
+      this.readingToolRequests.delete(response)
+      response.destroy()
+    }
+    for (const [key, active] of this.toolRequests) {
+      if (active.routingId !== routingId || active.kind !== kind) continue
+      this.toolRequests.delete(key)
+      active.response.destroy()
+    }
+  }
+
+  // Drops a routing id's registered environments once its session is gone.
+  unregister(routingId: string): void {
+    this.sessions.delete(routingId)
+    for (const [response, pending] of this.readingToolRequests) {
+      if (pending.routingId !== routingId) continue
+      this.readingToolRequests.delete(response)
+      response.destroy()
+    }
+    for (const [key, active] of this.toolRequests) {
+      if (active.routingId !== routingId) continue
+      this.toolRequests.delete(key)
+      active.response.destroy()
+    }
+  }
+
+  // Drops every registered environment (e.g. on runtime disconnect); the server keeps running for reuse.
+  clear(): void {
+    this.sessions.clear()
+    for (const response of this.readingToolRequests.keys()) response.destroy()
+    this.readingToolRequests.clear()
+    for (const active of this.toolRequests.values()) active.response.destroy()
+    this.toolRequests.clear()
+  }
+
+  // Builds the per-session MCP endpoint URL the agent connects to for one kind.
+  urlFor(kind: ServerKind, routingId: string): string {
+    if (!this.endpoint) {
+      throw new Error('MCP HTTP host is not started.')
+    }
+
+    const route = `${this.endpoint}/mcp/${kind}/${encodeURIComponent(routingId)}`
+    if (kind !== 'plan') return route
+
+    const routeToken = this.sessions.get(routingId)?.planRouteToken
+    if (!routeToken) throw new Error(`No registered plan MCP session: ${routingId}`)
+    // `token` is covered by the shared diagnostic URL redactor if this provider config is logged.
+    return `${route}?token=${encodeURIComponent(routeToken)}`
+  }
+
+  // Constructs a fresh MCP server for one request from the registered environment, or undefined when
+  // the routing id / kind was never registered.
+  private async buildServer(
+    kind: ServerKind,
+    routingId: string,
+    routeToken?: string
+  ): Promise<ModelContextProtocolServer | undefined> {
+    const entry = this.sessions.get(routingId)
+
+    if (!entry) return undefined
+    if (kind === 'skills')
+      return entry.skills ? createSkillRuntimeMcpServer(entry.skills) : undefined
+
+    if (kind === 'artifact') {
+      if (!entry.artifact) return undefined
+
+      return createArtifactMcpServer(
+        new ArtifactRepository(entry.artifact.storageRoot),
+        entry.artifact
+      )
+    }
+
+    if (kind === 'notebook') {
+      if (!entry.notebook) return undefined
+
+      return createNotebookMcpServer(entry.notebook)
+    }
+
+    if (kind === 'plan') {
+      if (!entry.plan || !routeToken || routeToken !== entry.planRouteToken) return undefined
+      return createPlanMcpServerForEnvironment(entry.plan)
+    }
+
+    if (kind === 'host-message') {
+      return entry.hostMessage ? createHostMessageMcpServer(entry.hostMessage) : undefined
+    }
+
+    if (kind === 'literature') {
+      return entry.literature ? createLiteratureMcpServer(entry.literature.handler) : undefined
+    }
+
+    if (kind === 'library') {
+      return entry.library ? createLiteratureLibraryMcpServer(entry.library.handler) : undefined
+    }
+
+    const skillImportEnvironment = entry.skillImport
+    if (!skillImportEnvironment) return undefined
+
+    return createSkillImportMcpServer({
+      requestImport: (attachmentUri, turnToken) =>
+        callSkillImportRpc(skillImportEnvironment, attachmentUri, turnToken),
+      requestGitHubImport: (githubUrl) =>
+        callGitHubSkillImportRpc(skillImportEnvironment, githubUrl)
+    })
+  }
+
+  // Authenticates, routes by path, and serves one MCP request from a fresh stateless server+transport.
+  private async handleRequest(request: IncomingMessage, response: ServerResponse): Promise<void> {
+    if (request.headers.authorization !== `Bearer ${this.token}`) {
+      writeJson(response, 401, { error: 'Invalid MCP host token.' })
+      return
+    }
+
+    const url = new URL(request.url ?? '', this.endpoint ?? 'http://127.0.0.1')
+    const match = /^\/mcp\/([^/]+)\/(.+)$/.exec(url.pathname)
+
+    if (!match || !isServerKind(match[1])) {
+      writeJson(response, 404, { error: 'Unknown MCP endpoint.' })
+      return
+    }
+
+    const kind = match[1]
+    const routingId = decodeURIComponent(match[2])
+    const registered = this.sessions.get(routingId)
+    const authority = receiptAuthority(registered, kind)
+    const server = await this.buildServer(
+      kind,
+      routingId,
+      url.searchParams.get('token') ?? undefined
+    )
+
+    if (this.sessions.get(routingId) !== registered) {
+      await server?.close()
+      writeJson(response, 404, { error: 'MCP session was revoked during preparation.' })
+      return
+    }
+
+    if (!server) {
+      writeJson(response, 404, { error: `No registered ${kind} MCP session: ${routingId}` })
+      return
+    }
+
+    if (this.receipts) {
+      server.server.registerCapabilities({ experimental: { [HARNESS_RECEIPTS]: {} } })
+    }
+    // Long-running Notebook/Plan calls need SSE to deliver progress while execution/review waits.
+    // Transport sessions remain stateless and are torn down when the response closes.
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: undefined,
+      enableJsonResponse: kind !== 'notebook' && kind !== 'plan'
+    })
+    response.on('close', () => {
+      void transport.close()
+      void server.close()
+    })
+
+    const reading = { routingId, kind, cancelledIds: new Set<string>(), cancellationBytes: 0 }
+    if ((kind === 'library' || kind === 'literature') && request.method === 'POST') {
+      this.readingToolRequests.set(response, reading)
+      response.once('close', () => this.readingToolRequests.delete(response))
+    }
+    try {
+      await server.connect(transport)
+      if (kind === 'library' || kind === 'literature') {
+        const receive = transport.onmessage!
+        transport.onmessage = (message, extra) => {
+          this.readingToolRequests.delete(response)
+          if (isJSONRPCRequest(message) && message.method === 'tools/call') {
+            if (reading.cancelledIds.has(JSON.stringify(message.id))) {
+              response.end()
+              return
+            }
+            const key = JSON.stringify([kind, routingId, message.id])
+            if (this.toolRequests.has(key)) {
+              writeJson(response, 409, { error: 'Duplicate active Literature request id.' })
+              return
+            }
+            const active = { routingId, kind, receive, response }
+            this.toolRequests.set(key, active)
+            response.once('close', () => {
+              if (this.toolRequests.get(key) === active) this.toolRequests.delete(key)
+            })
+          } else {
+            const cancellation = CancelledNotificationSchema.safeParse(message)
+            if (cancellation.success) {
+              const id = JSON.stringify(cancellation.data.params.requestId)
+              for (const [pendingResponse, pending] of this.readingToolRequests) {
+                if (
+                  pending.kind !== kind ||
+                  pending.routingId !== routingId ||
+                  pending.cancelledIds.has(id)
+                )
+                  continue
+                pending.cancellationBytes += Buffer.byteLength(id)
+                if (pending.cancellationBytes > this.requestBytes) {
+                  // Bound cancellation buffering by the same budget as the incoming body.
+                  this.readingToolRequests.delete(pendingResponse)
+                  pendingResponse.destroy()
+                } else pending.cancelledIds.add(id)
+              }
+              const key = JSON.stringify([kind, routingId, cancellation.data.params.requestId])
+              const active = this.toolRequests.get(key)
+              if (active) {
+                active.receive(message, extra)
+                // Cancelled MCP handlers intentionally send no result. End the original POST
+                // as well so its transport, server, and route entry can be released.
+                active.response.end()
+              }
+            }
+          }
+          receive(message, extra)
+        }
+      }
+      const body =
+        request.method === 'POST'
+          ? await readBoundedJsonBody<unknown>(request, this.requestBytes, {
+              emptyValue: undefined
+            })
+          : undefined
+      if (response.destroyed) return
+      if (this.receipts && isJSONRPCRequest(body)) {
+        const scope = registered?.receiptScopes?.[kind]
+        const current = (): boolean =>
+          this.sessions.get(routingId) === registered &&
+          receiptAuthority(registered, kind) === authority &&
+          registered?.receiptScopes?.[kind] === scope
+        if (body.method === HARNESS_RECEIPT_METHOD) {
+          if (!scope) throw new Error('Tool receipt scope is unavailable')
+          const result = await this.receipts.read(scope, receiptQuerySchema.parse(body.params))
+          if (!current()) throw new Error('Tool receipt scope was revoked')
+          writeJson(response, 200, { jsonrpc: '2.0', id: body.id, result })
+          return
+        }
+        const invocationId =
+          body.params?._meta && (body.params._meta as Record<string, unknown>)[HARNESS_INVOCATION]
+        if (body.method === 'tools/call' && invocationId !== undefined) {
+          if (!scope) throw new Error('Tool receipt scope is unavailable')
+          const query = receiptQuerySchema.parse({
+            invocationId,
+            name: body.params?.name,
+            arguments: body.params?.arguments ?? {}
+          })
+          await this.receipts.begin(scope, query)
+          if (!current()) throw new Error('Tool receipt scope was revoked')
+          const send = transport.send.bind(transport)
+          transport.send = async (message, options) => {
+            if ('id' in message && message.id === body.id && 'result' in message) {
+              await this.receipts!.complete(scope, query, message.result)
+            }
+            await send(message, options)
+          }
+        }
+      }
+      await transport.handleRequest(request, response, body)
+    } catch (error) {
+      this.readingToolRequests.delete(response)
+      log.error('MCP host request failed', { kind, error })
+
+      if (!response.headersSent) {
+        if (error instanceof ResourceBudgetExceededError) {
+          response.shouldKeepAlive = false
+          response.setHeader('connection', 'close')
+          response.once('finish', () => request.destroy())
+        }
+        writeJson(response, error instanceof ResourceBudgetExceededError ? 413 : 500, {
+          error: error instanceof Error ? error.message : String(error)
+        })
+      }
+    }
+  }
+}
+
+export { AgentMcpHttpHost }
+export type { HostConnection, ServerKind }

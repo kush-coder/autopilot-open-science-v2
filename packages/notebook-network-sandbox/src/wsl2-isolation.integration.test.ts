@@ -1,0 +1,522 @@
+import { execFileSync, spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
+import { access, mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+
+import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+
+import {
+  reconcileWsl2ExecutionReceipts,
+  wsl2Launch,
+  type Wsl2Launch
+} from '../runtime/src/platform/wsl2-isolation.js'
+import { cacheEnvironmentFixture } from '../test/cache-environment.js'
+import { CommandGateway } from '../runtime/src/gateway/command-gateway.js'
+
+const distro = process.env.OPEN_SCIENCE_WSL_DISTRO
+const user = process.env.OPEN_SCIENCE_WSL_USER
+const enabled = process.platform === 'win32' && Boolean(distro && user)
+
+it
+  .runIf(process.platform === 'linux' && process.env.VITEST_PORTABLE_CI !== '1')
+  .each([true, false])(
+  'enforces existing and missing write-denied roots in the real WSL guest launch (restricted=%s)',
+  async (restrictFolders) => {
+    const root = await mkdtemp(join(tmpdir(), 'wsl-guest-denials-'))
+    const workspace = join(root, 'workspace')
+    const existing = join(workspace, 'existing file')
+    const missing = join(workspace, 'missing folder')
+    const bridgeSocket = join(root, 'gateway.sock')
+    await mkdir(workspace)
+    await writeFile(existing, 'original')
+    // No network request is made: only the production guest launcher and filesystem mounts run.
+    await writeFile(bridgeSocket, '')
+    const launch = await wsl2Launch({
+      target: { kind: 'wsl2', profileId: 'guest-denials', distro: 'fixture', user: 'fixture' },
+      cwd: workspace,
+      command: [
+        'set -eu',
+        'test "$(cat "existing file")" = original',
+        'if { printf changed > "existing file"; } 2>/dev/null; then exit 41; fi',
+        'if touch "missing folder/changed" 2>/dev/null; then exit 42; fi',
+        'printf allowed > output.txt',
+        'printf verified'
+      ].join('\n'),
+      env: {},
+      filesystem: {
+        restrictFolders,
+        readOnlyRoots: [],
+        readWriteRoots: [workspace],
+        deniedReadRoots: [],
+        deniedWriteRoots: [existing, missing]
+      },
+      mapPath: async (path) => path,
+      reconcileGuest: async () => true,
+      gatewayPort: 4312,
+      gatewayCredentials: { username: 'fixture', password: 'fixture' },
+      openBridge: async () => ({
+        socketPath: bridgeSocket,
+        close: async () => ({ networkClosed: true, temporaryResourcesRemoved: true })
+      })
+    })
+    try {
+      // Only wsl.exe dispatch is omitted; run its exact guest command with real bubblewrap.
+      const result = await execute(
+        launch.argv.slice(launch.argv.indexOf('--exec') + 1),
+        process.env,
+        root
+      )
+      expect(result, result.stderr).toEqual({ exitCode: 0, stdout: 'verified', stderr: '' })
+      expect(await readFile(existing, 'utf8')).toBe('original')
+      expect(await readFile(join(workspace, 'output.txt'), 'utf8')).toBe('allowed')
+    } finally {
+      await launch.release()
+      await rm(launch.argv[launch.argv.indexOf('open-science-wsl-execution') + 1]!, { force: true })
+      await rm(root, { recursive: true, force: true })
+    }
+  },
+  20_000
+)
+
+const execute = async (
+  argv: readonly string[],
+  env: NodeJS.ProcessEnv,
+  cwd: string
+): Promise<{ exitCode: number | null; stdout: string; stderr: string }> =>
+  new Promise<{ exitCode: number | null; stdout: string; stderr: string }>((resolve, reject) => {
+    const child = spawn(argv[0]!, argv.slice(1), { cwd, env, windowsHide: true })
+    let stdout = ''
+    let stderr = ''
+    child.stdout.setEncoding('utf8').on('data', (chunk: string) => (stdout += chunk))
+    child.stderr.setEncoding('utf8').on('data', (chunk: string) => (stderr += chunk))
+    child.once('error', reject)
+    child.once('exit', (exitCode) => resolve({ exitCode, stdout, stderr }))
+  })
+
+const waitForStdout = (
+  child: ChildProcessWithoutNullStreams,
+  expected: string,
+  timeoutMs = 5_000
+): Promise<void> =>
+  new Promise((resolve, reject) => {
+    let stdout = ''
+    const timeout = setTimeout(
+      () => reject(new Error(`Timed out waiting for ${expected}.`)),
+      timeoutMs
+    )
+    const onData = (chunk: Buffer): void => {
+      stdout += chunk.toString('utf8')
+      if (!stdout.includes(expected)) return
+      clearTimeout(timeout)
+      child.stdout.off('data', onData)
+      resolve()
+    }
+    child.stdout.on('data', onData)
+  })
+
+describe.runIf(enabled)('WSL2 sandbox real profile', () => {
+  let root = ''
+  let workspace = ''
+  let handoff = ''
+  let cache = ''
+  let unauthorized = ''
+  let gateway: CommandGateway
+  const gatewayCredentials = { username: 'real-command', password: 'real-command-secret' }
+
+  beforeAll(async () => {
+    root = await mkdtemp(join(tmpdir(), 'open-science-wsl-command-'))
+    workspace = join(root, 'Workspace 路径')
+    handoff = join(root, 'handoff')
+    cache = join(root, 'runtime', 'cache', 'notebook')
+    unauthorized = join(root, 'unauthorized')
+    await Promise.all(
+      [workspace, handoff, cache, unauthorized].map((directory) =>
+        mkdir(directory, { recursive: true })
+      )
+    )
+    await writeFile(join(unauthorized, 'secret.txt'), 'host-secret', 'utf8')
+    gateway = await CommandGateway.open({
+      credentials: gatewayCredentials,
+      decide: async () => ({ allowed: false, message: 'OPEN_SCIENCE_NETWORK_POLICY_BLOCKED' })
+    })
+  })
+
+  afterAll(async () => {
+    await gateway.close()
+    await rm(root, { recursive: true, force: true })
+  })
+
+  const launch = (
+    command: string,
+    readOnlyRoots: string[] = [],
+    protectedRoot?: string
+  ): Promise<Wsl2Launch> =>
+    wsl2Launch({
+      target: {
+        kind: 'wsl2',
+        profileId: 'real-profile',
+        distro: distro!,
+        user: user!
+      },
+      command,
+      cwd: workspace,
+      env: {
+        PATH: process.env.PATH,
+        OPEN_SCIENCE_TEST_SECRET: 'must-not-leak'
+      },
+      gatewayPort: gateway.port,
+      gatewayCredentials,
+      pathEnvironment: {
+        OPEN_SCIENCE_HANDOFF_DIR: handoff,
+        ...cacheEnvironmentFixture(cache)
+      },
+      filesystem: {
+        // Application credential roots sit outside the Notebook's explicit grants.
+        ...(protectedRoot ? {} : { privateRoot: root }),
+        readOnlyRoots,
+        readWriteRoots: [workspace, handoff, cache],
+        deniedReadRoots: [unauthorized, ...(protectedRoot ? [protectedRoot] : [])],
+        deniedWriteRoots: protectedRoot ? [protectedRoot] : []
+      }
+    })
+
+  it.each(['missing', 'existing'])(
+    'keeps a %s protected root hidden and unwritable without requiring a source bind',
+    async (state) => {
+      const protectedRoot = join(root, `protected-${state}`)
+      if (state === 'existing') {
+        await mkdir(protectedRoot)
+        await writeFile(join(protectedRoot, 'secret.txt'), 'host-secret')
+      }
+      const guestRoot = execFileSync(
+        'wsl.exe',
+        ['-d', distro!, '-u', user!, '--exec', 'wslpath', '-a', '-u', protectedRoot],
+        { encoding: 'utf8', windowsHide: true }
+      ).trim()
+      const prepared = await launch(
+        `set -eu\n[ ! -e '${guestRoot}/secret.txt' ]\nif touch '${guestRoot}/changed' 2>/dev/null; then exit 41; fi\nprintf protected-ok`,
+        [],
+        protectedRoot
+      )
+      try {
+        const admission = prepared.beginSpawn()
+        const execution = execute(prepared.argv, prepared.env, workspace)
+        admission.started()
+        await expect(execution).resolves.toEqual({
+          exitCode: 0,
+          stdout: 'protected-ok',
+          stderr: ''
+        })
+        await expect(access(join(protectedRoot, 'changed'))).rejects.toMatchObject({
+          code: 'ENOENT'
+        })
+        if (state === 'existing') {
+          expect(await readFile(join(protectedRoot, 'secret.txt'), 'utf8')).toBe('host-secret')
+        } else {
+          await expect(access(protectedRoot)).rejects.toMatchObject({ code: 'ENOENT' })
+        }
+      } finally {
+        expect(await prepared.release()).toEqual({
+          processesTerminated: true,
+          networkClosed: true,
+          temporaryResourcesRemoved: true
+        })
+      }
+    }
+  )
+
+  it('reconciles only exact valid receipt identities and preserves malformed receipts', async () => {
+    const invalidId = randomUUID()
+    const validId = randomUUID()
+    const invalidReceipt = `/tmp/.open-science-execution-${invalidId}.receipt`
+    const validReceipt = `/tmp/.open-science-execution-${validId}.receipt`
+    const guest = (script: string, ...args: string[]): string =>
+      execFileSync(
+        process.env.SystemRoot + '\\System32\\wsl.exe',
+        [
+          '--distribution',
+          distro!,
+          '--user',
+          user!,
+          '--exec',
+          '/bin/bash',
+          '--noprofile',
+          '--norc',
+          '-c',
+          script,
+          'receipt-test',
+          ...args
+        ],
+        { encoding: 'utf8', windowsHide: true }
+      ).trim()
+
+    try {
+      guest(`printf 'malformed\\n' > "$1"`, invalidReceipt)
+      await expect(reconcileWsl2ExecutionReceipts({ distro: distro!, user: user! })).resolves.toBe(
+        false
+      )
+      expect(guest('[ -f "$1" ] && printf PRESENT', invalidReceipt)).toBe('PRESENT')
+
+      guest(
+        'rm -f -- "$1"; printf "v1 %s\\n" "$3" > "$2"',
+        invalidReceipt,
+        validReceipt,
+        `open-science-execution-${validId}`
+      )
+      await expect(reconcileWsl2ExecutionReceipts({ distro: distro!, user: user! })).resolves.toBe(
+        true
+      )
+      expect(guest('[ ! -e "$1" ] && printf REMOVED', validReceipt)).toBe('REMOVED')
+    } finally {
+      guest('rm -f -- "$1" "$2"', invalidReceipt, validReceipt)
+    }
+  })
+
+  it('runs Unicode Bash with mapped workspace channels and closed host surfaces', async () => {
+    const prepared = await launch(String.raw`
+printf '你好 stdout\n'
+printf 'guest stderr\n' >&2
+printf handoff > "$OPEN_SCIENCE_HANDOFF_DIR/result.txt"
+printf cache > "$OPEN_SCIENCE_NOTEBOOK_CACHE_DIR/result.txt"
+mkdir -p "$MPLCONFIGDIR" "$UV_CACHE_DIR" "$HF_DATASETS_CACHE" "$HF_XET_CACHE" "$HF_ASSETS_CACHE" "$TORCHINDUCTOR_CACHE_DIR" "$TORCH_EXTENSIONS_DIR" "$PYTORCH_KERNEL_CACHE_PATH" "$TRITON_CACHE_DIR" "$NUMBA_CACHE_DIR" "$R_USER_CACHE_DIR"
+[ ! -e ../unauthorized/secret.txt ]
+[ -z "\${OPEN_SCIENCE_TEST_SECRET:-}" ]
+[ "$PATH" = /usr/bin:/bin ]
+[ ! -e /mnt/c/Windows/System32/cmd.exe ]
+[ -z "$(find /run/WSL -name '*_interop' -print -quit 2>/dev/null || true)" ]
+[ ! -r /proc/net/route ] || ! grep -q '^.*[[:space:]]00000000[[:space:]]' /proc/net/route
+`)
+    const admission = prepared.beginSpawn()
+    const execution = execute(prepared.argv, prepared.env, workspace)
+    admission.started()
+    await expect(execution).resolves.toEqual({
+      exitCode: 0,
+      stdout: '你好 stdout\n',
+      stderr: 'guest stderr\n'
+    })
+    await prepared.release()
+  })
+
+  it('preserves a real non-zero Bash exit code', async () => {
+    const prepared = await launch(`printf 'failed' >&2; exit 23`)
+    const admission = prepared.beginSpawn()
+    const execution = execute(prepared.argv, prepared.env, workspace)
+    admission.started()
+    await expect(execution).resolves.toEqual({
+      exitCode: 23,
+      stdout: '',
+      stderr: 'failed'
+    })
+    await prepared.release()
+  })
+
+  it('mounts standalone notebook inputs and read-only files before sealing their parents', async () => {
+    const input = join(root, 'notebook-inputs', 'session', 'attachment')
+    const certificate = join(root, 'trust', 'bundle', 'current', 'ca.pem')
+    await mkdir(input, { recursive: true })
+    await mkdir(join(root, 'trust', 'bundle', 'current'), { recursive: true })
+    await writeFile(join(input, 'data.txt'), 'input-ok')
+    await writeFile(certificate, 'certificate-ok')
+    const guestPath = (path: string): string =>
+      execFileSync('wsl.exe', ['-d', distro!, '-u', user!, '--exec', 'wslpath', '-a', '-u', path], {
+        encoding: 'utf8'
+      }).trim()
+    const inputPath = guestPath(input)
+    const certificatePath = guestPath(certificate)
+    const prepared = await launch(
+      `set -eu
+[ "$(cat '${inputPath}/data.txt')" = input-ok ]
+[ "$(cat '${certificatePath}')" = certificate-ok ]
+if touch '${inputPath}/blocked' 2>/dev/null; then exit 41; fi
+if touch '${inputPath}/../blocked' 2>/dev/null; then exit 42; fi
+if /bin/sh -c 'echo changed > "${certificatePath}"' 2>/dev/null; then exit 43; fi
+printf writable > output.txt
+printf inputs-ok`,
+      [input, certificate]
+    )
+    try {
+      const admission = prepared.beginSpawn()
+      const execution = execute(prepared.argv, prepared.env, workspace)
+      admission.started()
+      await expect(execution).resolves.toEqual({ exitCode: 0, stdout: 'inputs-ok', stderr: '' })
+    } finally {
+      await prepared.release()
+    }
+  })
+
+  it('preserves nested read-only and denied roots under writable parents', async () => {
+    const input = join(workspace, 'input')
+    const deniedWrite = join(workspace, 'denied-write')
+    const deniedWriteChild = join(deniedWrite, 'child')
+    const deniedRead = join(workspace, 'denied-read')
+    const deniedReadChild = join(deniedRead, 'child')
+    await Promise.all(
+      [input, deniedWriteChild, deniedReadChild].map((directory) =>
+        mkdir(directory, { recursive: true })
+      )
+    )
+    await writeFile(join(input, 'existing.txt'), 'original', 'utf8')
+    await writeFile(join(deniedWriteChild, 'existing.txt'), 'original', 'utf8')
+    await writeFile(join(deniedReadChild, 'secret.txt'), 'secret', 'utf8')
+
+    const prepared = await wsl2Launch({
+      target: {
+        kind: 'wsl2',
+        profileId: 'real-profile',
+        distro: distro!,
+        user: user!
+      },
+      command: String.raw`
+if /bin/sh -c 'printf changed > input/existing.txt' 2>/dev/null; then exit 41; fi
+[ "$(cat input/existing.txt)" = original ]
+if /bin/sh -c 'printf changed > denied-write/child/existing.txt' 2>/dev/null; then exit 42; fi
+[ "$(cat denied-write/child/existing.txt)" = original ]
+if cat denied-read/child/secret.txt >/dev/null 2>&1; then exit 43; fi
+printf sibling > sibling.txt
+[ "$(cat sibling.txt)" = sibling ]
+`,
+      cwd: workspace,
+      env: {},
+      gatewayPort: gateway.port,
+      gatewayCredentials,
+      pathEnvironment: {
+        OPEN_SCIENCE_HANDOFF_DIR: handoff,
+        ...cacheEnvironmentFixture(cache)
+      },
+      filesystem: {
+        privateRoot: root,
+        readOnlyRoots: [input],
+        readWriteRoots: [workspace, handoff, cache, deniedWriteChild, deniedReadChild],
+        deniedReadRoots: [unauthorized, deniedRead],
+        deniedWriteRoots: [deniedWrite]
+      }
+    })
+    try {
+      const admission = prepared.beginSpawn()
+      const execution = execute(prepared.argv, prepared.env, workspace)
+      admission.started()
+      await expect(execution).resolves.toEqual({ exitCode: 0, stdout: '', stderr: '' })
+    } finally {
+      await prepared.release()
+    }
+  })
+
+  it('cleans an execution when cancellation races receipt publication', async () => {
+    const prepared = await launch('sleep 30')
+    const admission = prepared.beginSpawn()
+    const child = spawn(prepared.argv[0]!, prepared.argv.slice(1), {
+      cwd: workspace,
+      env: prepared.env,
+      windowsHide: true
+    })
+    admission.started()
+    const startedAt = Date.now()
+
+    const firstCleanup = await prepared.release('cancel')
+    const cleanup = Object.values(firstCleanup).every(Boolean)
+      ? firstCleanup
+      : await prepared.release('cancel')
+    expect(cleanup).toMatchObject({
+      processesTerminated: true,
+      networkClosed: true
+    })
+    expect(Date.now() - startedAt).toBeLessThan(8_000)
+    if (child.exitCode === null && child.signalCode === null) {
+      await new Promise<void>((resolve, reject) => {
+        const timeout = setTimeout(
+          () => reject(new Error('Receipt-race WSL host did not exit.')),
+          5_000
+        )
+        child.once('exit', () => {
+          clearTimeout(timeout)
+          resolve()
+        })
+      })
+    }
+  }, 15_000)
+
+  it('cancels background, double-fork, and persistent-writer descendants without stopping a concurrent execution', async () => {
+    const victim = await launch(String.raw`
+env -u OPEN_SCIENCE_WSL_EXECUTION_TOKEN setsid /bin/bash --noprofile --norc -c '
+  trap "" TERM
+  (trap "" TERM; while :; do printf writer; sleep 0.1; done) &
+  while :; do sleep 1; done
+' &
+printf ready
+while :; do sleep 1; done
+    `)
+    const concurrent = await launch(`sleep 4; printf concurrent-ok`)
+    const victimAdmission = victim.beginSpawn()
+    const victimChild = spawn(victim.argv[0]!, victim.argv.slice(1), {
+      cwd: workspace,
+      env: victim.env,
+      windowsHide: true
+    })
+    victimAdmission.started()
+    const concurrentAdmission = concurrent.beginSpawn()
+    const concurrentCompletion = execute(concurrent.argv, concurrent.env, workspace)
+    concurrentAdmission.started()
+
+    await waitForStdout(victimChild, 'ready')
+    const startedAt = Date.now()
+    await expect(victim.release('cancel')).resolves.toMatchObject({
+      processesTerminated: true,
+      networkClosed: true
+    })
+    expect(Date.now() - startedAt).toBeLessThan(8_000)
+    await expect(
+      new Promise<void>((resolve, reject) => {
+        if (victimChild.exitCode !== null || victimChild.signalCode !== null) {
+          resolve()
+          return
+        }
+        const timeout = setTimeout(
+          () => reject(new Error('Cancelled WSL host did not exit.')),
+          5_000
+        )
+        victimChild.once('exit', () => {
+          clearTimeout(timeout)
+          resolve()
+        })
+      })
+    ).resolves.toBeUndefined()
+
+    const token = victim.argv.find((value) =>
+      /^open-science-execution-[0-9a-f-]{36}$/u.test(value)
+    )!
+    const receipt = victim.argv.find((value) => /^\/tmp\/\.open-science-execution-/u.test(value))!
+    const cleanupEvidence = execFileSync(
+      victim.argv[0]!,
+      [
+        '--distribution',
+        distro!,
+        '--user',
+        user!,
+        '--exec',
+        '/bin/bash',
+        '--noprofile',
+        '--norc',
+        '-c',
+        String.raw`token=$1; receipt=$2; alive=0
+for environment in /proc/[0-9]*/environ; do
+  [ -r "$environment" ] || continue
+  tr '\0' '\n' < "$environment" 2>/dev/null | grep -Fqx "OPEN_SCIENCE_WSL_EXECUTION_TOKEN=$token" && alive=$((alive + 1))
+done
+[ -e "$receipt" ] && receipt_exists=1 || receipt_exists=0
+printf 'alive=%s;receipt=%s\n' "$alive" "$receipt_exists"`,
+        'verify-exact-cleanup',
+        token,
+        receipt
+      ],
+      { encoding: 'utf8', windowsHide: true }
+    ).trim()
+    expect(cleanupEvidence).toBe('alive=0;receipt=0')
+    await expect(concurrentCompletion).resolves.toEqual({
+      exitCode: 0,
+      stdout: 'concurrent-ok',
+      stderr: ''
+    })
+    await concurrent.release('exit')
+  }, 20_000)
+})

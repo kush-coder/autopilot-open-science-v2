@@ -1,0 +1,157 @@
+import { externalComputeMode } from '../../../shared/compute'
+import type { ComputeAuthenticationErrorCode } from '@aipoch/compute'
+
+import {
+  settingsPanelRoute,
+  type SettingsPanelId,
+  type SettingsRoute
+} from '@/lib/settings-navigation'
+import { rememberSettingsReturnFocusTarget } from './settings-return-focus'
+import { useNavigationStore, type ResourceCenterIntent } from './navigation-store'
+
+export type SettingsNavigationIntent = Readonly<{
+  requestId: number
+  route: SettingsRoute
+}>
+
+let settingsNavigationRequestId = 0
+
+export type SettingsNavigationState = {
+  isSettingsOpen: boolean
+  pendingSettingsIntent?: SettingsNavigationIntent
+}
+
+export type SettingsNavigationActions = {
+  openSettings: () => void
+  openSettingsToPanel: (panel: SettingsPanelId) => void
+  openSettingsToProvider: (providerId: string, model?: string) => void
+  openSettingsToConnector: (id: string) => void
+  openSettingsToClassification: () => void
+  openSettingsToOpenAlex: () => void
+  closeSettings: () => void
+  openSettingsToSkill: (skillId: string) => void
+  openSettingsToSpecialist: (specialistId: string) => void
+  openSettingsToCompute: () => void
+  openSettingsToComputeHost: (providerId: string) => void
+  openSettingsToComputeAuthentication: (
+    providerId: string,
+    errorCode: ComputeAuthenticationErrorCode
+  ) => void
+  consumePendingSettingsIntent: (requestId: number) => void
+}
+
+type SettingsNavigationSliceOptions = {
+  getState: () => SettingsNavigationState
+  setState: (patch: Partial<SettingsNavigationState>) => void
+}
+
+export const createInitialSettingsNavigationState = (): SettingsNavigationState => ({
+  isSettingsOpen: false,
+  pendingSettingsIntent: undefined
+})
+
+// Owns global dialog visibility and a one-shot landing intent. Caller-facing actions remain stable;
+// route construction, mutual exclusion, and repeated-intent identity stay behind this module's seam.
+export const createSettingsNavigationSlice = ({
+  getState,
+  setState
+}: SettingsNavigationSliceOptions): SettingsNavigationActions => {
+  const openTo = (route: SettingsRoute): void => {
+    rememberSettingsReturnFocusTarget(getState().isSettingsOpen)
+    setState({
+      isSettingsOpen: true,
+      pendingSettingsIntent: { requestId: ++settingsNavigationRequestId, route }
+    })
+  }
+
+  const openResource = (route: SettingsRoute, intent: ResourceCenterIntent): void => {
+    if (getState().isSettingsOpen) {
+      // The mounted Settings owner must resolve its dirty/busy leave guard first.
+      openTo(route)
+      return
+    }
+    setState({ pendingSettingsIntent: undefined })
+    useNavigationStore.getState().openResourceCenter('user', intent)
+  }
+
+  return {
+    openSettings: () => {
+      rememberSettingsReturnFocusTarget(getState().isSettingsOpen)
+      setState({ isSettingsOpen: true })
+    },
+
+    openSettingsToPanel: (panel) => {
+      if (panel === 'skills' || panel === 'specialists' || panel === 'connectors') {
+        openResource(settingsPanelRoute(panel), { resource: panel })
+        return
+      }
+      openTo(settingsPanelRoute(panel))
+    },
+    openSettingsToProvider: (providerId, model) =>
+      openTo({
+        panel: 'model',
+        view: { kind: 'list', recoveryProviderId: providerId, recoveryModel: model }
+      }),
+    openSettingsToConnector: (id) => {
+      const view = { kind: 'list' as const, recoveryConnectorId: id }
+      openResource({ panel: 'connectors', view }, { resource: 'connectors', view })
+    },
+    openSettingsToClassification: () =>
+      openTo({ panel: 'model', view: { kind: 'classification' } }),
+    openSettingsToOpenAlex: () =>
+      openTo({ panel: 'credentials', view: { kind: 'service', serviceId: 'openalex' } }),
+
+    closeSettings: () =>
+      setState({
+        isSettingsOpen: false,
+        pendingSettingsIntent: undefined
+      }),
+
+    openSettingsToSkill: (skillId) => {
+      openResource(
+        { panel: 'skills', view: { kind: 'detail', id: skillId } },
+        { resource: 'skills', skillId }
+      )
+    },
+
+    openSettingsToSpecialist: (specialistId) => {
+      openResource(
+        { panel: 'specialists', view: { kind: 'edit', id: specialistId } },
+        { resource: 'specialists', specialistId }
+      )
+    },
+
+    openSettingsToCompute: () => openTo({ panel: 'compute', view: { kind: 'list' } }),
+
+    openSettingsToComputeHost: (providerId) =>
+      openTo({
+        panel: 'compute',
+        view: externalComputeMode(providerId) ? { kind: 'list' } : { kind: 'detail', providerId }
+      }),
+
+    openSettingsToComputeAuthentication: (providerId, errorCode) => {
+      rememberSettingsReturnFocusTarget(getState().isSettingsOpen)
+      const requestId = ++settingsNavigationRequestId
+      setState({
+        isSettingsOpen: true,
+        pendingSettingsIntent: {
+          requestId,
+          route: {
+            panel: 'compute',
+            view: {
+              kind: 'detail',
+              providerId,
+              authenticationFocus: errorCode,
+              authenticationRequestId: requestId
+            }
+          }
+        }
+      })
+    },
+
+    consumePendingSettingsIntent: (requestId) => {
+      if (getState().pendingSettingsIntent?.requestId !== requestId) return
+      setState({ pendingSettingsIntent: undefined })
+    }
+  }
+}

@@ -1,0 +1,555 @@
+import type { PersistedActivityGroup } from '../../../../shared/session-persistence'
+import type { ToolActivity } from '@/stores/session-store-contract'
+
+import {
+  formatActivityTitle,
+  isActivityActive,
+  type ConversationItem
+} from './workspace-conversation-items'
+import {
+  buildToolActivityDetails,
+  translateToolDetailCopy,
+  isEditActivity,
+  isSkillActivity,
+  isToolSearchActivity,
+  getNotebookRunIdFromActivity
+} from './workspace-tool-activity-details'
+import { hasWebSearchContentEvidence } from './workspace-web-search-details'
+import {
+  getCorrelatedNotebookRun,
+  getToolExecutionPhase,
+  isNotebookExecutionActivity,
+  isNotebookCodeReviewActivity,
+  isPendingNotebookCodeReview
+} from './tool-execution-phase'
+import type { SessionPermissionRuntimeContext } from '../../../../shared/session-persistence'
+import type { NotebookRunRecord } from '../../../../shared/notebook'
+import type { TFunction } from 'i18next'
+import { isAuthorizedDirectoryTool, matchNotebookControlTool } from './notebook-tool-names'
+import { notebookInput } from './notebook-tool-presentation'
+import { i18next } from '@/i18n'
+
+type ConversationActivityGroupItem = {
+  id: string
+  type: 'activity-group'
+  createdAt: number
+  sortIndex: number
+  activities: ToolActivity[]
+  activityGroupId?: string
+  title?: string
+}
+
+type GroupedConversationItem = ConversationItem | ConversationActivityGroupItem
+type ActivityExpansionOverrides = Record<string, boolean>
+type RenderableActivityEntry = {
+  activity: ToolActivity
+  activityIndex: number
+}
+
+const WEB_SEARCH_PROVIDER_TOOL_NAME = 'websearch'
+const NOTEBOOK_TERMINAL_PHASES: ReadonlySet<string> = new Set([
+  'completed',
+  'declined',
+  'failed',
+  'limit-reached',
+  'interrupted',
+  'cancelled'
+])
+
+// Collapses consecutive activity items into one transcript group between chat messages.
+const groupConversationItems = (
+  items: ConversationItem[],
+  activityGroups: PersistedActivityGroup[] = []
+): GroupedConversationItem[] => {
+  const groupedItems: GroupedConversationItem[] = []
+  const groupsById = new Map(activityGroups.map((group) => [group.id, group]))
+
+  for (const item of items) {
+    // Handoff annotations, Plan call records, and elicitations are standalone transcript items.
+    // Keep their timeline position and prevent them from merging into adjacent ordinary tools.
+    if (
+      item.type === 'message' ||
+      item.type === 'subagent-message' ||
+      item.type === 'handoff' ||
+      item.type === 'plan-activity' ||
+      item.type === 'compaction-activity' ||
+      item.type === 'session-config-change' ||
+      (item.type === 'activity' && item.activity.elicitation)
+    ) {
+      groupedItems.push(item)
+      continue
+    }
+
+    const previousItem = groupedItems[groupedItems.length - 1]
+    const activityGroupId = item.activity.activityGroupId
+    const declaredGroup = activityGroupId ? groupsById.get(activityGroupId) : undefined
+
+    if (
+      previousItem?.type === 'activity-group' &&
+      previousItem.activityGroupId === activityGroupId
+    ) {
+      previousItem.activities.push(item.activity)
+      continue
+    }
+
+    groupedItems.push({
+      // Business groups can span standalone cards; each contiguous row owns its identity.
+      id: `activity-group-${item.activity.id}`,
+      type: 'activity-group',
+      createdAt: item.createdAt,
+      sortIndex: item.sortIndex,
+      activities: [item.activity],
+      activityGroupId,
+      title: declaredGroup?.title
+    })
+  }
+
+  return groupedItems
+}
+
+// Provides a normalized title for detection rules that depend on ACP tool names.
+const getTrimmedActivityTitle = (activity: ToolActivity): string => activity.title.trim()
+
+// Detects the synthetic ToolSearch wrapper row that can precede the real search entries.
+const isToolSearchWrapperActivity = (activity: ToolActivity): boolean =>
+  activity.providerToolName?.trim().toLowerCase() === 'toolsearch' ||
+  getTrimmedActivityTitle(activity).toLowerCase() === 'toolsearch'
+
+// Matches Claude's concrete WebSearch tool identity without conflating file-search kinds.
+const isProviderWebSearchActivity = (activity: ToolActivity): boolean =>
+  activity.providerToolName?.trim().toLowerCase() === WEB_SEARCH_PROVIDER_TOOL_NAME
+
+// Quoted titles are how the current ACP payload represents individual search queries.
+const isQuotedActivityTitle = (activity: ToolActivity): boolean =>
+  /^["'].+["']$/u.test(getTrimmedActivityTitle(activity))
+
+// ToolSearch can emit concrete search rows as fetch activities or without a tool kind.
+const canInferToolSearchResultActivity = (activity: ToolActivity): boolean =>
+  activity.toolKind === undefined || activity.toolKind === 'fetch'
+
+// Explicit non-WebSearch provider names are stronger evidence than legacy title heuristics.
+const canUseToolSearchProviderInference = (activity: ToolActivity): boolean =>
+  activity.providerToolName === undefined ||
+  activity.providerToolName.trim() === '' ||
+  activity.providerToolName.trim().toLowerCase() === 'toolsearch'
+
+// Allows provisional running searches while requiring payload evidence for completed rows.
+const hasToolSearchInferenceEvidence = (activity: ToolActivity): boolean =>
+  isActivityActive(activity) || hasWebSearchContentEvidence(activity)
+
+// Classifies concrete WebSearch tools and likely ToolSearch result rows as web searches.
+// Kept for row-level rendering; group counting below uses a single pass.
+const isSearchActivity = (
+  activity: ToolActivity,
+  activities: ToolActivity[],
+  activityIndex: number
+): boolean =>
+  isProviderWebSearchActivity(activity) ||
+  (canInferToolSearchResultActivity(activity) &&
+    canUseToolSearchProviderInference(activity) &&
+    isQuotedActivityTitle(activity) &&
+    hasToolSearchInferenceEvidence(activity) &&
+    activities.slice(0, activityIndex).some((candidate) => isToolSearchWrapperActivity(candidate)))
+
+// Counts detected search activities so headers can summarize searches instead of raw tool calls.
+const countSearchActivities = (activities: ToolActivity[]): number => {
+  let count = 0
+  let hasEarlierToolSearchWrapper = false
+
+  for (const activity of activities) {
+    const isSearch =
+      isProviderWebSearchActivity(activity) ||
+      (canInferToolSearchResultActivity(activity) &&
+        canUseToolSearchProviderInference(activity) &&
+        isQuotedActivityTitle(activity) &&
+        hasToolSearchInferenceEvidence(activity) &&
+        hasEarlierToolSearchWrapper)
+    if (isSearch) count += 1
+    if (isToolSearchWrapperActivity(activity)) hasEarlierToolSearchWrapper = true
+  }
+
+  return count
+}
+
+// Coarse activity categories that map many concrete tools onto a few readable header verbs.
+type ActivityCategory =
+  | 'search'
+  | 'toolSearch'
+  | 'command'
+  | 'fetch'
+  | 'read'
+  | 'edit'
+  | 'skill'
+  | 'directoryAccess'
+  | 'environment'
+  | 'call'
+  | 'artifact'
+  | 'notebook'
+  | 'other'
+
+// Provider tool names that behave like shell/interpreter commands regardless of ACP tool kind.
+const COMMAND_PROVIDER_TOOL_NAMES = new Set([
+  'python',
+  'bash',
+  'shell',
+  'sh',
+  'zsh',
+  'node',
+  'run_code',
+  'jupyter',
+  'bashoutput'
+])
+
+// Header clauses are emitted in this fixed order so summaries read consistently.
+const ACTIVITY_CATEGORY_ORDER: ActivityCategory[] = [
+  'command',
+  'search',
+  'toolSearch',
+  'fetch',
+  'read',
+  'edit',
+  'skill',
+  'directoryAccess',
+  'environment',
+  'call',
+  'artifact',
+  'notebook',
+  'other'
+]
+
+// Reads the lowercased provider tool name used for category matching.
+const getNormalizedProviderName = (activity: ToolActivity): string =>
+  activity.providerToolName?.trim().toLowerCase() ?? ''
+
+// Assigns one activity to the category that best describes what it did for the header summary.
+const categorizeActivity = (
+  activity: ToolActivity,
+  activities: ToolActivity[],
+  activityIndex: number,
+  hasEarlierToolSearchWrapper?: boolean
+): ActivityCategory => {
+  const isSearch =
+    hasEarlierToolSearchWrapper === undefined
+      ? isSearchActivity(activity, activities, activityIndex)
+      : isProviderWebSearchActivity(activity) ||
+        (canInferToolSearchResultActivity(activity) &&
+          canUseToolSearchProviderInference(activity) &&
+          isQuotedActivityTitle(activity) &&
+          hasToolSearchInferenceEvidence(activity) &&
+          hasEarlierToolSearchWrapper)
+  if (isSearch) return 'search'
+  if (isToolSearchActivity(activity)) return 'toolSearch'
+
+  const providerName = getNormalizedProviderName(activity)
+
+  // A Notebook execution is one run; use the shared provider-name matcher for every ACP backend.
+  if (isNotebookExecutionActivity(activity)) return 'notebook'
+  if (isAuthorizedDirectoryTool(activity.providerToolName, activity.title)) return 'directoryAccess'
+  if (isSkillActivity(activity)) return 'skill'
+  if (providerName === 'save_artifacts' || providerName.includes('artifact')) return 'artifact'
+  if (providerName === 'manage_packages' || providerName.includes('package')) return 'environment'
+  if (providerName === 'request_network_access' || providerName.startsWith('request_network')) {
+    return 'call'
+  }
+  if (activity.toolKind === 'execute' || COMMAND_PROVIDER_TOOL_NAMES.has(providerName)) {
+    return 'command'
+  }
+  if (isEditActivity(activity)) return 'edit'
+  if (activity.toolKind === 'read') return 'read'
+  if (activity.toolKind === 'fetch') return 'fetch'
+
+  return 'other'
+}
+
+// Builds one natural-language clause (verb + count) for a category present in the group.
+const formatCategoryClause = (
+  category: ActivityCategory,
+  count: number,
+  t: TFunction = i18next.t.bind(i18next)
+): string => {
+  switch (category) {
+    case 'command':
+      return count === 1 ? t('ran a command') : t('ran {{count}} commands', { count })
+    case 'search':
+      return count === 1 ? t('ran a search') : t('ran {{count}} searches', { count })
+    case 'toolSearch':
+      return count === 1 ? t('ran a tool search') : t('ran {{count}} tool searches', { count })
+    case 'fetch':
+      return count === 1 ? t('fetched a page') : t('fetched {{count}} pages', { count })
+    case 'read':
+      return count === 1 ? t('read a file') : t('read {{count}} files', { count })
+    case 'edit':
+      return count === 1 ? t('edited a file') : t('edited {{count}} files', { count })
+    case 'skill':
+      return count === 1 ? t('loaded a skill') : t('loaded {{count}} skills', { count })
+    case 'directoryAccess':
+      return t('checked directory access')
+    case 'environment':
+      return count === 1 ? t('managed an environment') : t('managed environments')
+    case 'call':
+      return count === 1 ? t('made a call') : t('made {{count}} calls', { count })
+    case 'artifact':
+      return count === 1 ? t('saved a file') : t('saved {{count}} files', { count })
+    case 'notebook':
+      return count === 1
+        ? t('completed a Notebook run')
+        : t('completed {{count}} Notebook runs', { count })
+    default:
+      return count === 1 ? t('ran a tool') : t('ran {{count}} tools', { count })
+  }
+}
+
+// Uppercases the first character so the joined lowercase clauses read as a sentence fragment.
+const capitalizeFirst = (value: string): string =>
+  value.length > 0 ? `${value.charAt(0).toUpperCase()}${value.slice(1)}` : value
+
+// Summarizes a group as "Ran 2 commands, loaded a skill, made a call" style category clauses.
+const formatActivityGroupTitle = (
+  activities: ToolActivity[],
+  declaredTitle?: string,
+  t: TFunction = i18next.t.bind(i18next)
+): string => {
+  const groupTitle = declaredTitle?.trim()
+  if (groupTitle) return groupTitle
+
+  const categoryCounts = new Map<ActivityCategory, number>()
+
+  let hasEarlierToolSearchWrapper = false
+  activities.forEach((activity, activityIndex) => {
+    if (isNotebookCodeReviewActivity(activity)) return
+    const category = categorizeActivity(
+      activity,
+      activities,
+      activityIndex,
+      hasEarlierToolSearchWrapper
+    )
+
+    if (category === 'search' && !categoryCounts.has('search')) {
+      // A concrete search supersedes any wrappers encountered earlier in this same pass.
+      const discoveryCount = activities
+        .slice(0, activityIndex)
+        .filter(
+          (candidate) => isToolSearchActivity(candidate) && !isToolSearchWrapperActivity(candidate)
+        ).length
+      if (discoveryCount) categoryCounts.set('toolSearch', discoveryCount)
+      else categoryCounts.delete('toolSearch')
+    }
+    if (isToolSearchWrapperActivity(activity) && categoryCounts.has('search')) {
+      hasEarlierToolSearchWrapper = true
+      return
+    }
+    categoryCounts.set(category, (categoryCounts.get(category) ?? 0) + 1)
+    if (isToolSearchWrapperActivity(activity)) hasEarlierToolSearchWrapper = true
+  })
+
+  const clauses = ACTIVITY_CATEGORY_ORDER.filter(
+    (category) => (categoryCounts.get(category) ?? 0) > 0
+  ).map((category) => formatCategoryClause(category, categoryCounts.get(category) ?? 0, t))
+
+  if (clauses.length === 0) return t('Ran a tool')
+
+  return capitalizeFirst(clauses.join(', '))
+}
+
+const formatActivityGroupPresentationTitle = (
+  activities: ToolActivity[],
+  declaredTitle: string | undefined,
+  permission: SessionPermissionRuntimeContext | undefined,
+  notebookRunsById?: ReadonlyMap<string, NotebookRunRecord>,
+  t: TFunction = i18next.t.bind(i18next)
+): string => {
+  if (activities.some(isPendingNotebookCodeReview)) return t('Waiting for your approval')
+  const activityPhases = getRenderableActivityEntries(activities).map(
+    ({ activity, activityIndex }) => ({
+      activity,
+      activityIndex,
+      isNotebook: isNotebookExecutionActivity(activity),
+      phase: getToolExecutionPhase(activity, permission, notebookRunsById)
+    })
+  )
+  if (activityPhases.some(({ phase }) => phase === 'awaiting-approval'))
+    return t('Waiting for your approval')
+  const executing = activityPhases.filter(({ phase }) => phase === 'executing')
+  const current =
+    executing.find(({ activity }) => activity.status === 'in_progress') ?? executing[0]
+  if (current) {
+    if (isSearchActivity(current.activity, activities, current.activityIndex))
+      return t('Using tool: {{name}}', { name: t('Web Search') })
+    const details = buildToolActivityDetails(current.activity, t)
+    const notebookControlTool =
+      matchNotebookControlTool(current.activity.providerToolName) ??
+      matchNotebookControlTool(current.activity.title)
+    // Keep the group header at the stable Notebook category even when the expanded card uses a
+    // specific control title such as "Inspect packages" or "Manage environments".
+    if (notebookControlTool)
+      // Canonicalize provider spellings before reusing the existing chip-name mapping.
+      return formatActivityTitle(
+        {
+          ...current.activity,
+          providerToolName: `mcp__open-science-notebook__${notebookControlTool}`
+        },
+        'executing',
+        t
+      )
+    if (details)
+      return t('Using tool: {{name}}', { name: translateToolDetailCopy(details.displayName, t) })
+    if (current.activity.providerToolName?.trim() || current.activity.title.trim())
+      return formatActivityTitle(current.activity, 'executing', t)
+  }
+  const phases = activityPhases.filter(({ isNotebook }) => isNotebook).map(({ phase }) => phase)
+  const notebookCount = phases.length
+  if (!phases.includes('executing') && activityPhases.some(({ phase }) => phase === 'executing'))
+    return declaredTitle?.trim() || t('Running')
+  if (notebookCount === 0) {
+    if (activityPhases.length > 0 && activityPhases.every(({ phase }) => phase === 'closed')) {
+      return activityPhases.length === 1 ? t('Tool request ended') : t('Tool requests ended')
+    }
+    return formatActivityGroupTitle(activities, declaredTitle, t)
+  }
+  const noun =
+    notebookCount === 1 ? t('Notebook run') : t('{{count}} Notebook runs', { count: notebookCount })
+
+  const transientPhase = (['awaiting-approval', 'executing', 'prepared'] as const).find((phase) =>
+    phases.includes(phase)
+  )
+  switch (transientPhase) {
+    case 'awaiting-approval':
+      return t('Waiting for your approval')
+    case 'executing':
+      return t('Running {{noun}}', { noun })
+    case 'prepared':
+      return t('Notebook code shown')
+  }
+
+  // A group can contain many successful runs and one failed run. Only apply an outcome label when
+  // every Notebook run shares that outcome; mixed terminal results stay neutral and let the step
+  // summary show the exact failure count.
+  const uniformPhase =
+    phases.length > 0 && phases.every((phase) => phase === phases[0]) ? phases[0] : undefined
+  const outcomePhase =
+    uniformPhase ??
+    (phases.length > 1 &&
+    phases.some((phase) => phase !== 'completed') &&
+    phases.every((phase) => NOTEBOOK_TERMINAL_PHASES.has(phase))
+      ? 'mixed'
+      : undefined)
+
+  switch (outcomePhase) {
+    case 'declined':
+      return t('Declined {{noun}}', { noun })
+    case 'failed':
+      return t('Failed {{noun}}', { noun })
+    case 'limit-reached':
+      return t('Execution limit reached for {{noun}}', { noun })
+    case 'interrupted':
+      return t('Interrupted {{noun}}', { noun })
+    case 'cancelled':
+      return t('Cancelled {{noun}}', { noun })
+    case 'mixed':
+      return noun
+  }
+
+  return formatActivityGroupTitle(activities, declaredTitle, t)
+}
+
+// Hides internal review receipts and ToolSearch wrappers superseded by concrete search rows.
+const getRenderableActivityEntries = (activities: ToolActivity[]): RenderableActivityEntry[] => {
+  const hasSearchActivities = countSearchActivities(activities) > 0
+
+  return activities
+    .map((activity, activityIndex) => ({ activity, activityIndex }))
+    .filter(
+      ({ activity }) =>
+        !isNotebookCodeReviewActivity(activity) &&
+        !(hasSearchActivities && isToolSearchWrapperActivity(activity))
+    )
+}
+
+// Formats the group header's total visible-step count, flagging any failed steps.
+const formatStepCount = (
+  activities: ToolActivity[],
+  permission?: SessionPermissionRuntimeContext,
+  notebookRunsById?: ReadonlyMap<string, NotebookRunRecord>,
+  t: TFunction = i18next.t.bind(i18next)
+): string => {
+  const activityCount = activities.length
+  const stepLabel =
+    activityCount === 1 ? t('1 step') : t('{{count}} steps', { count: activityCount })
+  const failedCount = activities.filter(
+    (activity) => getToolExecutionPhase(activity, permission, notebookRunsById) === 'failed'
+  ).length
+
+  return failedCount > 0
+    ? `${stepLabel} · ${t('{{count}} failed', { count: failedCount })}`
+    : stepLabel
+}
+
+// Adds each tool's own runtime, excluding idle gaps between tools in the same group.
+const getActivityGroupElapsedMs = (
+  activities: ToolActivity[],
+  now: number,
+  isActive: (activity: ToolActivity) => boolean = isActivityActive,
+  notebookRunsById?: ReadonlyMap<string, NotebookRunRecord>
+): number => {
+  const reviews = activities.filter(isNotebookCodeReviewActivity)
+  return activities.reduce((total, activity) => {
+    if (isNotebookCodeReviewActivity(activity)) return total
+    const end = isActive(activity) ? now : activity.updatedAt
+    const intervals = isNotebookExecutionActivity(activity)
+      ? reviews
+          .filter((review) => {
+            if (review.promptMessageId !== activity.promptMessageId) return false
+            const runId =
+              getCorrelatedNotebookRun(activity, notebookRunsById)?.runId ??
+              getNotebookRunIdFromActivity(activity)
+            const reviewRunId = notebookInput(notebookInput(review.rawInput).notebookCodeRisk).runId
+            return typeof reviewRunId === 'string' && reviewRunId === runId
+          })
+          .map((review) => [
+            Math.max(activity.createdAt, review.createdAt),
+            Math.min(end, isPendingNotebookCodeReview(review) ? now : review.updatedAt)
+          ])
+          .filter(([start, end]) => end > start)
+          .sort((a, b) => a[0] - b[0])
+      : []
+    let waiting = 0,
+      coveredEnd = activity.createdAt
+    for (const [start, stop] of intervals) {
+      waiting += Math.max(0, stop - Math.max(start, coveredEnd))
+      coveredEnd = Math.max(coveredEnd, stop)
+    }
+    return total + Math.max(0, end - activity.createdAt - waiting)
+  }, 0)
+}
+
+// Keeps short work precise, then switches to compact clock units as the elapsed span grows.
+const formatActivityGroupElapsed = (elapsedMs: number): string => {
+  const milliseconds = Math.max(0, Math.floor(elapsedMs))
+  if (milliseconds < 1000) return `${milliseconds}ms`
+
+  const totalSeconds = Math.floor(milliseconds / 1000)
+  const hours = Math.floor(totalSeconds / 3600)
+  const minutes = Math.floor((totalSeconds % 3600) / 60)
+  const seconds = totalSeconds % 60
+
+  if (hours > 0) return `${hours}h ${minutes}m ${seconds}s`
+  if (minutes > 0) return `${minutes}m ${seconds}s`
+  return `${seconds}s`
+}
+
+export {
+  formatActivityGroupElapsed,
+  formatActivityGroupPresentationTitle,
+  formatActivityGroupTitle,
+  formatStepCount,
+  getActivityGroupElapsedMs,
+  getRenderableActivityEntries,
+  groupConversationItems,
+  isSearchActivity
+}
+export type {
+  ActivityExpansionOverrides,
+  ConversationActivityGroupItem,
+  GroupedConversationItem,
+  RenderableActivityEntry
+}

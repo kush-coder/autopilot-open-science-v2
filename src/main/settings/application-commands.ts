@@ -1,0 +1,988 @@
+import { readSourceLinkImage, readSourceLinkMetadata } from './source-link-metadata'
+import type { SourceLinkMetadata } from '../../shared/source-preview'
+import type {
+  SavedSkillSource,
+  AddSkillSourceRequest,
+  RemoveSkillSourceRequest
+} from '../../shared/skill-sources'
+import { z } from 'zod'
+import { defineApplicationCommandContract } from '../../shared/application-command-contract'
+import { parseSettingsSnapshot } from '../../shared/settings'
+import { requireDesktopCaller } from '../caller-context'
+import type { PrivateDestinationRequest } from '../../shared/notebook-network-settings'
+import type {
+  AppIconPreview,
+  ClaudeInstallEvent,
+  InstallClaudeRequest,
+  InstallCodeBuddyRequest,
+  InstallPiRequest,
+  InstallCodexRequest,
+  InstallOpencodeRequest,
+  PreviewAgentHomeSkillRequest,
+  PreviewGitHubSkillRequest,
+  PreviewSkillZipRequest,
+  RefreshProviderModelsRequest,
+  ScanRepoRequest,
+  SaveGitHubTokenRequest,
+  SetAppIconVariantRequest,
+  SetClosePreferenceRequest,
+  SetDefaultPermissionProfileRequest,
+  SetNotificationsEnabledRequest,
+  SetShowNotificationContentRequest,
+  SetPackageMirrorRequest,
+  SetNetworkProxyRequest,
+  SetNotebookNetworkRequest,
+  SetProjectFilesFilterRequest,
+  SetPromptOptimizationModelRequest,
+  SetReviewerModelRequest,
+  SetSessionDetailsModelRequest,
+  SetSubagentModelRequest,
+  SetVisionModelRequest,
+  ValidateProviderRequest,
+  UpsertProviderRequest,
+  SaveValidatedProviderResult
+} from '../../shared/settings'
+import type {
+  InstallMissingWslDependenciesRequest,
+  InstallWslDistroRequest,
+  OpenWslTerminalRequest,
+  SelectWslProfileRequest
+} from '../../shared/wsl-setup'
+import {
+  defineApplicationCommand,
+  defineApplicationCommandGroup,
+  type ApplicationCommandInstallation,
+  type ApplicationCommandRegistrar
+} from '../application-command-router'
+import type { CallerContext } from '../caller-context'
+import type { SettingsService } from './service'
+import type {
+  ClassificationMutation,
+  ClassificationMutationResult,
+  ClassificationProbe,
+  ClassificationProbeResult,
+  ClassificationSnapshot
+} from '../../shared/classification'
+import type { ClassificationSettingsOwner } from './classification-settings'
+import type {
+  SkillMarketplaceCatalogRequest,
+  SkillMarketplaceDetailRequest
+} from '../../shared/skill-marketplace'
+import type { SettingsSnapshotCommitOwner } from './settings-snapshot-commit-owner'
+import {
+  readAppIconVariant,
+  readClosePreference,
+  readDefaultPermissionProfile,
+  readGitHubToken,
+  readNotebookFolderRestrictionEnabled,
+  readNotificationsEnabled,
+  readShowNotificationContent,
+  readProjectFilesFilter,
+  readReviewerModel,
+  readSessionDetailsModel,
+  readSubagentModel,
+  readVisionModel
+} from './transport-validation'
+import type { AppearanceSettingsWorkflows } from './workflows/appearance'
+import type { RuntimeSettingsWorkflows } from './workflows/runtime'
+import type { LocalShellSettingsWorkflows } from './workflows/local-shell'
+
+type CoreSettingsCommandStore = Pick<
+  SettingsService,
+  | 'bootstrap'
+  | 'cancelClaudeLogin'
+  | 'cancelCodexLogin'
+  | 'cancelClaudeIsolatedLogin'
+  | 'checkEnvironment'
+  | 'detectClaude'
+  | 'detectCodeBuddy'
+  | 'detectCodex'
+  | 'detectOpencode'
+  | 'getConnectorDetail'
+  | 'getPackageMirror'
+  | 'reviewNotebookPrivateDestination'
+  | 'getNotebookNetwork'
+  | 'getNotebookNetworkStatus'
+  | 'getLocalShellRuntimePreference'
+  | 'getWsl2BashPreviewStatus'
+  | 'getWslSetupStatus'
+  | 'getGitHubTokenStatus'
+  | 'getPreflight'
+  | 'getSettingsView'
+  | 'getSkillDetail'
+  | 'resolveSkillDocument'
+  | 'listAgentHomeSkills'
+  | 'previewCustomServerTemplateExport'
+  | 'installClaude'
+  | 'installCodeBuddy'
+  | 'installPi'
+  | 'installCodex'
+  | 'installOpencode'
+  | 'installNotebookNetwork'
+  | 'cancelNotebookNetworkSetup'
+  | 'installMissingWslDependencies'
+  | 'installRecommendedWslDistro'
+  | 'installWslPlatform'
+  | 'removeNotebookNetwork'
+  | 'isEncryptionAvailable'
+  | 'isNpmAvailable'
+  | 'listConnectors'
+  | 'listSkills'
+  | 'listSkillMarketplace'
+  | 'getSkillMarketplaceDetail'
+  | 'getSkillMarketplaceBatch'
+  | 'stopSkillMarketplaceBatch'
+  | 'markOnboardingComplete'
+  | 'createWslSupportHandoff'
+  | 'openWslTerminal'
+  | 'previewAgentHomeSkill'
+  | 'previewGitHubSkill'
+  | 'previewSkillZip'
+  | 'probeWslSetup'
+  | 'refreshProviderModels'
+  | 'listSkillSources'
+  | 'addSkillSource'
+  | 'removeSkillSource'
+  | 'scanRepoSkills'
+  | 'saveGitHubToken'
+  | 'removeGitHubToken'
+  | 'setClosePreference'
+  | 'setDefaultPermissionProfile'
+  | 'setNotebookFolderRestrictionEnabled'
+  | 'setNotificationsEnabled'
+  | 'setShowNotificationContent'
+  | 'setPackageMirror'
+  | 'setNetworkProxy'
+  | 'setNotebookNetwork'
+  | 'setProjectFilesFilter'
+  | 'setReviewerModel'
+  | 'setPromptOptimizationModel'
+  | 'selectWslProfile'
+  | 'setSessionDetailsModel'
+  | 'setSubagentModel'
+  | 'setVisionModel'
+  | 'validateProvider'
+> & {
+  classification: Pick<ClassificationSettingsOwner, 'snapshot' | 'mutate' | 'probe'>
+}
+
+type StoreResult<Method extends keyof CoreSettingsCommandStore> =
+  CoreSettingsCommandStore[Method] extends (...args: infer _Args) => infer Result
+    ? Awaited<Result>
+    : never
+type AppearanceResult = Awaited<ReturnType<AppearanceSettingsWorkflows['setAppIconVariant']>>
+type SwitchToPowerShellResult = Awaited<
+  ReturnType<LocalShellSettingsWorkflows['switchToPowerShell']>
+>
+type UseWsl2BashResult = Awaited<ReturnType<LocalShellSettingsWorkflows['useWsl2Bash']>>
+
+const settingsCoreApplicationCommands = Object.freeze({
+  resolveSkillDocument: defineApplicationCommand<
+    'settings:resolve-skill-document',
+    Readonly<Parameters<CoreSettingsCommandStore['resolveSkillDocument']>>,
+    StoreResult<'resolveSkillDocument'>
+  >('settings:resolve-skill-document'),
+  listAgentHomeSkills: defineApplicationCommand<
+    'settings:list-agent-home-skills',
+    Readonly<Parameters<CoreSettingsCommandStore['listAgentHomeSkills']>>,
+    StoreResult<'listAgentHomeSkills'>
+  >('settings:list-agent-home-skills'),
+  previewCustomServerTemplateExport: defineApplicationCommand<
+    'settings:preview-custom-server-template-export',
+    Readonly<Parameters<CoreSettingsCommandStore['previewCustomServerTemplateExport']>>,
+    StoreResult<'previewCustomServerTemplateExport'>
+  >('settings:preview-custom-server-template-export'),
+
+  getSkillMarketplaceBatch: defineApplicationCommand<
+    'settings:get-skill-marketplace-batch',
+    readonly [],
+    StoreResult<'getSkillMarketplaceBatch'>
+  >('settings:get-skill-marketplace-batch'),
+  stopSkillMarketplaceBatch: defineApplicationCommand<
+    'settings:stop-skill-marketplace-batch',
+    readonly [id: string],
+    StoreResult<'stopSkillMarketplaceBatch'>
+  >('settings:stop-skill-marketplace-batch'),
+  listSkillMarketplace: defineApplicationCommand<
+    'settings:list-skill-marketplace',
+    readonly [request?: SkillMarketplaceCatalogRequest],
+    StoreResult<'listSkillMarketplace'>
+  >('settings:list-skill-marketplace'),
+  getSkillMarketplaceDetail: defineApplicationCommand<
+    'settings:get-skill-marketplace-detail',
+    readonly [request: SkillMarketplaceDetailRequest],
+    StoreResult<'getSkillMarketplaceDetail'>
+  >('settings:get-skill-marketplace-detail'),
+  cancelClaudeLogin: defineApplicationCommand<
+    'settings:cancel-claude-login',
+    readonly [],
+    StoreResult<'cancelClaudeLogin'>
+  >('settings:cancel-claude-login'),
+  cancelCodexLogin: defineApplicationCommand<
+    'settings:cancel-codex-login',
+    readonly [],
+    StoreResult<'cancelCodexLogin'>
+  >('settings:cancel-codex-login'),
+  cancelIsolatedClaudeLogin: defineApplicationCommand<
+    'settings:cancel-isolated-claude-login',
+    readonly [],
+    StoreResult<'cancelClaudeIsolatedLogin'>
+  >('settings:cancel-isolated-claude-login'),
+  checkEnvironment: defineApplicationCommand<
+    'settings:check-environment',
+    readonly [],
+    StoreResult<'checkEnvironment'>
+  >('settings:check-environment'),
+  detectClaude: defineApplicationCommand<
+    'settings:detect-claude',
+    readonly [],
+    StoreResult<'detectClaude'>
+  >('settings:detect-claude'),
+  detectCodeBuddy: defineApplicationCommand<
+    'settings:detect-codebuddy',
+    readonly [],
+    StoreResult<'detectCodeBuddy'>
+  >('settings:detect-codebuddy'),
+  detectCodex: defineApplicationCommand<
+    'settings:detect-codex',
+    readonly [],
+    StoreResult<'detectCodex'>
+  >('settings:detect-codex'),
+  detectOpencode: defineApplicationCommand<
+    'settings:detect-opencode',
+    readonly [],
+    StoreResult<'detectOpencode'>
+  >('settings:detect-opencode'),
+  getGitHubTokenStatus: defineApplicationCommand<
+    'settings:get-github-token-status',
+    readonly [],
+    StoreResult<'getGitHubTokenStatus'>
+  >('settings:get-github-token-status'),
+  getConnectorDetail: defineApplicationCommand<
+    'settings:get-connector-detail',
+    readonly [id: string],
+    StoreResult<'getConnectorDetail'>
+  >('settings:get-connector-detail'),
+  getClassification: defineApplicationCommand<
+    'settings:get-classification',
+    readonly [],
+    ClassificationSnapshot
+  >('settings:get-classification'),
+  getPackageMirror: defineApplicationCommand<
+    'settings:get-package-mirror',
+    readonly [],
+    StoreResult<'getPackageMirror'>
+  >('settings:get-package-mirror'),
+  reviewNotebookPrivateDestination: defineApplicationCommand<
+    'settings:review-notebook-private-destination',
+    readonly [request: PrivateDestinationRequest],
+    StoreResult<'reviewNotebookPrivateDestination'>
+  >('settings:review-notebook-private-destination'),
+  getSourceLinkMetadata: defineApplicationCommand<
+    'settings:get-source-link-metadata',
+    readonly [url: string],
+    SourceLinkMetadata
+  >('settings:get-source-link-metadata'),
+  getSourceLinkImage: defineApplicationCommand<
+    'settings:get-source-link-image',
+    readonly [url: string],
+    string | undefined
+  >('settings:get-source-link-image'),
+  getNotebookNetworkStatus: defineApplicationCommand<
+    'settings:get-notebook-network-status',
+    readonly [],
+    StoreResult<'getNotebookNetworkStatus'>
+  >('settings:get-notebook-network-status'),
+  getWsl2BashPreviewStatus: defineApplicationCommand<
+    'settings:get-wsl2-bash-preview-status',
+    readonly [],
+    StoreResult<'getWsl2BashPreviewStatus'>
+  >('settings:get-wsl2-bash-preview-status'),
+  getWslSetupStatus: defineApplicationCommand<
+    'settings:get-wsl-setup-status',
+    readonly [],
+    StoreResult<'getWslSetupStatus'>
+  >('settings:get-wsl-setup-status'),
+  getLocalShellRuntimePreference: defineApplicationCommand<
+    'settings:get-local-shell-runtime-preference',
+    readonly [],
+    StoreResult<'getLocalShellRuntimePreference'>
+  >('settings:get-local-shell-runtime-preference'),
+  getPreflight: defineApplicationCommand<
+    'settings:get-preflight',
+    readonly [],
+    StoreResult<'getPreflight'>
+  >('settings:get-preflight'),
+  getSettings: defineApplicationCommand<
+    'settings:get-settings',
+    readonly [],
+    StoreResult<'getSettingsView'>
+  >(
+    'settings:get-settings',
+    defineApplicationCommandContract(z.tuple([]), { parse: parseSettingsSnapshot })
+  ),
+  getSkillDetail: defineApplicationCommand<
+    'settings:get-skill-detail',
+    readonly [id: string],
+    StoreResult<'getSkillDetail'>
+  >('settings:get-skill-detail'),
+  installClaude: defineApplicationCommand<
+    'settings:install-claude',
+    readonly [request: InstallClaudeRequest],
+    StoreResult<'installClaude'>
+  >('settings:install-claude'),
+  installCodeBuddy: defineApplicationCommand<
+    'settings:install-codebuddy',
+    readonly [request: InstallCodeBuddyRequest],
+    StoreResult<'installCodeBuddy'>
+  >('settings:install-codebuddy'),
+  installPi: defineApplicationCommand<
+    'settings:install-pi',
+    readonly [request: InstallPiRequest],
+    StoreResult<'installPi'>
+  >('settings:install-pi'),
+  installCodex: defineApplicationCommand<
+    'settings:install-codex',
+    readonly [request: InstallCodexRequest],
+    StoreResult<'installCodex'>
+  >('settings:install-codex'),
+  installOpencode: defineApplicationCommand<
+    'settings:install-opencode',
+    readonly [request: InstallOpencodeRequest],
+    StoreResult<'installOpencode'>
+  >('settings:install-opencode'),
+  cancelNotebookNetworkSetup: defineApplicationCommand<
+    'settings:cancel-notebook-network-setup',
+    [],
+    boolean
+  >('settings:cancel-notebook-network-setup'),
+  installNotebookNetwork: defineApplicationCommand<
+    'settings:install-notebook-network',
+    readonly [],
+    StoreResult<'installNotebookNetwork'>
+  >('settings:install-notebook-network'),
+  removeNotebookNetwork: defineApplicationCommand<
+    'settings:remove-notebook-network',
+    readonly [],
+    StoreResult<'removeNotebookNetwork'>
+  >('settings:remove-notebook-network'),
+  isEncryptionAvailable: defineApplicationCommand<
+    'settings:encryption-available',
+    readonly [],
+    StoreResult<'isEncryptionAvailable'>
+  >('settings:encryption-available'),
+  isNpmAvailable: defineApplicationCommand<
+    'settings:npm-available',
+    readonly [],
+    StoreResult<'isNpmAvailable'>
+  >('settings:npm-available'),
+  listAppIcons: defineApplicationCommand<'settings:list-app-icons', readonly [], AppIconPreview[]>(
+    'settings:list-app-icons'
+  ),
+  listConnectors: defineApplicationCommand<
+    'settings:list-connectors',
+    readonly [],
+    StoreResult<'listConnectors'>
+  >('settings:list-connectors'),
+  listSkills: defineApplicationCommand<
+    'settings:list-skills',
+    readonly [],
+    StoreResult<'listSkills'>
+  >('settings:list-skills'),
+  markOnboardingComplete: defineApplicationCommand<
+    'settings:mark-onboarding-complete',
+    readonly [],
+    StoreResult<'markOnboardingComplete'>
+  >('settings:mark-onboarding-complete'),
+  previewAgentHomeSkill: defineApplicationCommand<
+    'settings:preview-agent-home-skill',
+    readonly [request: PreviewAgentHomeSkillRequest],
+    StoreResult<'previewAgentHomeSkill'>
+  >('settings:preview-agent-home-skill'),
+  previewGitHubSkill: defineApplicationCommand<
+    'settings:preview-github-skill',
+    readonly [request: PreviewGitHubSkillRequest],
+    StoreResult<'previewGitHubSkill'>
+  >('settings:preview-github-skill'),
+  previewSkillZip: defineApplicationCommand<
+    'settings:preview-skill-zip',
+    readonly [request: PreviewSkillZipRequest],
+    StoreResult<'previewSkillZip'>
+  >('settings:preview-skill-zip'),
+  probeWslSetup: defineApplicationCommand<
+    'settings:probe-wsl-setup',
+    readonly [],
+    StoreResult<'probeWslSetup'>
+  >('settings:probe-wsl-setup'),
+  installWslPlatform: defineApplicationCommand<
+    'settings:install-wsl-platform',
+    readonly [],
+    StoreResult<'installWslPlatform'>
+  >('settings:install-wsl-platform'),
+  installMissingWslDependencies: defineApplicationCommand<
+    'settings:install-missing-wsl-dependencies',
+    readonly [request: InstallMissingWslDependenciesRequest],
+    StoreResult<'installMissingWslDependencies'>
+  >('settings:install-missing-wsl-dependencies'),
+  createWslSupportHandoff: defineApplicationCommand<
+    'settings:create-wsl-support-handoff',
+    readonly [],
+    StoreResult<'createWslSupportHandoff'>
+  >('settings:create-wsl-support-handoff'),
+  installRecommendedWslDistro: defineApplicationCommand<
+    'settings:install-recommended-wsl-distro',
+    readonly [request: InstallWslDistroRequest],
+    StoreResult<'installRecommendedWslDistro'>
+  >('settings:install-recommended-wsl-distro'),
+  openWslTerminal: defineApplicationCommand<
+    'settings:open-wsl-terminal',
+    readonly [request: OpenWslTerminalRequest],
+    StoreResult<'openWslTerminal'>
+  >('settings:open-wsl-terminal'),
+  refreshProviderModels: defineApplicationCommand<
+    'settings:refresh-provider-models',
+    readonly [request: RefreshProviderModelsRequest],
+    StoreResult<'refreshProviderModels'>
+  >('settings:refresh-provider-models'),
+  listSkillSources: defineApplicationCommand<
+    'settings:list-skill-sources',
+    readonly [],
+    SavedSkillSource[]
+  >('settings:list-skill-sources'),
+  addSkillSource: defineApplicationCommand<
+    'settings:add-skill-source',
+    readonly [request: AddSkillSourceRequest],
+    SavedSkillSource[]
+  >('settings:add-skill-source'),
+  removeSkillSource: defineApplicationCommand<
+    'settings:remove-skill-source',
+    readonly [request: RemoveSkillSourceRequest],
+    SavedSkillSource[]
+  >('settings:remove-skill-source'),
+  scanRepoSkills: defineApplicationCommand<
+    'settings:scan-repo-skills',
+    readonly [request: ScanRepoRequest],
+    StoreResult<'scanRepoSkills'>
+  >('settings:scan-repo-skills'),
+  saveGitHubToken: defineApplicationCommand<
+    'settings:save-github-token',
+    readonly [request: SaveGitHubTokenRequest],
+    StoreResult<'saveGitHubToken'>
+  >('settings:save-github-token'),
+  removeGitHubToken: defineApplicationCommand<
+    'settings:remove-github-token',
+    readonly [],
+    StoreResult<'removeGitHubToken'>
+  >('settings:remove-github-token'),
+  setAppIconVariant: defineApplicationCommand<
+    'settings:set-app-icon-variant',
+    readonly [request: SetAppIconVariantRequest],
+    AppearanceResult
+  >('settings:set-app-icon-variant'),
+  setClosePreference: defineApplicationCommand<
+    'settings:set-close-preference',
+    readonly [request: SetClosePreferenceRequest],
+    StoreResult<'setClosePreference'>
+  >('settings:set-close-preference'),
+  setDefaultPermissionProfile: defineApplicationCommand<
+    'settings:set-default-permission-profile',
+    readonly [request: SetDefaultPermissionProfileRequest],
+    StoreResult<'setDefaultPermissionProfile'>
+  >('settings:set-default-permission-profile'),
+  setNotebookFolderRestrictionEnabled: defineApplicationCommand<
+    'settings:set-notebook-folder-restriction-enabled',
+    readonly [request: { enabled: boolean }],
+    StoreResult<'setNotebookFolderRestrictionEnabled'>
+  >('settings:set-notebook-folder-restriction-enabled'),
+  setNotificationsEnabled: defineApplicationCommand<
+    'settings:set-notifications-enabled',
+    readonly [request: SetNotificationsEnabledRequest],
+    StoreResult<'setNotificationsEnabled'>
+  >('settings:set-notifications-enabled'),
+  setShowNotificationContent: defineApplicationCommand<
+    'settings:set-show-notification-content',
+    readonly [request: SetShowNotificationContentRequest],
+    StoreResult<'setShowNotificationContent'>
+  >('settings:set-show-notification-content'),
+  setPackageMirror: defineApplicationCommand<
+    'settings:set-package-mirror',
+    readonly [request: SetPackageMirrorRequest],
+    StoreResult<'setPackageMirror'>
+  >('settings:set-package-mirror'),
+  setNetworkProxy: defineApplicationCommand<
+    'settings:set-network-proxy',
+    readonly [request: SetNetworkProxyRequest],
+    StoreResult<'setNetworkProxy'>
+  >('settings:set-network-proxy'),
+  setNotebookNetwork: defineApplicationCommand<
+    'settings:set-notebook-network',
+    readonly [request: SetNotebookNetworkRequest],
+    StoreResult<'setNotebookNetwork'>
+  >('settings:set-notebook-network'),
+  setProjectFilesFilter: defineApplicationCommand<
+    'settings:set-project-files-filter',
+    readonly [request: SetProjectFilesFilterRequest],
+    StoreResult<'setProjectFilesFilter'>
+  >('settings:set-project-files-filter'),
+  setReviewerModel: defineApplicationCommand<
+    'settings:set-reviewer-model',
+    readonly [request: SetReviewerModelRequest],
+    StoreResult<'setReviewerModel'>
+  >('settings:set-reviewer-model'),
+  setPromptOptimizationModel: defineApplicationCommand<
+    'settings:set-prompt-optimization-model',
+    readonly [request: SetPromptOptimizationModelRequest],
+    StoreResult<'setPromptOptimizationModel'>
+  >('settings:set-prompt-optimization-model'),
+  selectWslProfile: defineApplicationCommand<
+    'settings:select-wsl-profile',
+    readonly [request: SelectWslProfileRequest],
+    StoreResult<'selectWslProfile'>
+  >('settings:select-wsl-profile'),
+  switchLocalShellToPowerShell: defineApplicationCommand<
+    'settings:switch-local-shell-to-powershell',
+    readonly [],
+    SwitchToPowerShellResult
+  >('settings:switch-local-shell-to-powershell'),
+  useWsl2Bash: defineApplicationCommand<'settings:use-wsl2-bash', readonly [], UseWsl2BashResult>(
+    'settings:use-wsl2-bash'
+  ),
+  setSessionDetailsModel: defineApplicationCommand<
+    'settings:set-session-details-model',
+    readonly [request: SetSessionDetailsModelRequest],
+    StoreResult<'setSessionDetailsModel'>
+  >('settings:set-session-details-model'),
+  setSubagentModel: defineApplicationCommand<
+    'settings:set-subagent-model',
+    readonly [request: SetSubagentModelRequest],
+    StoreResult<'setSubagentModel'>
+  >('settings:set-subagent-model'),
+  setVisionModel: defineApplicationCommand<
+    'settings:set-vision-model',
+    readonly [request: SetVisionModelRequest],
+    StoreResult<'setVisionModel'>
+  >('settings:set-vision-model'),
+  updateClassification: defineApplicationCommand<
+    'settings:update-classification',
+    readonly [request: ClassificationMutation],
+    ClassificationMutationResult
+  >('settings:update-classification'),
+  testClassification: defineApplicationCommand<
+    'settings:test-classification',
+    readonly [request: ClassificationProbe],
+    ClassificationProbeResult
+  >('settings:test-classification'),
+  saveValidatedProvider: defineApplicationCommand<
+    'settings:save-validated-provider',
+    readonly [request: UpsertProviderRequest],
+    SaveValidatedProviderResult
+  >('settings:save-validated-provider'),
+  validateProvider: defineApplicationCommand<
+    'settings:validate-provider',
+    readonly [request: ValidateProviderRequest],
+    StoreResult<'validateProvider'>
+  >('settings:validate-provider')
+})
+
+const settingsCoreApplicationCommandGroup = defineApplicationCommandGroup('settings-core', [
+  settingsCoreApplicationCommands.cancelClaudeLogin,
+  settingsCoreApplicationCommands.cancelCodexLogin,
+  settingsCoreApplicationCommands.cancelIsolatedClaudeLogin,
+  settingsCoreApplicationCommands.checkEnvironment,
+  settingsCoreApplicationCommands.detectClaude,
+  settingsCoreApplicationCommands.detectCodeBuddy,
+  settingsCoreApplicationCommands.detectCodex,
+  settingsCoreApplicationCommands.detectOpencode,
+  settingsCoreApplicationCommands.getConnectorDetail,
+  settingsCoreApplicationCommands.getClassification,
+  settingsCoreApplicationCommands.getGitHubTokenStatus,
+  settingsCoreApplicationCommands.getPackageMirror,
+  settingsCoreApplicationCommands.reviewNotebookPrivateDestination,
+  settingsCoreApplicationCommands.getSourceLinkMetadata,
+  settingsCoreApplicationCommands.getSourceLinkImage,
+  settingsCoreApplicationCommands.getNotebookNetworkStatus,
+  settingsCoreApplicationCommands.getLocalShellRuntimePreference,
+  settingsCoreApplicationCommands.getWsl2BashPreviewStatus,
+  settingsCoreApplicationCommands.getWslSetupStatus,
+  settingsCoreApplicationCommands.getPreflight,
+  settingsCoreApplicationCommands.getSettings,
+  settingsCoreApplicationCommands.resolveSkillDocument,
+  settingsCoreApplicationCommands.listAgentHomeSkills,
+  settingsCoreApplicationCommands.previewCustomServerTemplateExport,
+
+  settingsCoreApplicationCommands.getSkillDetail,
+  settingsCoreApplicationCommands.installClaude,
+  settingsCoreApplicationCommands.installCodeBuddy,
+  settingsCoreApplicationCommands.installPi,
+  settingsCoreApplicationCommands.installCodex,
+  settingsCoreApplicationCommands.installOpencode,
+  settingsCoreApplicationCommands.installNotebookNetwork,
+  settingsCoreApplicationCommands.cancelNotebookNetworkSetup,
+  settingsCoreApplicationCommands.removeNotebookNetwork,
+  settingsCoreApplicationCommands.isEncryptionAvailable,
+  settingsCoreApplicationCommands.isNpmAvailable,
+  settingsCoreApplicationCommands.listAppIcons,
+  settingsCoreApplicationCommands.listConnectors,
+  settingsCoreApplicationCommands.listSkills,
+  settingsCoreApplicationCommands.listSkillMarketplace,
+  settingsCoreApplicationCommands.getSkillMarketplaceBatch,
+  settingsCoreApplicationCommands.stopSkillMarketplaceBatch,
+  settingsCoreApplicationCommands.getSkillMarketplaceDetail,
+  settingsCoreApplicationCommands.markOnboardingComplete,
+  settingsCoreApplicationCommands.previewAgentHomeSkill,
+  settingsCoreApplicationCommands.previewGitHubSkill,
+  settingsCoreApplicationCommands.previewSkillZip,
+  settingsCoreApplicationCommands.probeWslSetup,
+  settingsCoreApplicationCommands.installWslPlatform,
+  settingsCoreApplicationCommands.installMissingWslDependencies,
+  settingsCoreApplicationCommands.createWslSupportHandoff,
+  settingsCoreApplicationCommands.installRecommendedWslDistro,
+  settingsCoreApplicationCommands.openWslTerminal,
+  settingsCoreApplicationCommands.refreshProviderModels,
+  settingsCoreApplicationCommands.listSkillSources,
+  settingsCoreApplicationCommands.addSkillSource,
+  settingsCoreApplicationCommands.removeSkillSource,
+  settingsCoreApplicationCommands.scanRepoSkills,
+  settingsCoreApplicationCommands.saveGitHubToken,
+  settingsCoreApplicationCommands.removeGitHubToken,
+  settingsCoreApplicationCommands.setAppIconVariant,
+  settingsCoreApplicationCommands.setClosePreference,
+  settingsCoreApplicationCommands.setDefaultPermissionProfile,
+  settingsCoreApplicationCommands.setNotebookFolderRestrictionEnabled,
+  settingsCoreApplicationCommands.setNotificationsEnabled,
+  settingsCoreApplicationCommands.setShowNotificationContent,
+  settingsCoreApplicationCommands.setPackageMirror,
+  settingsCoreApplicationCommands.setNetworkProxy,
+  settingsCoreApplicationCommands.setNotebookNetwork,
+  settingsCoreApplicationCommands.setProjectFilesFilter,
+  settingsCoreApplicationCommands.setReviewerModel,
+  settingsCoreApplicationCommands.setPromptOptimizationModel,
+  settingsCoreApplicationCommands.selectWslProfile,
+  settingsCoreApplicationCommands.switchLocalShellToPowerShell,
+  settingsCoreApplicationCommands.useWsl2Bash,
+  settingsCoreApplicationCommands.setSessionDetailsModel,
+  settingsCoreApplicationCommands.setSubagentModel,
+  settingsCoreApplicationCommands.setVisionModel,
+  settingsCoreApplicationCommands.updateClassification,
+  settingsCoreApplicationCommands.testClassification,
+  settingsCoreApplicationCommands.saveValidatedProvider,
+  settingsCoreApplicationCommands.validateProvider
+] as const)
+
+type CoreSettingsApplicationCommandDependencies = Readonly<{
+  service: CoreSettingsCommandStore
+  runtime: Pick<RuntimeSettingsWorkflows, 'refreshProviderModels' | 'saveValidatedProvider'>
+  appearance: Pick<AppearanceSettingsWorkflows, 'setAppIconVariant'>
+  localShell: Pick<LocalShellSettingsWorkflows, 'switchToPowerShell' | 'useWsl2Bash'>
+  snapshotCommits: SettingsSnapshotCommitOwner
+  emitInstallEvent: (event: ClaudeInstallEvent) => void
+  listAppIconPreviews?: () => AppIconPreview[]
+}>
+
+const requireLocalCaller = (context: CallerContext, channel: string): void => {
+  if (context.location !== 'local') {
+    throw new Error(`Channel only available from the local app: ${channel}`)
+  }
+}
+
+const registerCoreSettingsApplicationCommands = (
+  registrar: ApplicationCommandRegistrar,
+  dependencies: CoreSettingsApplicationCommandDependencies
+): ApplicationCommandInstallation => {
+  const scope = registrar.createScope()
+
+  try {
+    scope.registerGroup(settingsCoreApplicationCommandGroup, {
+      'settings:resolve-skill-document': ({ args, callerContext }) => {
+        requireDesktopCaller(callerContext)
+        return dependencies.service.resolveSkillDocument(args[0])
+      },
+      'settings:list-agent-home-skills': ({ callerContext }) => {
+        requireDesktopCaller(callerContext)
+        return dependencies.service.listAgentHomeSkills()
+      },
+      'settings:preview-custom-server-template-export': ({ args, callerContext }) => {
+        requireDesktopCaller(callerContext)
+        return dependencies.service.previewCustomServerTemplateExport(args[0])
+      },
+
+      'settings:cancel-claude-login': ({ callerContext }) => {
+        requireLocalCaller(callerContext, 'settings:cancel-claude-login')
+        return dependencies.service.cancelClaudeLogin()
+      },
+      'settings:cancel-codex-login': ({ callerContext }) => {
+        requireLocalCaller(callerContext, 'settings:cancel-codex-login')
+        return dependencies.service.cancelCodexLogin()
+      },
+      'settings:cancel-isolated-claude-login': ({ callerContext }) => {
+        requireLocalCaller(callerContext, 'settings:cancel-isolated-claude-login')
+        return dependencies.service.cancelClaudeIsolatedLogin()
+      },
+      'settings:check-environment': () =>
+        dependencies.snapshotCommits.projectAfter(dependencies.service.checkEnvironment()),
+      'settings:detect-claude': () =>
+        dependencies.snapshotCommits.projectAfter(dependencies.service.detectClaude()),
+      'settings:detect-codebuddy': () =>
+        dependencies.snapshotCommits.currentSnapshotAfter(dependencies.service.detectCodeBuddy()),
+      'settings:detect-codex': () =>
+        dependencies.snapshotCommits.currentSnapshotAfter(dependencies.service.detectCodex()),
+      'settings:detect-opencode': () =>
+        dependencies.snapshotCommits.currentSnapshotAfter(dependencies.service.detectOpencode()),
+      'settings:get-connector-detail': ({ args }) =>
+        dependencies.service.getConnectorDetail(args[0]),
+      'settings:get-classification': ({ callerContext }) => {
+        requireLocalCaller(callerContext, 'settings:get-classification')
+        return dependencies.service.classification.snapshot()
+      },
+      'settings:get-github-token-status': ({ callerContext }) => {
+        requireLocalCaller(callerContext, 'settings:get-github-token-status')
+        return dependencies.service.getGitHubTokenStatus()
+      },
+      'settings:get-package-mirror': () => dependencies.service.getPackageMirror(),
+      'settings:review-notebook-private-destination': ({ args, callerContext }) => {
+        requireLocalCaller(callerContext, 'settings:review-notebook-private-destination')
+        return dependencies.service.reviewNotebookPrivateDestination(args[0])
+      },
+      'settings:get-source-link-metadata': ({ args }) => readSourceLinkMetadata(args[0]),
+      'settings:get-source-link-image': ({ args }) => readSourceLinkImage(args[0]),
+      'settings:get-notebook-network-status': () => dependencies.service.getNotebookNetworkStatus(),
+      'settings:get-local-shell-runtime-preference': ({ callerContext }) => {
+        requireLocalCaller(callerContext, 'settings:get-local-shell-runtime-preference')
+        return dependencies.service.getLocalShellRuntimePreference()
+      },
+      'settings:get-wsl2-bash-preview-status': ({ callerContext }) => {
+        requireLocalCaller(callerContext, 'settings:get-wsl2-bash-preview-status')
+        return dependencies.service.getWsl2BashPreviewStatus()
+      },
+      'settings:get-wsl-setup-status': ({ callerContext }) => {
+        requireLocalCaller(callerContext, 'settings:get-wsl-setup-status')
+        return dependencies.service.getWslSetupStatus()
+      },
+      'settings:get-preflight': () => dependencies.service.getPreflight(),
+      'settings:get-settings': () => dependencies.snapshotCommits.readCurrentSnapshot(),
+      'settings:get-skill-detail': ({ args }) => dependencies.service.getSkillDetail(args[0]),
+      'settings:install-claude': ({ args, callerContext }) => {
+        requireLocalCaller(callerContext, 'settings:install-claude')
+        return dependencies.snapshotCommits.projectAfter(
+          dependencies.service.installClaude(args[0], dependencies.emitInstallEvent)
+        )
+      },
+      'settings:install-codebuddy': ({ args, callerContext }) => {
+        requireLocalCaller(callerContext, 'settings:install-codebuddy')
+        return dependencies.snapshotCommits.projectAfter(
+          dependencies.service.installCodeBuddy(args[0], dependencies.emitInstallEvent)
+        )
+      },
+      'settings:install-pi': ({ args, callerContext }) => {
+        requireLocalCaller(callerContext, 'settings:install-pi')
+        return dependencies.snapshotCommits.projectAfter(
+          dependencies.service.installPi(args[0], dependencies.emitInstallEvent)
+        )
+      },
+      'settings:install-codex': ({ args, callerContext }) => {
+        requireLocalCaller(callerContext, 'settings:install-codex')
+        return dependencies.snapshotCommits.projectAfter(
+          dependencies.service.installCodex(args[0], dependencies.emitInstallEvent)
+        )
+      },
+      'settings:install-opencode': ({ args, callerContext }) => {
+        requireLocalCaller(callerContext, 'settings:install-opencode')
+        return dependencies.snapshotCommits.projectAfter(
+          dependencies.service.installOpencode(args[0], dependencies.emitInstallEvent)
+        )
+      },
+      'settings:cancel-notebook-network-setup': ({ callerContext }) => {
+        requireLocalCaller(callerContext, 'settings:cancel-notebook-network-setup')
+        return dependencies.service.cancelNotebookNetworkSetup()
+      },
+      'settings:install-notebook-network': ({ callerContext }) => {
+        requireLocalCaller(callerContext, 'settings:install-notebook-network')
+        return dependencies.service.installNotebookNetwork()
+      },
+      'settings:remove-notebook-network': ({ callerContext }) => {
+        requireLocalCaller(callerContext, 'settings:remove-notebook-network')
+        return dependencies.service.removeNotebookNetwork()
+      },
+      'settings:encryption-available': () => dependencies.service.isEncryptionAvailable(),
+      'settings:npm-available': () => dependencies.service.isNpmAvailable(),
+      'settings:list-app-icons': () => dependencies.listAppIconPreviews?.() ?? [],
+      'settings:list-connectors': () => dependencies.service.listConnectors(),
+      'settings:list-skills': () => dependencies.service.listSkills(),
+      'settings:list-skill-marketplace': ({ args }) =>
+        dependencies.service.listSkillMarketplace(args[0]),
+      'settings:get-skill-marketplace-batch': () => dependencies.service.getSkillMarketplaceBatch(),
+      'settings:stop-skill-marketplace-batch': ({ args }) =>
+        dependencies.service.stopSkillMarketplaceBatch(args[0]),
+      'settings:get-skill-marketplace-detail': ({ args }) =>
+        dependencies.service.getSkillMarketplaceDetail(args[0]),
+      'settings:mark-onboarding-complete': () =>
+        dependencies.snapshotCommits.currentSnapshotAfter(
+          dependencies.service.markOnboardingComplete()
+        ),
+      'settings:preview-agent-home-skill': ({ args }) =>
+        dependencies.service.previewAgentHomeSkill(args[0]),
+      'settings:preview-github-skill': ({ args }) =>
+        dependencies.service.previewGitHubSkill(args[0]),
+      'settings:preview-skill-zip': ({ args }) => dependencies.service.previewSkillZip(args[0]),
+      'settings:probe-wsl-setup': ({ callerContext }) => {
+        requireLocalCaller(callerContext, 'settings:probe-wsl-setup')
+        return dependencies.service.probeWslSetup()
+      },
+      'settings:install-wsl-platform': ({ callerContext }) => {
+        requireLocalCaller(callerContext, 'settings:install-wsl-platform')
+        return dependencies.service.installWslPlatform()
+      },
+      'settings:install-missing-wsl-dependencies': ({ args, callerContext }) => {
+        requireLocalCaller(callerContext, 'settings:install-missing-wsl-dependencies')
+        return dependencies.service.installMissingWslDependencies(args[0])
+      },
+      'settings:create-wsl-support-handoff': ({ callerContext }) => {
+        requireLocalCaller(callerContext, 'settings:create-wsl-support-handoff')
+        return dependencies.service.createWslSupportHandoff()
+      },
+      'settings:install-recommended-wsl-distro': ({ args, callerContext }) => {
+        requireLocalCaller(callerContext, 'settings:install-recommended-wsl-distro')
+        return dependencies.service.installRecommendedWslDistro(args[0])
+      },
+      'settings:open-wsl-terminal': ({ args, callerContext }) => {
+        requireLocalCaller(callerContext, 'settings:open-wsl-terminal')
+        return dependencies.service.openWslTerminal(args[0])
+      },
+      'settings:refresh-provider-models': ({ args }) =>
+        dependencies.snapshotCommits.projectAfter(
+          dependencies.runtime.refreshProviderModels(args[0])
+        ),
+      'settings:list-skill-sources': () => dependencies.service.listSkillSources(),
+      'settings:add-skill-source': ({ args }) => dependencies.service.addSkillSource(args[0]),
+      'settings:remove-skill-source': ({ args }) => dependencies.service.removeSkillSource(args[0]),
+      'settings:scan-repo-skills': ({ args }) => dependencies.service.scanRepoSkills(args[0]),
+      'settings:save-github-token': ({ args, callerContext }) => {
+        requireLocalCaller(callerContext, 'settings:save-github-token')
+        return dependencies.service.saveGitHubToken(readGitHubToken(args[0]))
+      },
+      'settings:remove-github-token': ({ callerContext }) => {
+        requireLocalCaller(callerContext, 'settings:remove-github-token')
+        return dependencies.service.removeGitHubToken()
+      },
+      'settings:set-app-icon-variant': ({ args, callerContext }) => {
+        requireLocalCaller(callerContext, 'settings:set-app-icon-variant')
+        return dependencies.snapshotCommits.currentSnapshotAfter(
+          dependencies.appearance.setAppIconVariant(readAppIconVariant(args[0]))
+        )
+      },
+      'settings:set-close-preference': ({ args, callerContext }) => {
+        requireLocalCaller(callerContext, 'settings:set-close-preference')
+        return dependencies.snapshotCommits.currentSnapshotAfter(
+          dependencies.service.setClosePreference(readClosePreference(args[0]))
+        )
+      },
+      'settings:set-default-permission-profile': ({ args, callerContext }) => {
+        requireLocalCaller(callerContext, 'settings:set-default-permission-profile')
+        return dependencies.snapshotCommits.currentSnapshotAfter(
+          dependencies.service.setDefaultPermissionProfile(readDefaultPermissionProfile(args[0]))
+        )
+      },
+      'settings:set-notebook-folder-restriction-enabled': ({ args, callerContext }) => {
+        requireLocalCaller(callerContext, 'settings:set-notebook-folder-restriction-enabled')
+        return dependencies.snapshotCommits.currentSnapshotAfter(
+          dependencies.service.setNotebookFolderRestrictionEnabled(
+            readNotebookFolderRestrictionEnabled(args[0])
+          )
+        )
+      },
+      'settings:set-notifications-enabled': ({ args, callerContext }) => {
+        requireLocalCaller(callerContext, 'settings:set-notifications-enabled')
+        return dependencies.snapshotCommits.currentSnapshotAfter(
+          dependencies.service.setNotificationsEnabled(readNotificationsEnabled(args[0]))
+        )
+      },
+      'settings:set-show-notification-content': ({ args, callerContext }) => {
+        requireLocalCaller(callerContext, 'settings:set-show-notification-content')
+        return dependencies.snapshotCommits.currentSnapshotAfter(
+          dependencies.service.setShowNotificationContent(readShowNotificationContent(args[0]))
+        )
+      },
+      'settings:set-package-mirror': ({ args, callerContext }) => {
+        requireLocalCaller(callerContext, 'settings:set-package-mirror')
+        return dependencies.snapshotCommits.projectAfter(
+          dependencies.service.setPackageMirror(args[0])
+        )
+      },
+      'settings:set-network-proxy': ({ args, callerContext }) => {
+        requireLocalCaller(callerContext, 'settings:set-network-proxy')
+        return dependencies.snapshotCommits.projectAfter(
+          dependencies.service.setNetworkProxy(args[0])
+        )
+      },
+      'settings:set-notebook-network': ({ args, callerContext }) => {
+        requireLocalCaller(callerContext, 'settings:set-notebook-network')
+        return dependencies.snapshotCommits.projectAfter(
+          dependencies.service.setNotebookNetwork(args[0])
+        )
+      },
+      'settings:set-project-files-filter': ({ args, callerContext }) => {
+        requireLocalCaller(callerContext, 'settings:set-project-files-filter')
+        return dependencies.snapshotCommits.currentSnapshotAfter(
+          dependencies.service.setProjectFilesFilter(readProjectFilesFilter(args[0]))
+        )
+      },
+      'settings:set-reviewer-model': ({ args }) =>
+        dependencies.snapshotCommits.currentSnapshotAfter(
+          dependencies.service.setReviewerModel(readReviewerModel(args[0]))
+        ),
+      'settings:set-prompt-optimization-model': ({ args }) =>
+        dependencies.snapshotCommits.currentSnapshotAfter(
+          dependencies.service.setPromptOptimizationModel(readSubagentModel(args[0]))
+        ),
+      'settings:select-wsl-profile': ({ args, callerContext }) => {
+        requireLocalCaller(callerContext, 'settings:select-wsl-profile')
+        return dependencies.service.selectWslProfile(args[0])
+      },
+      'settings:switch-local-shell-to-powershell': ({ callerContext }) => {
+        requireLocalCaller(callerContext, 'settings:switch-local-shell-to-powershell')
+        return dependencies.localShell.switchToPowerShell()
+      },
+      'settings:use-wsl2-bash': ({ callerContext }) => {
+        requireLocalCaller(callerContext, 'settings:use-wsl2-bash')
+        return dependencies.localShell.useWsl2Bash()
+      },
+      'settings:set-session-details-model': ({ args }) =>
+        dependencies.snapshotCommits.currentSnapshotAfter(
+          dependencies.service.setSessionDetailsModel(readSessionDetailsModel(args[0]))
+        ),
+      'settings:set-subagent-model': ({ args }) =>
+        dependencies.snapshotCommits.currentSnapshotAfter(
+          dependencies.service.setSubagentModel(readSubagentModel(args[0]))
+        ),
+      'settings:set-vision-model': ({ args }) =>
+        dependencies.snapshotCommits.currentSnapshotAfter(
+          dependencies.service.setVisionModel(readVisionModel(args[0]))
+        ),
+      'settings:update-classification': ({ args, callerContext }) => {
+        requireLocalCaller(callerContext, 'settings:update-classification')
+        return dependencies.service.classification.mutate(args[0])
+      },
+      'settings:test-classification': ({ args, callerContext }) => {
+        requireLocalCaller(callerContext, 'settings:test-classification')
+        return dependencies.service.classification.probe(args[0])
+      },
+      'settings:save-validated-provider': ({ args }) =>
+        dependencies.snapshotCommits.projectAfter(
+          dependencies.runtime.saveValidatedProvider(args[0])
+        ),
+      'settings:validate-provider': ({ args }) =>
+        dependencies.snapshotCommits.projectAfter(dependencies.service.validateProvider(args[0]))
+    })
+    return scope.complete()
+  } catch (error) {
+    scope.rollback()
+    throw error
+  }
+}
+
+export {
+  registerCoreSettingsApplicationCommands,
+  settingsCoreApplicationCommandGroup,
+  settingsCoreApplicationCommands
+}
+export type { CoreSettingsApplicationCommandDependencies, CoreSettingsCommandStore }

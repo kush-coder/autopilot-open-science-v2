@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="application-name" content="Open-Science Remote" />
+    <meta name="apple-mobile-web-app-title" content="Open-Science Remote" />
+    <title>Open-Science Remote</title>
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; worker-src 'self' blob:; style-src 'self' 'unsafe-inline'; img-src 'self' data: https: blob:; font-src 'self' data:; media-src 'self' https: blob:; frame-src 'self'; connect-src 'self' ws: wss:"
+    />
+    <style>
+      /* Match the renderer startup surface before its stylesheet has loaded. */
+      :root {
+        --connection-background: #fafaf8;
+        --connection-foreground: #202321;
+        --connection-muted: #646762;
+      }
+      .dark {
+        --connection-background: #1a1a18;
+        --connection-foreground: #e8e6df;
+        --connection-muted: #a8a49a;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --connection-background: #1a1a18;
+          --connection-foreground: #e8e6df;
+          --connection-muted: #a8a49a;
+        }
+      }
+      body {
+        margin: 0;
+      }
+      .open-science-connection-panel {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 3.5rem;
+        text-align: center;
+        max-width: min(420px, calc(100vw - 3rem));
+      }
+      #open-science-connection-logo:empty + p {
+        visibility: hidden;
+      }
+      #open-science-connection-logo > div {
+        position: relative;
+        width: 14rem;
+        height: 14rem;
+        flex-shrink: 0;
+      }
+      #open-science-connection-logo canvas {
+        pointer-events: none;
+        position: absolute;
+        left: 50%;
+        top: 50%;
+        width: min(200%, 100vw);
+        height: min(200%, 100vw);
+        translate: -50% -50%;
+        color: var(--connection-foreground);
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root">
+      <div
+        id="open-science-connection-state"
+        role="status"
+        aria-live="polite"
+        style="
+          box-sizing: border-box;
+          display: grid;
+          min-height: 100svh;
+          place-items: center;
+          background: var(--connection-background);
+          color: var(--connection-foreground);
+          font-family:
+            Inter,
+            ui-sans-serif,
+            system-ui,
+            -apple-system,
+            BlinkMacSystemFont,
+            'Segoe UI',
+            sans-serif;
+        "
+      >
+        <div class="open-science-connection-panel">
+          <div id="open-science-connection-logo" aria-hidden="true"></div>
+          <p
+            id="open-science-connection-message"
+            style="margin: 0; color: var(--connection-muted); font-size: 14px; line-height: 20px"
+          >
+            Connecting to remote computer…
+          </p>
+        </div>
+      </div>
+    </div>
+    <script type="module" src="/bootstrap.ts"></script>
+  </body>
+</html>

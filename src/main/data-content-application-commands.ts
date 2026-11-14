@@ -1,0 +1,1581 @@
+import type { LocalModelSnapshot } from '../shared/local-models'
+import type {
+  ResearchVideoPresentationRequest,
+  ResearchVideoStartRequest,
+  ResearchVideoStatusRequest,
+  ResearchVideoPresentationStatus
+} from '../shared/research-video-presentation'
+import type { createResearchVideoPresentationOwner } from './research-video/presentation'
+import type {
+  ResearchVideoProgress,
+  ResearchVideoExportResult
+} from '@aipoch/research-film/contracts'
+import type { createVideoExportTools } from '@aipoch/research-film'
+import { createResearchVideoExportControl } from './research-video/export-control'
+import type { UseCaseCatalog } from './session-package/use-case-catalog'
+import {
+  useCaseCatalogContract,
+  useCaseIntroductionContract,
+  type UseCase
+} from '../shared/use-cases'
+import type { OfficePreviewCommands } from './office-preview/application-commands'
+import type { FileSaveCommands } from './file-save'
+import type { ArtifactReproducibilityCommands } from './artifacts/artifact-reproducibility-commands'
+import type { ManagedFileVersionCommandOwner } from './managed-file-versions/ipc'
+import { RuntimeWriterOwner } from './session-persistence/runtime-writer'
+import { sanitizeRendererSaveSessionOptions } from './session-persistence/renderer-save-options'
+import { runtimeWriterClaimContract, type RuntimeWriterLease } from '../shared/runtime-writer'
+import {
+  defineApplicationCommand,
+  defineApplicationCommandGroup,
+  type ApplicationCommandInstallation,
+  type ApplicationCommandRegistrar,
+  type ApplicationInvocation
+} from './application-command-router'
+import type { ApplicationEventMap, ApplicationEventPublisher } from './application-events'
+import { artifactFinalizationFailureResult, type ArtifactHandlers } from './artifacts/ipc'
+import {
+  ArtifactFinalizationProofError,
+  ArtifactOwnershipPersistenceRaceError
+} from './artifacts/provenance-repository'
+import type { ProjectFilesHandlers } from './project-files/ipc'
+import type { ProjectHandlers } from './projects/ipc'
+import type { SessionPersistenceHandlers } from './session-persistence/ipc'
+import type { ManagedPreviewOwnerRegistry } from './managed-preview-ipc'
+import { canMutateSessionDelegationPolicy } from './caller-context'
+import { preserveSessionSizeLimitCode } from './session-persistence/application-command-errors'
+
+import {
+  ApplicationCommandError,
+  type ApplicationCommandContract
+} from '../shared/application-command-contract'
+import * as Artifacts from '../shared/artifacts'
+import type * as ConversationExport from '../shared/conversation-export'
+import * as SessionPackage from '../shared/session-package'
+import type * as SessionDiagnostics from '../shared/session-diagnostics'
+import { sessionDiagnosticCommandContracts } from '../shared/session-diagnostics-contracts'
+import {
+  LIFECYCLE_CHANNELS,
+  MAIN_DELEGATION_POLICY_LIFECYCLE_CLIENT_ID
+} from '../shared/lifecycle-events'
+import type * as PreviewResources from '../shared/preview-resources'
+import type * as PreviewState from '../shared/preview-state'
+import * as Projects from '../shared/projects'
+import * as SessionPersistence from '../shared/session-persistence'
+import * as Uploads from '../shared/uploads'
+
+type OwnerArgs<Owner, Method extends keyof Owner> = Owner[Method] extends (
+  ...args: infer Args
+) => unknown
+  ? Readonly<Args>
+  : never
+
+type OwnerResult<Owner, Method extends keyof Owner> = Owner[Method] extends (
+  ...args: never[]
+) => infer Result
+  ? Awaited<Result>
+  : never
+
+const commandFor =
+  <Owner>() =>
+  <const Name extends string, Method extends keyof Owner>(
+    name: Name,
+    method: Method,
+    contract?: ApplicationCommandContract<OwnerArgs<Owner, Method>, OwnerResult<Owner, Method>>
+  ) => {
+    void method
+    return defineApplicationCommand<Name, OwnerArgs<Owner, Method>, OwnerResult<Owner, Method>>(
+      name,
+      contract
+    )
+  }
+
+type InvocationArgs<Owner, Method extends keyof Owner> = Owner[Method] extends (
+  invocation: ApplicationInvocation<infer Args>
+) => unknown
+  ? Args
+  : never
+
+const invocationCommandFor =
+  <Owner>() =>
+  <const Name extends string, Method extends keyof Owner>(
+    name: Name,
+    method: Method,
+    contract?: ApplicationCommandContract<InvocationArgs<Owner, Method>, OwnerResult<Owner, Method>>
+  ) => {
+    void method
+    return defineApplicationCommand<
+      Name,
+      InvocationArgs<Owner, Method>,
+      OwnerResult<Owner, Method>
+    >(name, contract)
+  }
+
+type PreviewApplicationCommandOwner = Readonly<{
+  load(
+    request: PreviewState.LoadPreviewStateRequest
+  ): Promise<PreviewState.PreviewStateSnapshot | null>
+  save(request: PreviewState.SavePreviewStateRequest): Promise<PreviewState.SavePreviewStateResult>
+  delete(request: PreviewState.DeletePreviewStateRequest): Promise<void>
+}>
+
+type SessionApplicationCommandOwner = Omit<SessionPersistenceHandlers, 'deleteSession'> & {
+  deleteRecoveryFile(request: SessionPersistence.DeleteSessionRecoveryFileRequest): Promise<void>
+  bindTaskSession(
+    request: SessionPersistence.BindTaskSessionRequest
+  ): Promise<SessionPersistence.PersistedChatSession>
+  admitTaskTurn(
+    request: SessionPersistence.AdmitTaskSessionTurnRequest
+  ): Promise<SessionPersistence.PersistedChatSession>
+  stageTaskCompletion(
+    request: SessionPersistence.StageTaskSessionCompletionRequest
+  ): Promise<SessionPersistence.PersistedChatSession>
+  settleTaskCompletion(
+    request: SessionPersistence.SettleTaskSessionCompletionRequest
+  ): Promise<SessionPersistence.PersistedChatSession>
+  failTaskRun(
+    request: SessionPersistence.FailTaskSessionRunRequest
+  ): Promise<SessionPersistence.PersistedChatSession>
+  filterPdfContextCandidates(
+    request: SessionPersistence.FilterSessionPdfContextCandidatesRequest
+  ): Promise<SessionPersistence.FilterSessionPdfContextCandidatesResult>
+  linkPdfContext(
+    request: SessionPersistence.LinkSessionPdfContextRequest
+  ): Promise<SessionPersistence.SessionRuntimeContext>
+  unlinkPdfContext(
+    request: SessionPersistence.UnlinkSessionPdfContextRequest
+  ): Promise<SessionPersistence.SessionRuntimeContext>
+  editDetails(
+    request: SessionPersistence.EditSessionDetailsRequest
+  ): Promise<SessionPersistence.PersistedChatSession>
+  updateSessionConfiguration(
+    session: SessionPersistence.PersistedChatSession,
+    expectedRevision: number
+  ): Promise<SessionPersistence.PersistedChatSession>
+  deleteSession(
+    request: SessionPersistence.DeleteSessionRequest
+  ): Promise<SessionPersistence.SessionDeletionResult>
+}
+
+type InvocationOwner<Owner> = Readonly<{
+  [Method in keyof Owner]: Owner[Method] extends (...args: infer Args) => infer Result
+    ? (invocation: ApplicationInvocation<Readonly<Args>>) => Result
+    : never
+}>
+
+// T2h0 injects this adapter; it resolves native window/progress targets without putting Electron
+// objects in transport-neutral application invocations.
+type ElectronDataContentApplicationCommandAdapter = InvocationOwner<{
+  openRecoveryFolder: (
+    request: SessionPersistence.OpenSessionRecoveryFolderRequest
+  ) => Promise<void>
+  inspectSessionDiagnostics: (
+    request: SessionDiagnostics.SessionDiagnosticRequest
+  ) => Promise<SessionDiagnostics.SessionDiagnosticInspection>
+  exportSessionDiagnostics: (
+    request: SessionDiagnostics.SessionDiagnosticExportRequest
+  ) => Promise<SessionDiagnostics.SessionDiagnosticExportResult>
+  cancelSessionDiagnostics: (request: { operationId: string }) => Promise<void>
+  forkSession: (
+    request: SessionPackage.SessionPackageRequest
+  ) => Promise<SessionPackage.SessionPackageRequest | null>
+  exportSessionPackage: (
+    request: SessionPackage.SessionPackageRequest,
+    destinationPath?: string
+  ) => Promise<SessionPackage.SessionPackageExportResult>
+  importSessionPackage: (
+    request?: SessionPackage.SessionPackageImportRequest,
+    sourcePath?: string | import('../shared/use-cases').UseCaseSource,
+    options?: { readonly nonInteractive: true }
+  ) => Promise<SessionPackage.SessionPackageImportResult>
+  sessionPackageOperation: (
+    request: SessionPackage.PackageOperationRequest
+  ) => Promise<SessionPackage.PackageOperationSnapshot | null>
+  exportConversationFromInvokingWindow: (
+    request: ConversationExport.ExportConversationRequest
+  ) => Promise<ConversationExport.ExportConversationResult>
+  stageLocalFileWithProgress: (
+    request: Uploads.StageLocalUploadRequest
+  ) => Promise<Uploads.UploadedAttachment>
+}>
+
+type ManagedPreviewApplicationCommandOwner = ManagedPreviewOwnerRegistry
+
+type UploadApplicationCommandOwner = InvocationOwner<{
+  recoverDraft: (request: { receipt: string }) => Promise<Uploads.UploadedAttachment | null>
+  claimLocalFile: (request: Uploads.UploadTransferRequest) => void
+  stageLocalPath: (
+    request: Uploads.StageLocalPathUploadRequest
+  ) => Promise<Uploads.UploadedAttachment>
+  beginTransfer: (
+    request: Uploads.BeginUploadTransferRequest
+  ) => Promise<Uploads.UploadTransferStatus>
+  appendTransfer: (
+    request: Uploads.AppendUploadTransferRequest
+  ) => Promise<Uploads.UploadTransferStatus>
+  transferStatus: (
+    request: Uploads.UploadTransferRequest
+  ) => Promise<Uploads.UploadTransferStatus | null>
+  finishTransfer: (request: Uploads.UploadTransferRequest) => Promise<Uploads.UploadedAttachment>
+  abortTransfer: (request: Uploads.UploadTransferRequest) => Promise<void>
+  deleteUpload: (request: Uploads.DeleteUploadRequest) => Promise<void>
+  finalizeSession: (
+    request: Uploads.FinalizeUploadSessionRequest
+  ) => Promise<Uploads.UploadedAttachment[]>
+  readPreview: (
+    request: Artifacts.ReadArtifactPreviewRequest
+  ) => Promise<Artifacts.ArtifactPreviewResult>
+}>
+
+type DataRootWrite = <Result>(operation: () => Promise<Result>) => Promise<Result>
+
+type DataContentApplicationCommandDependencies = Readonly<{
+  useCaseCatalog: UseCaseCatalog
+  officePreviewCommands: OfficePreviewCommands
+  fileSaveCommands: FileSaveCommands
+  reproducibility: ArtifactReproducibilityCommands
+  runtimeWriter?: RuntimeWriterOwner
+  artifacts: ArtifactHandlers
+  electron: ElectronDataContentApplicationCommandAdapter
+  events: ApplicationEventPublisher
+  managedFileVersions: ManagedFileVersionCommandOwner
+  researchVideoPresentation?: ReturnType<typeof createResearchVideoPresentationOwner>
+  videoExportTools?: ReturnType<typeof createVideoExportTools<LocalModelSnapshot>>
+  managedPreview: ManagedPreviewApplicationCommandOwner
+  preview: PreviewApplicationCommandOwner
+  projectFiles: ProjectFilesHandlers
+  projects: ProjectHandlers
+  sessions: SessionApplicationCommandOwner
+  uploads: UploadApplicationCommandOwner
+  withDataRootWrite: DataRootWrite
+}>
+
+const managedFileCommand = commandFor<ManagedFileVersionCommandOwner>()
+const managedFileInvocationCommand = invocationCommandFor<ManagedFileVersionCommandOwner>()
+
+const reproducibilityCommand = invocationCommandFor<ArtifactReproducibilityCommands>()
+
+const artifactCommand = commandFor<ArtifactHandlers>()
+const previewCommand = commandFor<PreviewApplicationCommandOwner>()
+const projectFilesCommand = commandFor<ProjectFilesHandlers>()
+const projectCommand = commandFor<ProjectHandlers>()
+const sessionCommand = commandFor<SessionApplicationCommandOwner>()
+const electronCommand = invocationCommandFor<ElectronDataContentApplicationCommandAdapter>()
+const uploadCommand = invocationCommandFor<UploadApplicationCommandOwner>()
+
+const dataContentApplicationCommands = Object.freeze({
+  useCaseIntroduction: defineApplicationCommand<
+    'sessions:use-case-introduction',
+    readonly [string],
+    string | null
+  >('sessions:use-case-introduction', useCaseIntroductionContract),
+  useCaseCatalog: defineApplicationCommand<
+    'sessions:use-case-catalog',
+    readonly ['cached' | 'refreshed' | 'reload'],
+    UseCase[]
+  >('sessions:use-case-catalog', useCaseCatalogContract),
+  officePreviewOpen: invocationCommandFor<OfficePreviewCommands>()('office-preview:open', 'open'),
+  officePreviewAttachFrame: invocationCommandFor<OfficePreviewCommands>()(
+    'office-preview:attach-frame',
+    'attachFrame'
+  ),
+  officePreviewClose: invocationCommandFor<OfficePreviewCommands>()(
+    'office-preview:close',
+    'close'
+  ),
+  officePreviewReportState: invocationCommandFor<OfficePreviewCommands>()(
+    'office-preview:report-state',
+    'reportState'
+  ),
+
+  sessionOpenRecoveryFolder: electronCommand('sessions:open-recovery-folder', 'openRecoveryFolder'),
+  artifactSaveProgress: invocationCommandFor<FileSaveCommands>()(
+    'file:artifact-save-progress',
+    'file:artifact-save-progress'
+  ),
+  cancelArtifactSave: invocationCommandFor<FileSaveCommands>()(
+    'file:cancel-artifact-save',
+    'file:cancel-artifact-save'
+  ),
+  fileSaveBlob: invocationCommandFor<FileSaveCommands>()('file:save-blob', 'file:save-blob'),
+  fileSaveManaged: invocationCommandFor<FileSaveCommands>()(
+    'file:save-managed',
+    'file:save-managed'
+  ),
+  fileSaveSessionArtifacts: invocationCommandFor<FileSaveCommands>()(
+    'file:save-session-artifacts',
+    'file:save-session-artifacts'
+  ),
+  fileSaveProjectArtifacts: invocationCommandFor<FileSaveCommands>()(
+    'file:save-project-artifacts',
+    'file:save-project-artifacts'
+  ),
+
+  reproducibilitySessionCommand: reproducibilityCommand(
+    'artifacts:session-reproducibility',
+    'sessionCommand'
+  ),
+  reproducibilityOutputStorage: reproducibilityCommand(
+    'artifacts:get-reproducibility-output-storage',
+    'outputStorage'
+  ),
+  reproducibilityClearOutputs: reproducibilityCommand(
+    'artifacts:clear-reproducibility-outputs',
+    'clearOutputs'
+  ),
+  reproducibilityPreviewOutput: reproducibilityCommand(
+    'artifacts:read-reproducibility-output',
+    'previewOutput'
+  ),
+  reproducibilityDescribeEnvironmentLock: reproducibilityCommand(
+    'artifacts:describe-environment-lock',
+    'describeEnvironmentLock'
+  ),
+  reproducibilityCreateEnvironmentFromLock: reproducibilityCommand(
+    'artifacts:create-environment-from-lock',
+    'createEnvironmentFromLock'
+  ),
+  reproducibilityExportEnvironmentLock: reproducibilityCommand(
+    'artifacts:export-environment-lock',
+    'exportEnvironmentLock'
+  ),
+  reproducibilityExportReceipt: reproducibilityCommand(
+    'artifacts:export-reproducibility-receipt',
+    'exportReceipt'
+  ),
+  reproducibilityImportEnvironmentLock: reproducibilityCommand(
+    'artifacts:import-environment-lock',
+    'importEnvironmentLock'
+  ),
+  reproducibilityGetCheck: reproducibilityCommand(
+    'artifacts:get-reproducibility-check',
+    'getCheck'
+  ),
+  reproducibilityGetCheckLog: reproducibilityCommand(
+    'artifacts:get-reproducibility-check-log',
+    'getCheckLog'
+  ),
+  reproducibilityListReceipts: reproducibilityCommand(
+    'artifacts:list-reproducibility-receipts',
+    'listReceipts'
+  ),
+  reproducibilityStart: reproducibilityCommand('artifacts:start-reproducibility-check', 'start'),
+  reproducibilityCancel: reproducibilityCommand('artifacts:cancel-reproducibility-check', 'cancel'),
+
+  artifactFinalizeRun: defineApplicationCommand<
+    'artifacts:finalize-run',
+    readonly [request: Artifacts.FinalizeRunArtifactsRequest],
+    Artifacts.FinalizeRunArtifactsResult
+  >('artifacts:finalize-run'),
+  artifactGenerateCodeReconstruction: artifactCommand(
+    'artifacts:generate-code-reconstruction',
+    'generateCodeReconstruction'
+  ),
+  artifactGetCodeReconstruction: artifactCommand(
+    'artifacts:get-code-reconstruction',
+    'getCodeReconstruction'
+  ),
+  artifactGetLineage: artifactCommand('artifacts:get-lineage', 'getLineage'),
+  artifactGetVersionLiterature: artifactCommand(
+    'artifacts:get-version-literature',
+    'getVersionLiterature'
+  ),
+  artifactGetVersionExecution: artifactCommand(
+    'artifacts:get-version-execution',
+    'getVersionExecution'
+  ),
+  artifactGetVersionMessages: artifactCommand(
+    'artifacts:get-version-messages',
+    'getVersionMessages'
+  ),
+  artifactGetVersionProvenance: artifactCommand(
+    'artifacts:get-version-provenance',
+    'getVersionProvenance'
+  ),
+  artifactGetVersionReview: artifactCommand('artifacts:get-version-review', 'getVersionReview'),
+  artifactOpenFile: artifactCommand('artifacts:open-file', 'openFile'),
+  artifactReadPreview: artifactCommand('artifacts:read-preview', 'readPreview'),
+  artifactReconcilePending: artifactCommand(
+    'artifacts:reconcile-pending',
+    'reconcilePendingArtifacts'
+  ),
+  artifactResolveVersionDescriptors: artifactCommand(
+    'artifacts:resolve-version-descriptors',
+    'resolveVersionDescriptors'
+  ),
+  managedFileInspect: managedFileCommand('managed-file-versions:inspect', 'inspect'),
+  managedFileSaveTextEdit: managedFileCommand(
+    'managed-file-versions:save-text-edit',
+    'saveTextEdit'
+  ),
+  managedFileDiffText: managedFileInvocationCommand('managed-file-versions:diff-text', 'diffText'),
+  managedFileCancelDiff: managedFileInvocationCommand(
+    'managed-file-versions:cancel-diff',
+    'cancelDiff'
+  ),
+  runtimeWriterClaim: defineApplicationCommand<
+    'lifecycle:claim-runtime-writer',
+    readonly [],
+    RuntimeWriterLease
+  >('lifecycle:claim-runtime-writer', runtimeWriterClaimContract),
+  lifecycleClientId: defineApplicationCommand<'lifecycle:client-id', readonly [], string>(
+    'lifecycle:client-id'
+  ),
+  previewDelete: previewCommand('preview:delete', 'delete'),
+  previewLoad: previewCommand('preview:load', 'load'),
+  previewSave: previewCommand('preview:save', 'save'),
+  previewResourceAcquire: defineApplicationCommand<
+    'preview-resources:acquire',
+    readonly [request: PreviewResources.AcquireManagedPreviewRequest],
+    PreviewResources.ManagedPreviewResource
+  >('preview-resources:acquire'),
+  previewResourceReadRange: defineApplicationCommand<
+    'preview-resources:read-range',
+    readonly [request: PreviewResources.ReadManagedPreviewRangeRequest],
+    PreviewResources.ManagedPreviewRangeResult
+  >('preview-resources:read-range'),
+  previewResearchVideoExport: defineApplicationCommand<
+    'preview-resources:export-research-video',
+    readonly [request: { resourceId: string }],
+    ResearchVideoExportResult
+  >('preview-resources:export-research-video'),
+  researchVideoPresentationStart: defineApplicationCommand<
+    'research-video:start',
+    readonly [request: ResearchVideoStartRequest],
+    ResearchVideoPresentationStatus
+  >('research-video:start'),
+  researchVideoPresentationStatus: defineApplicationCommand<
+    'research-video:status',
+    readonly [request: ResearchVideoStatusRequest],
+    ResearchVideoPresentationStatus
+  >('research-video:status'),
+  researchVideoPresentationRemove: defineApplicationCommand<
+    'research-video:remove',
+    readonly [request: ResearchVideoPresentationRequest],
+    ResearchVideoPresentationStatus
+  >('research-video:remove'),
+  researchVideoPresentationCancel: defineApplicationCommand<
+    'research-video:cancel',
+    readonly [request: ResearchVideoPresentationRequest],
+    void
+  >('research-video:cancel'),
+  previewResearchVideoProgress: defineApplicationCommand<
+    'preview-resources:research-video-progress',
+    readonly [request: { resourceId: string }],
+    ResearchVideoProgress | null
+  >('preview-resources:research-video-progress'),
+  previewResearchVideoCancel: defineApplicationCommand<
+    'preview-resources:cancel-research-video-export',
+    readonly [request: { resourceId: string }],
+    void
+  >('preview-resources:cancel-research-video-export'),
+  previewResourceRelease: defineApplicationCommand<
+    'preview-resources:release',
+    readonly [request: PreviewResources.ReleaseManagedPreviewRequest],
+    void
+  >('preview-resources:release'),
+  projectFilesGetOverview: projectFilesCommand('project-files:get-overview', 'getOverview'),
+  projectFilesListArtifactGroups: projectFilesCommand(
+    'project-files:list-artifact-groups',
+    'listArtifactGroups'
+  ),
+  projectFilesListFiles: projectFilesCommand('project-files:list-files', 'listFiles'),
+  projectFilesReadExportFiles: projectFilesCommand(
+    'project-files:read-export-files',
+    'readExportFiles'
+  ),
+  projectFilesRepairIndex: projectFilesCommand('project-files:repair-index', 'repairIndex'),
+  projectFilesResolveFile: projectFilesCommand('project-files:resolve-file', 'resolveFile'),
+  projectFilesSearchArtifacts: projectFilesCommand(
+    'project-files:search-artifacts',
+    'searchArtifacts'
+  ),
+  projectOptimizePrompt: projectCommand(
+    'projects:optimize-prompt',
+    'optimizePrompt',
+    Projects.projectApplicationCommandContracts.optimizePrompt
+  ),
+  projectCancelPromptOptimization: projectCommand(
+    'projects:cancel-prompt-optimization',
+    'cancelPromptOptimization',
+    Projects.projectApplicationCommandContracts.cancelPromptOptimization
+  ),
+  projectRecordOptimizationEvent: projectCommand(
+    'projects:record-optimization-event',
+    'recordOptimizationEvent',
+    Projects.projectApplicationCommandContracts.recordOptimizationEvent
+  ),
+  projectCreate: projectCommand(
+    'projects:create',
+    'create',
+    Projects.projectApplicationCommandContracts.create
+  ),
+  projectUpdateArchive: projectCommand(
+    'projects:update-archive',
+    'updateArchive',
+    Projects.projectApplicationCommandContracts.updateArchive
+  ),
+  projectDelete: defineApplicationCommand<
+    'projects:delete',
+    readonly [request: Projects.DeleteProjectRequest],
+    Projects.ProjectDeletionOutcome
+  >('projects:delete', Projects.projectApplicationCommandContracts.delete),
+  projectGet: projectCommand(
+    'projects:get',
+    'get',
+    Projects.projectApplicationCommandContracts.get
+  ),
+  projectList: projectCommand(
+    'projects:list',
+    'list',
+    Projects.projectApplicationCommandContracts.list
+  ),
+  projectListDeletionCleanup: projectCommand(
+    'projects:list-deletion-cleanup',
+    'listDeletionCleanup',
+    Projects.projectApplicationCommandContracts.listDeletionCleanup
+  ),
+  projectRetryDeletionCleanup: projectCommand(
+    'projects:retry-deletion-cleanup',
+    'retryDeletionCleanup',
+    Projects.projectApplicationCommandContracts.retryDeletionCleanup
+  ),
+  projectUpdate: projectCommand(
+    'projects:update',
+    'update',
+    Projects.projectApplicationCommandContracts.update
+  ),
+  projectUpdateSessionDefaults: projectCommand(
+    'projects:update-session-defaults',
+    'update',
+    Projects.projectApplicationCommandContracts.update
+  ),
+  sessionDelete: sessionCommand(
+    'sessions:delete-session',
+    'deleteSession',
+    SessionPersistence.sessionApplicationCommandContracts.delete
+  ),
+  sessionDeleteRecoveryFile: sessionCommand(
+    'sessions:delete-recovery-file',
+    'deleteRecoveryFile',
+    SessionPersistence.sessionApplicationCommandContracts.deleteRecoveryFile
+  ),
+  sessionEditDetails: sessionCommand(
+    'sessions:edit-details',
+    'editDetails',
+    SessionPersistence.sessionApplicationCommandContracts.editDetails
+  ),
+  sessionExportConversation: electronCommand(
+    'sessions:export-conversation',
+    'exportConversationFromInvokingWindow'
+  ),
+  sessionInspectDiagnostics: electronCommand(
+    'sessions:inspect-diagnostics',
+    'inspectSessionDiagnostics',
+    sessionDiagnosticCommandContracts.inspect
+  ),
+  sessionExportDiagnostics: electronCommand(
+    'sessions:export-diagnostics',
+    'exportSessionDiagnostics',
+    sessionDiagnosticCommandContracts.export
+  ),
+  sessionCancelDiagnostics: electronCommand(
+    'sessions:cancel-diagnostics',
+    'cancelSessionDiagnostics',
+    sessionDiagnosticCommandContracts.cancel
+  ),
+  sessionFork: electronCommand(
+    'sessions:fork',
+    'forkSession',
+    SessionPackage.sessionPackageCommandContracts.fork
+  ),
+  sessionExportPackage: electronCommand(
+    'sessions:export-package',
+    'exportSessionPackage',
+    SessionPackage.sessionPackageCommandContracts.export
+  ),
+  sessionImportPackage: electronCommand(
+    'sessions:import-package',
+    'importSessionPackage',
+    SessionPackage.sessionPackageCommandContracts.import
+  ),
+  sessionPackageOperation: electronCommand(
+    'sessions:package-operation',
+    'sessionPackageOperation',
+    SessionPackage.sessionPackageCommandContracts.operation
+  ),
+  sessionList: sessionCommand('sessions:list', 'list'),
+  sessionFilterPdfContextCandidates: sessionCommand(
+    'sessions:filter-pdf-context-candidates',
+    'filterPdfContextCandidates',
+    SessionPersistence.sessionApplicationCommandContracts.filterPdfContextCandidates
+  ),
+  sessionLinkPdfContext: sessionCommand(
+    'sessions:link-pdf-context',
+    'linkPdfContext',
+    SessionPersistence.sessionApplicationCommandContracts.linkPdfContext
+  ),
+  sessionLoadAll: sessionCommand('sessions:load-all', 'loadAll'),
+  sessionLoadOne: sessionCommand('sessions:load-one', 'loadOne'),
+  sessionListRuntimeTerminalFailures: sessionCommand(
+    'sessions:list-runtime-terminal-failures',
+    'listRuntimeTerminalFailures'
+  ),
+  sessionRetryRuntimeTerminalCommit: sessionCommand(
+    'sessions:retry-runtime-terminal-commit',
+    'retryRuntimeTerminalCommit',
+    SessionPersistence.sessionApplicationCommandContracts.retryRuntimeTerminalCommit
+  ),
+  sessionSearchMessages: sessionCommand('sessions:search-messages', 'searchMessages'),
+  sessionLoadUsage: sessionCommand('sessions:load-usage', 'loadUsage'),
+  sessionSaveManifest: sessionCommand(
+    'sessions:save-manifest',
+    'saveManifest',
+    SessionPersistence.sessionApplicationCommandContracts.saveManifest
+  ),
+  sessionUpdateArchive: sessionCommand(
+    'sessions:update-archive',
+    'updateArchive',
+    SessionPersistence.sessionApplicationCommandContracts.updateArchive
+  ),
+  sessionUnlinkPdfContext: sessionCommand(
+    'sessions:unlink-pdf-context',
+    'unlinkPdfContext',
+    SessionPersistence.sessionApplicationCommandContracts.unlinkPdfContext
+  ),
+  sessionSave: defineApplicationCommand<
+    'sessions:save-session',
+    readonly [
+      session: SessionPersistence.PersistedChatSession,
+      options?: SessionPersistence.SaveSessionOptions
+    ],
+    SessionPersistence.PersistedChatSession
+  >('sessions:save-session', SessionPersistence.sessionApplicationCommandContracts.save),
+  sessionBindTask: defineApplicationCommand<
+    'sessions:bind-task-session',
+    readonly [request: SessionPersistence.BindTaskSessionRequest],
+    SessionPersistence.PersistedChatSession
+  >('sessions:bind-task-session'),
+  sessionAdmitTaskTurn: defineApplicationCommand<
+    'sessions:admit-task-turn',
+    readonly [request: SessionPersistence.AdmitTaskSessionTurnRequest],
+    SessionPersistence.PersistedChatSession
+  >('sessions:admit-task-turn'),
+  sessionStageTaskCompletion: defineApplicationCommand<
+    'sessions:stage-task-completion',
+    readonly [request: SessionPersistence.StageTaskSessionCompletionRequest],
+    SessionPersistence.PersistedChatSession
+  >('sessions:stage-task-completion'),
+  sessionSettleTaskCompletion: defineApplicationCommand<
+    'sessions:settle-task-completion',
+    readonly [request: SessionPersistence.SettleTaskSessionCompletionRequest],
+    SessionPersistence.PersistedChatSession
+  >('sessions:settle-task-completion'),
+  sessionFailTaskRun: defineApplicationCommand<
+    'sessions:fail-task-run',
+    readonly [request: SessionPersistence.FailTaskSessionRunRequest],
+    SessionPersistence.PersistedChatSession
+  >('sessions:fail-task-run'),
+  sessionSetDelegationPolicy: defineApplicationCommand<
+    'sessions:set-delegation-policy',
+    readonly [projectId: string, sessionId: string, policy: SessionPersistence.DelegationPolicy],
+    SessionPersistence.PersistedChatSession
+  >(
+    'sessions:set-delegation-policy',
+    SessionPersistence.sessionApplicationCommandContracts.setDelegationPolicy
+  ),
+  sessionUpdateConfiguration: defineApplicationCommand<
+    'sessions:update-configuration',
+    readonly [session: SessionPersistence.PersistedChatSession, expectedRevision: number],
+    SessionPersistence.PersistedChatSession
+  >(
+    'sessions:update-configuration',
+    SessionPersistence.sessionApplicationCommandContracts.updateConfiguration
+  ),
+  uploadAbortTransfer: uploadCommand('uploads:abort-transfer', 'abortTransfer'),
+  uploadAppendTransfer: uploadCommand('uploads:append-transfer', 'appendTransfer'),
+  uploadBeginTransfer: uploadCommand('uploads:begin-transfer', 'beginTransfer'),
+  uploadClaimLocalFile: uploadCommand('uploads:claim-local-file', 'claimLocalFile'),
+  uploadDelete: uploadCommand('uploads:delete', 'deleteUpload'),
+  uploadFinalizeSession: uploadCommand(
+    'uploads:finalize-session',
+    'finalizeSession',
+    Uploads.uploadApplicationCommandContracts.finalizeSession
+  ),
+  uploadFinishTransfer: uploadCommand('uploads:finish-transfer', 'finishTransfer'),
+  uploadRecoverDraft: uploadCommand(
+    'uploads:recover-draft',
+    'recoverDraft',
+    Uploads.uploadApplicationCommandContracts.recoverDraft
+  ),
+  uploadReadPreview: uploadCommand('uploads:read-preview', 'readPreview'),
+  uploadStageLocalFile: electronCommand('uploads:stage-local-file', 'stageLocalFileWithProgress'),
+  uploadStageLocalPath: uploadCommand('uploads:stage-local-path', 'stageLocalPath'),
+  uploadTransferStatus: uploadCommand('uploads:transfer-status', 'transferStatus')
+})
+
+const dataContentApplicationCommandGroups = Object.freeze([
+  defineApplicationCommandGroup('artifacts', [
+    dataContentApplicationCommands.artifactFinalizeRun,
+    dataContentApplicationCommands.artifactGenerateCodeReconstruction,
+    dataContentApplicationCommands.artifactGetCodeReconstruction,
+    dataContentApplicationCommands.artifactGetLineage,
+    dataContentApplicationCommands.artifactGetVersionExecution,
+    dataContentApplicationCommands.artifactGetVersionLiterature,
+    dataContentApplicationCommands.artifactGetVersionMessages,
+    dataContentApplicationCommands.artifactGetVersionProvenance,
+    dataContentApplicationCommands.artifactGetVersionReview,
+    dataContentApplicationCommands.artifactOpenFile,
+    dataContentApplicationCommands.artifactReadPreview,
+    dataContentApplicationCommands.artifactReconcilePending,
+    dataContentApplicationCommands.artifactResolveVersionDescriptors
+  ] as const),
+  defineApplicationCommandGroup('lifecycle', [
+    dataContentApplicationCommands.lifecycleClientId,
+    dataContentApplicationCommands.runtimeWriterClaim
+  ] as const),
+  defineApplicationCommandGroup('preview', [
+    dataContentApplicationCommands.previewDelete,
+    dataContentApplicationCommands.previewLoad,
+    dataContentApplicationCommands.previewSave
+  ] as const),
+  defineApplicationCommandGroup('preview-resources', [
+    dataContentApplicationCommands.previewResourceAcquire,
+    dataContentApplicationCommands.previewResourceReadRange,
+    dataContentApplicationCommands.previewResourceRelease,
+    dataContentApplicationCommands.previewResearchVideoExport,
+    dataContentApplicationCommands.previewResearchVideoCancel,
+    dataContentApplicationCommands.researchVideoPresentationStart,
+    dataContentApplicationCommands.researchVideoPresentationStatus,
+    dataContentApplicationCommands.researchVideoPresentationRemove,
+    dataContentApplicationCommands.researchVideoPresentationCancel,
+    dataContentApplicationCommands.previewResearchVideoProgress
+  ] as const),
+  defineApplicationCommandGroup('project-files', [
+    dataContentApplicationCommands.projectFilesGetOverview,
+    dataContentApplicationCommands.projectFilesListArtifactGroups,
+    dataContentApplicationCommands.projectFilesListFiles,
+    dataContentApplicationCommands.projectFilesReadExportFiles,
+    dataContentApplicationCommands.projectFilesRepairIndex,
+    dataContentApplicationCommands.projectFilesResolveFile,
+    dataContentApplicationCommands.projectFilesSearchArtifacts
+  ] as const),
+  defineApplicationCommandGroup('projects', [
+    dataContentApplicationCommands.projectOptimizePrompt,
+    dataContentApplicationCommands.projectCancelPromptOptimization,
+    dataContentApplicationCommands.projectRecordOptimizationEvent,
+    dataContentApplicationCommands.projectCreate,
+    dataContentApplicationCommands.projectUpdateArchive,
+    dataContentApplicationCommands.projectDelete,
+    dataContentApplicationCommands.projectGet,
+    dataContentApplicationCommands.projectList,
+    dataContentApplicationCommands.projectListDeletionCleanup,
+    dataContentApplicationCommands.projectRetryDeletionCleanup,
+    dataContentApplicationCommands.projectUpdate,
+    dataContentApplicationCommands.projectUpdateSessionDefaults
+  ] as const),
+  defineApplicationCommandGroup('sessions', [
+    dataContentApplicationCommands.sessionOpenRecoveryFolder,
+    dataContentApplicationCommands.sessionDelete,
+    dataContentApplicationCommands.sessionDeleteRecoveryFile,
+    dataContentApplicationCommands.sessionEditDetails,
+    dataContentApplicationCommands.sessionExportConversation,
+    dataContentApplicationCommands.sessionInspectDiagnostics,
+    dataContentApplicationCommands.sessionExportDiagnostics,
+    dataContentApplicationCommands.sessionCancelDiagnostics,
+    dataContentApplicationCommands.sessionFork,
+    dataContentApplicationCommands.sessionExportPackage,
+    dataContentApplicationCommands.sessionImportPackage,
+    dataContentApplicationCommands.sessionPackageOperation,
+    dataContentApplicationCommands.useCaseCatalog,
+    dataContentApplicationCommands.useCaseIntroduction,
+    dataContentApplicationCommands.sessionFilterPdfContextCandidates,
+    dataContentApplicationCommands.sessionLinkPdfContext,
+    dataContentApplicationCommands.sessionList,
+    dataContentApplicationCommands.sessionLoadAll,
+    dataContentApplicationCommands.sessionLoadOne,
+    dataContentApplicationCommands.sessionListRuntimeTerminalFailures,
+    dataContentApplicationCommands.sessionRetryRuntimeTerminalCommit,
+    dataContentApplicationCommands.sessionSearchMessages,
+    dataContentApplicationCommands.sessionLoadUsage,
+    dataContentApplicationCommands.sessionSaveManifest,
+    dataContentApplicationCommands.sessionUpdateArchive,
+    dataContentApplicationCommands.sessionUnlinkPdfContext,
+    dataContentApplicationCommands.sessionSave,
+    dataContentApplicationCommands.sessionBindTask,
+    dataContentApplicationCommands.sessionAdmitTaskTurn,
+    dataContentApplicationCommands.sessionStageTaskCompletion,
+    dataContentApplicationCommands.sessionSettleTaskCompletion,
+    dataContentApplicationCommands.sessionFailTaskRun,
+    dataContentApplicationCommands.sessionSetDelegationPolicy,
+    dataContentApplicationCommands.sessionUpdateConfiguration
+  ] as const),
+  defineApplicationCommandGroup('uploads', [
+    dataContentApplicationCommands.uploadAbortTransfer,
+    dataContentApplicationCommands.uploadAppendTransfer,
+    dataContentApplicationCommands.uploadBeginTransfer,
+    dataContentApplicationCommands.uploadClaimLocalFile,
+    dataContentApplicationCommands.uploadDelete,
+    dataContentApplicationCommands.uploadFinalizeSession,
+    dataContentApplicationCommands.uploadFinishTransfer,
+    dataContentApplicationCommands.uploadReadPreview,
+    dataContentApplicationCommands.uploadRecoverDraft,
+    dataContentApplicationCommands.uploadStageLocalFile,
+    dataContentApplicationCommands.uploadStageLocalPath,
+    dataContentApplicationCommands.uploadTransferStatus
+  ] as const),
+  defineApplicationCommandGroup('managed-file-versions', [
+    dataContentApplicationCommands.managedFileInspect,
+    dataContentApplicationCommands.managedFileSaveTextEdit,
+    dataContentApplicationCommands.managedFileDiffText,
+    dataContentApplicationCommands.managedFileCancelDiff
+  ] as const),
+  defineApplicationCommandGroup('artifact-reproducibility', [
+    dataContentApplicationCommands.reproducibilitySessionCommand,
+    dataContentApplicationCommands.reproducibilityOutputStorage,
+    dataContentApplicationCommands.reproducibilityClearOutputs,
+    dataContentApplicationCommands.reproducibilityPreviewOutput,
+    dataContentApplicationCommands.reproducibilityDescribeEnvironmentLock,
+    dataContentApplicationCommands.reproducibilityCreateEnvironmentFromLock,
+    dataContentApplicationCommands.reproducibilityExportEnvironmentLock,
+    dataContentApplicationCommands.reproducibilityExportReceipt,
+    dataContentApplicationCommands.reproducibilityImportEnvironmentLock,
+    dataContentApplicationCommands.reproducibilityGetCheck,
+    dataContentApplicationCommands.reproducibilityGetCheckLog,
+    dataContentApplicationCommands.reproducibilityListReceipts,
+    dataContentApplicationCommands.reproducibilityStart,
+    dataContentApplicationCommands.reproducibilityCancel
+  ]),
+  defineApplicationCommandGroup('native-file-save', [
+    dataContentApplicationCommands.artifactSaveProgress,
+    dataContentApplicationCommands.cancelArtifactSave,
+    dataContentApplicationCommands.fileSaveBlob,
+    dataContentApplicationCommands.fileSaveManaged,
+    dataContentApplicationCommands.fileSaveSessionArtifacts,
+    dataContentApplicationCommands.fileSaveProjectArtifacts
+  ] as const),
+  defineApplicationCommandGroup('office-preview', [
+    dataContentApplicationCommands.officePreviewOpen,
+    dataContentApplicationCommands.officePreviewAttachFrame,
+    dataContentApplicationCommands.officePreviewClose,
+    dataContentApplicationCommands.officePreviewReportState
+  ])
+] as const)
+
+const assertLocalCaller = (
+  invocation: ApplicationInvocation<readonly unknown[]>,
+  name: string
+): void => {
+  if (invocation.callerContext.location !== 'local') {
+    throw new Error(`Channel only available from the local app: ${name}`)
+  }
+}
+
+const assertElectronCaller = (
+  invocation: ApplicationInvocation<readonly unknown[]>,
+  name: string
+): void => {
+  if (invocation.callerContext.surface !== 'electron') {
+    throw new Error(`Channel only available from the Electron app: ${name}`)
+  }
+}
+
+// Package export/import/operation are exposed to local Web callers (CLI over loopback Web RPC).
+// Remote browsers are stopped by the rejecting-stub surface and the local-only RPC gate; this
+// repeats that boundary at the handler so a dispatcher regression cannot widen it.
+const assertElectronOrLocalWebCaller = (
+  invocation: ApplicationInvocation<readonly unknown[]>,
+  name: string
+): void => {
+  const { surface, location } = invocation.callerContext
+  if (surface === 'electron') return
+  if (surface === 'web' && location === 'local') return
+  throw new Error(`Channel only available from the desktop app or local Web session: ${name}`)
+}
+
+const assertSessionDelegationPolicyCaller = (
+  invocation: ApplicationInvocation<readonly unknown[]>,
+  name: string
+): void => {
+  const { callerContext } = invocation
+  if (!canMutateSessionDelegationPolicy(callerContext)) {
+    throw new Error(`Channel only available from current human or Task automation: ${name}`)
+  }
+}
+
+const assertTaskCaller = (
+  invocation: ApplicationInvocation<readonly unknown[]>,
+  name: string
+): void => {
+  if (invocation.callerContext.surface !== 'task') {
+    throw new Error(`Channel only available from Task automation: ${name}`)
+  }
+}
+
+// Repository commits remain authoritative if compatibility publication fails, matching the current
+// lifecycle broadcaster's non-fatal behavior.
+const publishLifecycle = <Channel extends keyof ApplicationEventMap>(
+  events: ApplicationEventPublisher,
+  channel: Channel,
+  payload: ApplicationEventMap[Channel]
+): void => {
+  try {
+    events.publish(channel, payload)
+  } catch {
+    // A disconnected renderer cannot turn an already-committed mutation into a failed command.
+  }
+}
+
+// Production composition registers all bounded command groups atomically; this group must not be
+// exposed through a live transport in isolation.
+const registerDataContentApplicationCommands = (
+  registrar: ApplicationCommandRegistrar,
+  dependencies: DataContentApplicationCommandDependencies
+): ApplicationCommandInstallation => {
+  const videoExports = createResearchVideoExportControl(
+    dependencies.managedPreview,
+    dependencies.videoExportTools
+  )
+  const scope = registrar.createScope()
+  const runtimeWriter = dependencies.runtimeWriter ?? new RuntimeWriterOwner()
+
+  try {
+    scope.registerGroup(dataContentApplicationCommandGroups[0], {
+      'artifacts:finalize-run': async ({ args }) => {
+        try {
+          return {
+            ok: true as const,
+            artifacts: await dependencies.artifacts.finalizeRunArtifacts(args[0])
+          }
+        } catch (error) {
+          const executionFailure = artifactFinalizationFailureResult(error)
+          if (executionFailure) return executionFailure
+          if (error instanceof ArtifactOwnershipPersistenceRaceError) {
+            return {
+              ok: false as const,
+              code: Artifacts.ARTIFACT_OWNERSHIP_PERSISTENCE_RACE,
+              message: error.message
+            }
+          }
+          if (error instanceof ArtifactFinalizationProofError) {
+            throw new ApplicationCommandError(
+              'command-failed',
+              'Artifact finalization was rejected because its ownership no longer matches the saved Session.'
+            )
+          }
+          throw error
+        }
+      },
+      'artifacts:generate-code-reconstruction': ({ args }) =>
+        dependencies.artifacts.generateCodeReconstruction(args[0]),
+      'artifacts:get-code-reconstruction': ({ args }) =>
+        dependencies.artifacts.getCodeReconstruction(args[0]),
+      'artifacts:get-lineage': ({ args }) => dependencies.artifacts.getLineage(args[0]),
+      'artifacts:get-version-literature': ({ args }) =>
+        dependencies.artifacts.getVersionLiterature(args[0]),
+      'artifacts:get-version-execution': ({ args }) =>
+        dependencies.artifacts.getVersionExecution(args[0]),
+      'artifacts:get-version-messages': ({ args }) =>
+        dependencies.artifacts.getVersionMessages(args[0]),
+      'artifacts:get-version-provenance': ({ args }) =>
+        dependencies.artifacts.getVersionProvenance(args[0]),
+      'artifacts:get-version-review': ({ args }) =>
+        dependencies.artifacts.getVersionReview(args[0]),
+      'artifacts:open-file': (invocation) => {
+        assertLocalCaller(invocation, dataContentApplicationCommands.artifactOpenFile.name)
+        return dependencies.artifacts.openFile(invocation.args[0])
+      },
+      'artifacts:read-preview': ({ args }) => dependencies.artifacts.readPreview(args[0]),
+      'artifacts:reconcile-pending': ({ args }) =>
+        dependencies.artifacts.reconcilePendingArtifacts(args[0]),
+      'artifacts:resolve-version-descriptors': ({ args }) =>
+        dependencies.artifacts.resolveVersionDescriptors(args[0])
+    })
+    scope.registerGroup(dataContentApplicationCommandGroups[1], {
+      'lifecycle:claim-runtime-writer': ({ callerContext, callerLease }) =>
+        runtimeWriter.claim(
+          callerContext.lifecycleClientId,
+          callerContext.surface === 'electron'
+            ? () => callerLease.isCurrent() && callerContext.isAuthorizationCurrent()
+            : undefined
+        ),
+      'lifecycle:client-id': ({ callerContext }) => callerContext.lifecycleClientId
+    })
+    scope.registerGroup(dataContentApplicationCommandGroups[2], {
+      'preview:delete': ({ args }) => dependencies.preview.delete(args[0]),
+      'preview:load': ({ args }) => dependencies.preview.load(args[0]),
+      'preview:save': ({ args }) => dependencies.preview.save(args[0])
+    })
+    scope.registerGroup(dataContentApplicationCommandGroups[3], {
+      'preview-resources:acquire': (invocation) => {
+        if (invocation.args[0].source === 'local') {
+          assertLocalCaller(invocation, 'preview-resources:acquire')
+        }
+        return dependencies.managedPreview.acquire(invocation.callerLease, invocation.args[0])
+      },
+      'preview-resources:export-research-video': (invocation) => {
+        assertElectronCaller(invocation, 'preview-resources:export-research-video')
+        return videoExports.export(
+          invocation.callerLease,
+          invocation.args[0],
+          invocation.callerContext.clientId
+        )
+      },
+      'research-video:start': (invocation) => {
+        assertElectronCaller(invocation, 'research-video:start')
+        if (!dependencies.researchVideoPresentation)
+          throw new Error('Research explanation service is unavailable.')
+        return dependencies.researchVideoPresentation.start(invocation.args[0])
+      },
+      'research-video:status': (invocation) => {
+        assertElectronCaller(invocation, 'research-video:status')
+        if (!dependencies.researchVideoPresentation)
+          throw new Error('Research explanation service is unavailable.')
+        return dependencies.researchVideoPresentation.status(invocation.args[0])
+      },
+      'research-video:remove': (invocation) => {
+        assertElectronCaller(invocation, 'research-video:remove')
+        if (!dependencies.researchVideoPresentation)
+          throw new Error('Research explanation service is unavailable.')
+        return dependencies.researchVideoPresentation.remove(invocation.args[0])
+      },
+      'research-video:cancel': (invocation) => {
+        assertElectronCaller(invocation, 'research-video:cancel')
+        if (!dependencies.researchVideoPresentation)
+          throw new Error('Research explanation service is unavailable.')
+        return dependencies.researchVideoPresentation.cancel(invocation.args[0])
+      },
+      'preview-resources:research-video-progress': (invocation) => {
+        assertElectronCaller(invocation, 'preview-resources:research-video-progress')
+        return videoExports.progress(invocation.callerLease, invocation.args[0])
+      },
+      'preview-resources:cancel-research-video-export': (invocation) => {
+        assertElectronCaller(invocation, 'preview-resources:cancel-research-video-export')
+        return videoExports.cancel(invocation.callerLease, invocation.args[0])
+      },
+      'preview-resources:read-range': ({ args, callerLease }) =>
+        dependencies.managedPreview.readRange(callerLease, args[0]),
+      'preview-resources:release': ({ args, callerLease }) =>
+        dependencies.managedPreview.release(callerLease, args[0])
+    })
+    scope.registerGroup(dataContentApplicationCommandGroups[4], {
+      'project-files:get-overview': ({ args }) => dependencies.projectFiles.getOverview(args[0]),
+      'project-files:list-artifact-groups': ({ args }) =>
+        dependencies.projectFiles.listArtifactGroups(args[0]),
+      'project-files:list-files': ({ args }) => dependencies.projectFiles.listFiles(args[0]),
+      'project-files:read-export-files': ({ args }) =>
+        dependencies.projectFiles.readExportFiles(args[0]),
+      'project-files:repair-index': ({ args }) => dependencies.projectFiles.repairIndex(args[0]),
+      'project-files:resolve-file': ({ args }) => dependencies.projectFiles.resolveFile(args[0]),
+      'project-files:search-artifacts': ({ args }) =>
+        dependencies.projectFiles.searchArtifacts(args[0])
+    })
+    scope.registerGroup(dataContentApplicationCommandGroups[5], {
+      'projects:optimize-prompt': ({ args }) => dependencies.projects.optimizePrompt(args[0]),
+      'projects:cancel-prompt-optimization': ({ args }) =>
+        dependencies.projects.cancelPromptOptimization(args[0]),
+      'projects:record-optimization-event': ({ args }) =>
+        dependencies.projects.recordOptimizationEvent(args[0]),
+      'projects:create': ({ args }) =>
+        dependencies.withDataRootWrite(async () => {
+          const project = await dependencies.projects.create(args[0])
+          publishLifecycle(dependencies.events, LIFECYCLE_CHANNELS.projectCreated, project)
+          return project
+        }),
+      'projects:delete': ({ args }) => dependencies.projects.delete(args[0].id),
+      'projects:get': ({ args }) =>
+        dependencies.withDataRootWrite(() => dependencies.projects.get(args[0])),
+      'projects:list': () => dependencies.withDataRootWrite(() => dependencies.projects.list()),
+      'projects:list-deletion-cleanup': () =>
+        dependencies.withDataRootWrite(() => dependencies.projects.listDeletionCleanup()),
+      'projects:retry-deletion-cleanup': () => dependencies.projects.retryDeletionCleanup(),
+      'projects:update-archive': ({ args }) =>
+        dependencies.withDataRootWrite(async () => {
+          const project = await dependencies.projects.updateArchive(args[0])
+          publishLifecycle(dependencies.events, LIFECYCLE_CHANNELS.projectUpdated, project)
+          return project
+        }),
+      'projects:update': ({ args }) =>
+        dependencies.withDataRootWrite(async () => {
+          if (args[0].sessionDefaults !== undefined) {
+            throw new Error(
+              'Project Session defaults must be changed through the Task configuration API.'
+            )
+          }
+          const project = await dependencies.projects.update(args[0])
+          publishLifecycle(dependencies.events, LIFECYCLE_CHANNELS.projectUpdated, project)
+          return project
+        }),
+      'projects:update-session-defaults': (invocation) => {
+        assertTaskCaller(
+          invocation,
+          dataContentApplicationCommands.projectUpdateSessionDefaults.name
+        )
+        return dependencies.withDataRootWrite(async () => {
+          if (invocation.args[0].sessionDefaults === undefined) {
+            throw new Error('Project Session defaults are required.')
+          }
+          const project = await dependencies.projects.update(invocation.args[0])
+          publishLifecycle(dependencies.events, LIFECYCLE_CHANNELS.projectUpdated, project)
+          return project
+        })
+      }
+    })
+    scope.registerGroup(dataContentApplicationCommandGroups[6], {
+      'sessions:open-recovery-folder': (invocation) => {
+        assertElectronCaller(
+          invocation,
+          dataContentApplicationCommands.sessionOpenRecoveryFolder.name
+        )
+        return dependencies.electron.openRecoveryFolder(invocation)
+      },
+      'sessions:delete-recovery-file': ({ args }) =>
+        dependencies.withDataRootWrite(() => dependencies.sessions.deleteRecoveryFile(args[0])),
+      'sessions:delete-session': async ({ args }) => {
+        const result = await dependencies.sessions.deleteSession(args[0])
+        if (result.status === 'deleted') {
+          publishLifecycle(dependencies.events, LIFECYCLE_CHANNELS.sessionDeleted, args[0])
+        }
+        return result
+      },
+      'sessions:edit-details': (invocation) => {
+        return dependencies.withDataRootWrite(() =>
+          preserveSessionSizeLimitCode(async () => {
+            try {
+              return await dependencies.sessions.editDetails(invocation.args[0])
+            } catch (error) {
+              if (SessionPersistence.isSessionDetailsConflictError(error)) {
+                throw new ApplicationCommandError(
+                  SessionPersistence.SESSION_DETAILS_CONFLICT_ERROR_CODE,
+                  error instanceof Error ? error.message : 'Session details changed elsewhere.'
+                )
+              }
+              if (SessionPersistence.isSessionRevisionConflictError(error)) {
+                throw new ApplicationCommandError(
+                  SessionPersistence.SESSION_REVISION_CONFLICT_ERROR_CODE,
+                  error instanceof Error ? error.message : 'Session revision conflict.'
+                )
+              }
+              throw error
+            }
+          })
+        )
+      },
+      'sessions:export-conversation': (invocation) => {
+        assertElectronCaller(
+          invocation,
+          dataContentApplicationCommands.sessionExportConversation.name
+        )
+        return dependencies.electron.exportConversationFromInvokingWindow(invocation)
+      },
+      'sessions:inspect-diagnostics': (invocation) => {
+        assertElectronCaller(
+          invocation,
+          dataContentApplicationCommands.sessionInspectDiagnostics.name
+        )
+        return dependencies.electron.inspectSessionDiagnostics(invocation)
+      },
+      'sessions:export-diagnostics': (invocation) => {
+        assertElectronCaller(
+          invocation,
+          dataContentApplicationCommands.sessionExportDiagnostics.name
+        )
+        return dependencies.electron.exportSessionDiagnostics(invocation)
+      },
+      'sessions:cancel-diagnostics': (invocation) => {
+        assertElectronCaller(
+          invocation,
+          dataContentApplicationCommands.sessionCancelDiagnostics.name
+        )
+        return dependencies.electron.cancelSessionDiagnostics(invocation)
+      },
+      'sessions:fork': (invocation) => {
+        assertElectronOrLocalWebCaller(invocation, dataContentApplicationCommands.sessionFork.name)
+        return dependencies.electron.forkSession(invocation)
+      },
+      'sessions:export-package': (invocation) => {
+        assertElectronOrLocalWebCaller(
+          invocation,
+          dataContentApplicationCommands.sessionExportPackage.name
+        )
+        return dependencies.electron.exportSessionPackage(invocation)
+      },
+      'sessions:import-package': (invocation) => {
+        assertElectronOrLocalWebCaller(
+          invocation,
+          dataContentApplicationCommands.sessionImportPackage.name
+        )
+        return dependencies.electron.importSessionPackage(invocation)
+      },
+      'sessions:use-case-introduction': (invocation) => {
+        assertLocalCaller(invocation, dataContentApplicationCommands.useCaseIntroduction.name)
+        return dependencies.useCaseCatalog.introduction(invocation.args[0])
+      },
+      'sessions:use-case-catalog': (invocation) => {
+        assertLocalCaller(invocation, dataContentApplicationCommands.useCaseCatalog.name)
+        return invocation.args[0] === 'cached'
+          ? dependencies.useCaseCatalog.cached()
+          : dependencies.useCaseCatalog.refresh(invocation.args[0] === 'reload')
+      },
+      'sessions:package-operation': (invocation) => {
+        assertElectronOrLocalWebCaller(
+          invocation,
+          dataContentApplicationCommands.sessionPackageOperation.name
+        )
+        return dependencies.electron.sessionPackageOperation(invocation)
+      },
+      'sessions:filter-pdf-context-candidates': ({ args }) =>
+        dependencies.withDataRootWrite(() =>
+          dependencies.sessions.filterPdfContextCandidates(args[0])
+        ),
+      'sessions:load-all': () =>
+        dependencies.withDataRootWrite(() => dependencies.sessions.loadAll()),
+      'sessions:list': () => dependencies.withDataRootWrite(() => dependencies.sessions.list()),
+      'sessions:link-pdf-context': (invocation) =>
+        dependencies.withDataRootWrite(() =>
+          preserveSessionSizeLimitCode(async () => {
+            try {
+              return await dependencies.sessions.linkPdfContext(invocation.args[0])
+            } catch (error) {
+              if (SessionPersistence.isSessionRevisionConflictError(error)) {
+                throw new ApplicationCommandError(
+                  SessionPersistence.SESSION_REVISION_CONFLICT_ERROR_CODE,
+                  error instanceof Error ? error.message : 'Session revision conflict.'
+                )
+              }
+              throw error
+            }
+          })
+        ),
+      'sessions:load-one': ({ args }) =>
+        dependencies.withDataRootWrite(() => dependencies.sessions.loadOne(args[0])),
+      'sessions:list-runtime-terminal-failures': () =>
+        dependencies.sessions.listRuntimeTerminalFailures(),
+      'sessions:retry-runtime-terminal-commit': ({ args }) =>
+        dependencies.withDataRootWrite(() =>
+          dependencies.sessions.retryRuntimeTerminalCommit(args[0])
+        ),
+      'sessions:search-messages': ({ args }) =>
+        dependencies.withDataRootWrite(() => dependencies.sessions.searchMessages(args[0])),
+      'sessions:load-usage': () =>
+        dependencies.withDataRootWrite(() => dependencies.sessions.loadUsage()),
+      'sessions:save-manifest': ({ args }) =>
+        dependencies.withDataRootWrite(() => dependencies.sessions.saveManifest(args[0])),
+      'sessions:update-archive': (invocation) => {
+        const originClientId = invocation.callerContext.lifecycleClientId
+        return dependencies.withDataRootWrite(() =>
+          preserveSessionSizeLimitCode(async () => {
+            const session = await dependencies.sessions.updateArchive(invocation.args[0])
+            publishLifecycle(dependencies.events, LIFECYCLE_CHANNELS.sessionUpdated, {
+              session,
+              originClientId
+            })
+            return session
+          })
+        )
+      },
+      'sessions:unlink-pdf-context': (invocation) =>
+        dependencies.withDataRootWrite(() =>
+          preserveSessionSizeLimitCode(async () => {
+            try {
+              return await dependencies.sessions.unlinkPdfContext(invocation.args[0])
+            } catch (error) {
+              if (SessionPersistence.isSessionRevisionConflictError(error)) {
+                throw new ApplicationCommandError(
+                  SessionPersistence.SESSION_REVISION_CONFLICT_ERROR_CODE,
+                  error instanceof Error ? error.message : 'Session revision conflict.'
+                )
+              }
+              throw error
+            }
+          })
+        ),
+      'sessions:save-session': (invocation) => {
+        const originClientId = invocation.callerContext.lifecycleClientId
+        const writerToken = invocation.args[1]?.runtimeWriterToken
+        const withRuntimeWriterWrite = <T>(run: () => Promise<T>): Promise<T> =>
+          dependencies.withDataRootWrite(() =>
+            writerToken === undefined
+              ? run()
+              : runtimeWriter.commit(originClientId, writerToken, run)
+          )
+        return withRuntimeWriterWrite(() =>
+          preserveSessionSizeLimitCode(async () => {
+            let result: Awaited<ReturnType<SessionPersistenceHandlers['saveSession']>>
+            try {
+              const rendererOptions =
+                invocation.callerContext.surface === 'task'
+                  ? undefined
+                  : sanitizeRendererSaveSessionOptions(invocation.args[1], invocation.args[0])
+              const preparesPrompt = rendererOptions?.conversationCommands?.some(
+                ({ kind }) => kind === 'prepare-prompt'
+              )
+              result =
+                invocation.callerContext.surface === 'task'
+                  ? await dependencies.sessions.saveSession(
+                      invocation.args[0],
+                      invocation.args[1],
+                      {
+                        taskRunCommit: true
+                      }
+                    )
+                  : preparesPrompt
+                    ? await dependencies.sessions.saveSession(invocation.args[0], rendererOptions, {
+                        taskRunCommit: false,
+                        callerSignal: invocation.callerLease.signal
+                      })
+                    : await dependencies.sessions.saveSession(invocation.args[0], rendererOptions)
+            } catch (error) {
+              if (SessionPersistence.isSessionRevisionConflictError(error)) {
+                throw new ApplicationCommandError(
+                  SessionPersistence.SESSION_REVISION_CONFLICT_ERROR_CODE,
+                  error instanceof Error ? error.message : 'Session revision conflict.'
+                )
+              }
+              throw error
+            }
+            publishLifecycle(
+              dependencies.events,
+              result.created
+                ? LIFECYCLE_CHANNELS.sessionCreated
+                : LIFECYCLE_CHANNELS.sessionUpdated,
+              { session: result.session, originClientId }
+            )
+            return result.session
+          })
+        )
+      },
+      'sessions:bind-task-session': (invocation) => {
+        const originClientId = invocation.callerContext.lifecycleClientId
+        return dependencies.withDataRootWrite(() =>
+          preserveSessionSizeLimitCode(async () => {
+            const session = await dependencies.sessions.bindTaskSession(invocation.args[0])
+            publishLifecycle(dependencies.events, LIFECYCLE_CHANNELS.sessionUpdated, {
+              session,
+              originClientId
+            })
+            return session
+          })
+        )
+      },
+      'sessions:admit-task-turn': (invocation) => {
+        const originClientId = invocation.callerContext.lifecycleClientId
+        return dependencies.withDataRootWrite(() =>
+          preserveSessionSizeLimitCode(async () => {
+            const session = await dependencies.sessions.admitTaskTurn(invocation.args[0])
+            publishLifecycle(dependencies.events, LIFECYCLE_CHANNELS.sessionUpdated, {
+              session,
+              originClientId
+            })
+            return session
+          })
+        )
+      },
+      'sessions:stage-task-completion': (invocation) => {
+        const originClientId = invocation.callerContext.lifecycleClientId
+        return dependencies.withDataRootWrite(() =>
+          preserveSessionSizeLimitCode(async () => {
+            const session = await dependencies.sessions.stageTaskCompletion(invocation.args[0])
+            publishLifecycle(dependencies.events, LIFECYCLE_CHANNELS.sessionUpdated, {
+              session,
+              originClientId
+            })
+            return session
+          })
+        )
+      },
+      'sessions:settle-task-completion': (invocation) => {
+        const originClientId = invocation.callerContext.lifecycleClientId
+        return dependencies.withDataRootWrite(() =>
+          preserveSessionSizeLimitCode(async () => {
+            const session = await dependencies.sessions.settleTaskCompletion(invocation.args[0])
+            publishLifecycle(dependencies.events, LIFECYCLE_CHANNELS.sessionUpdated, {
+              session,
+              originClientId
+            })
+            return session
+          })
+        )
+      },
+      'sessions:fail-task-run': (invocation) => {
+        const originClientId = invocation.callerContext.lifecycleClientId
+        return dependencies.withDataRootWrite(() =>
+          preserveSessionSizeLimitCode(async () => {
+            const session = await dependencies.sessions.failTaskRun(invocation.args[0])
+            publishLifecycle(dependencies.events, LIFECYCLE_CHANNELS.sessionUpdated, {
+              session,
+              originClientId
+            })
+            return session
+          })
+        )
+      },
+      'sessions:set-delegation-policy': (invocation) => {
+        assertSessionDelegationPolicyCaller(
+          invocation,
+          dataContentApplicationCommands.sessionSetDelegationPolicy.name
+        )
+        return dependencies.withDataRootWrite(() =>
+          preserveSessionSizeLimitCode(async () => {
+            const session = await dependencies.sessions.setDelegationPolicy(
+              invocation.args[0],
+              invocation.args[1],
+              invocation.args[2]
+            )
+            publishLifecycle(dependencies.events, LIFECYCLE_CHANNELS.sessionUpdated, {
+              session,
+              originClientId: MAIN_DELEGATION_POLICY_LIFECYCLE_CLIENT_ID
+            })
+            return session
+          })
+        )
+      },
+      'sessions:update-configuration': (invocation) => {
+        assertTaskCaller(invocation, dataContentApplicationCommands.sessionUpdateConfiguration.name)
+        const originClientId = invocation.callerContext.lifecycleClientId
+        return dependencies.withDataRootWrite(() =>
+          preserveSessionSizeLimitCode(async () => {
+            let session: SessionPersistence.PersistedChatSession
+            try {
+              session = await dependencies.sessions.updateSessionConfiguration(
+                invocation.args[0],
+                invocation.args[1]
+              )
+            } catch (error) {
+              if (SessionPersistence.isSessionRevisionConflictError(error)) {
+                throw new ApplicationCommandError(
+                  SessionPersistence.SESSION_REVISION_CONFLICT_ERROR_CODE,
+                  error instanceof Error ? error.message : 'Session revision conflict.'
+                )
+              }
+              throw error
+            }
+            publishLifecycle(dependencies.events, LIFECYCLE_CHANNELS.sessionUpdated, {
+              session,
+              originClientId
+            })
+            return session
+          })
+        )
+      }
+    })
+    scope.registerGroup(dataContentApplicationCommandGroups[7], {
+      'uploads:abort-transfer': (invocation) => dependencies.uploads.abortTransfer(invocation),
+      'uploads:append-transfer': (invocation) => dependencies.uploads.appendTransfer(invocation),
+      'uploads:begin-transfer': (invocation) => dependencies.uploads.beginTransfer(invocation),
+      'uploads:claim-local-file': (invocation) => dependencies.uploads.claimLocalFile(invocation),
+      'uploads:delete': (invocation) => dependencies.uploads.deleteUpload(invocation),
+      'uploads:finalize-session': (invocation) => dependencies.uploads.finalizeSession(invocation),
+      'uploads:finish-transfer': (invocation) => dependencies.uploads.finishTransfer(invocation),
+      'uploads:recover-draft': (invocation) => dependencies.uploads.recoverDraft(invocation),
+      'uploads:read-preview': (invocation) => dependencies.uploads.readPreview(invocation),
+      'uploads:stage-local-file': (invocation) => {
+        assertElectronCaller(invocation, dataContentApplicationCommands.uploadStageLocalFile.name)
+        return dependencies.electron.stageLocalFileWithProgress(invocation)
+      },
+      'uploads:stage-local-path': async (invocation) => {
+        assertLocalCaller(invocation, dataContentApplicationCommands.uploadStageLocalPath.name)
+        const attachment = await dependencies.uploads.stageLocalPath(invocation)
+        dependencies.events.publish('project-files:changed', {
+          projectId: invocation.args[0].projectId ?? Uploads.DEFAULT_UPLOAD_PROJECT_ID,
+          sessionId: Uploads.STANDALONE_UPLOAD_SESSION_ID,
+          sources: ['upload'],
+          kind: 'upsert'
+        })
+        return attachment
+      },
+      'uploads:transfer-status': (invocation) => dependencies.uploads.transferStatus(invocation)
+    })
+    scope.registerGroup(dataContentApplicationCommandGroups[8], {
+      'managed-file-versions:inspect': async (invocation) => {
+        const [request] = invocation.args
+        const result = await dependencies.managedFileVersions.inspect(request)
+        // The command may be reached from a remote Web caller. Never return a Version whose
+        // resolved Project or logical File identity differs from the requested scope.
+        if (
+          result.ok &&
+          (result.value.projectId !== request.projectId || result.value.fileId !== request.fileId)
+        ) {
+          throw new Error('Managed file version identity does not match the requested scope.')
+        }
+        // Web can inspect versions, but its renderer has no edit or diff commands.
+        if (result.ok && invocation.callerContext.surface === 'web') {
+          return { ...result, value: { ...result.value, canEdit: false, canDiff: false } }
+        }
+        return result
+      },
+      'managed-file-versions:save-text-edit': ({ args }) =>
+        dependencies.managedFileVersions.saveTextEdit(args[0]),
+      'managed-file-versions:diff-text': (invocation) =>
+        dependencies.managedFileVersions.diffText(invocation),
+      'managed-file-versions:cancel-diff': (invocation) =>
+        dependencies.managedFileVersions.cancelDiff(invocation)
+    })
+    scope.registerGroup(dataContentApplicationCommandGroups[9], {
+      'artifacts:session-reproducibility': (invocation) =>
+        dependencies.reproducibility.sessionCommand(invocation),
+      'artifacts:get-reproducibility-output-storage': (invocation) =>
+        dependencies.reproducibility.outputStorage(invocation),
+      'artifacts:clear-reproducibility-outputs': (invocation) =>
+        dependencies.reproducibility.clearOutputs(invocation),
+      'artifacts:read-reproducibility-output': (invocation) =>
+        dependencies.reproducibility.previewOutput(invocation),
+      'artifacts:describe-environment-lock': (invocation) =>
+        dependencies.reproducibility.describeEnvironmentLock(invocation),
+      'artifacts:create-environment-from-lock': (invocation) =>
+        dependencies.reproducibility.createEnvironmentFromLock(invocation),
+      'artifacts:export-environment-lock': (invocation) =>
+        dependencies.reproducibility.exportEnvironmentLock(invocation),
+      'artifacts:export-reproducibility-receipt': (invocation) =>
+        dependencies.reproducibility.exportReceipt(invocation),
+      'artifacts:import-environment-lock': (invocation) =>
+        dependencies.reproducibility.importEnvironmentLock(invocation),
+      'artifacts:get-reproducibility-check': (invocation) =>
+        dependencies.reproducibility.getCheck(invocation),
+      'artifacts:get-reproducibility-check-log': (invocation) =>
+        dependencies.reproducibility.getCheckLog(invocation),
+      'artifacts:list-reproducibility-receipts': (invocation) =>
+        dependencies.reproducibility.listReceipts(invocation),
+      'artifacts:start-reproducibility-check': (invocation) =>
+        dependencies.reproducibility.start(invocation),
+      'artifacts:cancel-reproducibility-check': (invocation) =>
+        dependencies.reproducibility.cancel(invocation)
+    })
+    scope.registerGroup(dataContentApplicationCommandGroups[10], {
+      'file:artifact-save-progress': (invocation) =>
+        dependencies.fileSaveCommands['file:artifact-save-progress'](invocation),
+      'file:cancel-artifact-save': (invocation) =>
+        dependencies.fileSaveCommands['file:cancel-artifact-save'](invocation),
+      'file:save-blob': (invocation) => dependencies.fileSaveCommands['file:save-blob'](invocation),
+      'file:save-managed': (invocation) =>
+        dependencies.fileSaveCommands['file:save-managed'](invocation),
+      'file:save-session-artifacts': (invocation) =>
+        dependencies.fileSaveCommands['file:save-session-artifacts'](invocation),
+      'file:save-project-artifacts': (invocation) =>
+        dependencies.fileSaveCommands['file:save-project-artifacts'](invocation)
+    })
+    scope.registerGroup(dataContentApplicationCommandGroups[11], {
+      'office-preview:open': (invocation) => dependencies.officePreviewCommands.open(invocation),
+      'office-preview:attach-frame': (invocation) =>
+        dependencies.officePreviewCommands.attachFrame(invocation),
+      'office-preview:close': (invocation) => dependencies.officePreviewCommands.close(invocation),
+      'office-preview:report-state': (invocation) =>
+        dependencies.officePreviewCommands.reportState(invocation)
+    })
+    return scope.complete(() => {
+      return Promise.all([videoExports.close(), dependencies.reproducibility?.dispose()]).then(
+        () => undefined
+      )
+    })
+  } catch (error) {
+    scope.rollback()
+    throw error
+  }
+}
+
+export {
+  dataContentApplicationCommandGroups,
+  dataContentApplicationCommands,
+  registerDataContentApplicationCommands
+}
+export type { DataContentApplicationCommandDependencies }

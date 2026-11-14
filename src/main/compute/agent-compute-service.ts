@@ -1,0 +1,295 @@
+import { externalComputeMode, type ExternalComputeTarget } from '../../shared/compute'
+import type {
+  ComputeHost,
+  ComputeHostDetails,
+  DetailsAuthor,
+  JobStatusResult,
+  SubmitJobResult
+} from '@aipoch/compute'
+import type { AgentResultFollowUpDelivery } from '../../shared/background-result-delivery'
+import type { AgentComputeHostSummary, ExecResult, JobResult } from '../../shared/compute'
+
+import { ComputeHostUnavailableError, computeHostSummary } from '@aipoch/compute'
+
+import { createLogger } from '@aipoch/diagnostics/node'
+import type { DownloadDest, LocalFile } from '../../shared/remote-fs'
+import type { ComputeService } from './compute-service'
+
+const log = createLogger('compute:agent')
+
+type SessionComputeHostRegistry = Readonly<{
+  getEnabled(sessionId: string): string[]
+  getSelected(sessionId: string): string[]
+}>
+
+type AgentComputeContext = Readonly<{
+  sessionId: string
+  projectId: string
+  producerRunId?: string
+}>
+
+type AgentComputeLifecycle = Readonly<{
+  onFinalJobObserved?: (
+    context: AgentComputeContext,
+    providerId: string,
+    snapshot: JobStatusResult | JobResult
+  ) => Promise<AgentResultFollowUpDelivery>
+}>
+
+type RawComputeService = Pick<
+  ComputeService,
+  | 'listKubernetesTargets'
+  | 'listHostedTargets'
+  | 'listRayTargets'
+  | 'listModalTargets'
+  | 'list'
+  | 'getDetails'
+  | 'appendDetails'
+  | 'replaceDetails'
+  | 'callCommand'
+  | 'download'
+  | 'submitJob'
+  | 'getJobStatus'
+  | 'getJobResult'
+  | 'cancelJob'
+  | 'setSessionConcurrencyLimit'
+  | 'getSessionConcurrencyStatus'
+>
+
+// The only Compute facade exposed to Agent RPC. Global ComputeService remains unrestricted for
+// Settings and internal runtimes; every Agent provider operation passes through Session admission.
+export class AgentComputeService {
+  constructor(
+    private readonly compute: RawComputeService,
+    private readonly registry: SessionComputeHostRegistry,
+    private readonly lifecycle: AgentComputeLifecycle = {}
+  ) {}
+
+  private enabledIds(sessionId: string): string[] {
+    return this.registry.getEnabled(sessionId)
+  }
+
+  private targets(
+    mode: NonNullable<ReturnType<typeof externalComputeMode>>
+  ): Promise<ExternalComputeTarget[]> {
+    switch (mode) {
+      case 'kubernetes':
+        return this.compute.listKubernetesTargets()
+      case 'hugging_face_jobs':
+        return this.compute.listHostedTargets()
+      case 'ray_jobs':
+        return this.compute.listRayTargets()
+      case 'modal_sandbox':
+        return this.compute.listModalTargets()
+    }
+  }
+  private async requireEnabled(sessionId: string, providerId: string): Promise<void> {
+    if (!this.enabledIds(sessionId).includes(providerId)) throw new ComputeHostUnavailableError()
+    // A stale Session projection must not turn a removed global host into a distinguishable error.
+    const mode = externalComputeMode(providerId)
+    const configured = mode ? await this.targets(mode) : await this.compute.list()
+    if (!configured.some((host) => host.providerId === providerId)) {
+      throw new ComputeHostUnavailableError()
+    }
+  }
+
+  private async observeJobRead(
+    context: AgentComputeContext,
+    providerId: string,
+    jobId: string,
+    operation: 'status' | 'result',
+    snapshot: JobStatusResult | JobResult
+  ): Promise<AgentResultFollowUpDelivery> {
+    log.info('Agent queried Compute Job snapshot', {
+      sessionId: context.sessionId,
+      jobId,
+      operation,
+      status: snapshot.status,
+      resultFinal: snapshot.result_final
+    })
+    if (operation !== 'result' || !snapshot.result_final || !this.lifecycle.onFinalJobObserved) {
+      return 'pending'
+    }
+    // `result_final` belongs to this exact full-result response. status() deliberately remains a
+    // readiness projection because it omits harvested file lists and cannot prove that the Agent
+    // received the complete result that automatic delivery would carry.
+    return this.lifecycle.onFinalJobObserved(context, providerId, snapshot)
+  }
+
+  async list(sessionId: string): Promise<ComputeHost[]> {
+    const enabled = new Set(this.enabledIds(sessionId))
+    if (enabled.size === 0) return []
+    return (await this.compute.list()).filter((host) => enabled.has(host.providerId))
+  }
+
+  async listHosts(sessionId: string): Promise<AgentComputeHostSummary[]> {
+    const enabled = new Set(this.enabledIds(sessionId))
+    const selected = new Set(
+      this.registry.getSelected(sessionId).filter((providerId) => enabled.has(providerId))
+    )
+    const hosts = await this.list(sessionId)
+    const modes = new Set(
+      [...enabled].map(externalComputeMode).filter((mode) => mode !== undefined)
+    )
+    const targets = (
+      await Promise.all(
+        [...modes].map(async (mode) =>
+          (await this.targets(mode))
+            .filter((t) => enabled.has(t.providerId))
+            .map((t) => ({
+              provider_id: t.providerId,
+              display_name: t.displayName,
+              shape: 'bridge_runner' as const,
+              execution_mode: mode,
+              status: 'not_probed' as const
+            }))
+        )
+      )
+    ).flat()
+    return [...hosts.map(computeHostSummary), ...targets].map((host) => ({
+      ...host,
+      role: selected.has(host.provider_id) ? 'selected' : 'available'
+    }))
+  }
+
+  // Compatibility name: registered-but-disabled hosts are intentionally no longer returned.
+  listRegistered(sessionId: string): Promise<AgentComputeHostSummary[]> {
+    return this.listHosts(sessionId)
+  }
+
+  async listPreferred(sessionId: string): Promise<AgentComputeHostSummary[]> {
+    return (await this.listHosts(sessionId)).filter((host) => host.role === 'selected')
+  }
+
+  listCompute(sessionId: string): string[] {
+    return this.enabledIds(sessionId)
+  }
+
+  private async requireDetailsHost(sessionId: string, providerId: string): Promise<void> {
+    await this.requireEnabled(sessionId, providerId)
+    if (externalComputeMode(providerId)) {
+      throw new Error(
+        'Host details are available only for SSH hosts. Use host.compute.create(providerId).submitJob() for this target.'
+      )
+    }
+  }
+
+  async getDetails(sessionId: string, providerId: string): Promise<ComputeHostDetails> {
+    await this.requireDetailsHost(sessionId, providerId)
+    return this.compute.getDetails(providerId)
+  }
+
+  async appendDetails(
+    sessionId: string,
+    providerId: string,
+    request: { text: string; author: DetailsAuthor }
+  ): Promise<void> {
+    await this.requireDetailsHost(sessionId, providerId)
+    return this.compute.appendDetails(providerId, request)
+  }
+
+  async replaceDetails(
+    sessionId: string,
+    providerId: string,
+    request: { text: string; oldText: string; author: DetailsAuthor }
+  ): Promise<void> {
+    await this.requireDetailsHost(sessionId, providerId)
+    return this.compute.replaceDetails(providerId, request)
+  }
+
+  async callCommand(
+    context: AgentComputeContext,
+    providerId: string,
+    cmd: string,
+    intent: string,
+    loginShell = true,
+    timeoutSeconds?: number,
+    signal?: AbortSignal
+  ): Promise<ExecResult> {
+    await this.requireEnabled(context.sessionId, providerId)
+    return this.compute.callCommand(
+      providerId,
+      cmd,
+      intent,
+      loginShell,
+      timeoutSeconds,
+      context,
+      signal
+    )
+  }
+
+  async download(
+    context: AgentComputeContext,
+    providerId: string,
+    remotePath: string,
+    dest: DownloadDest,
+    signal?: AbortSignal
+  ): Promise<LocalFile> {
+    await this.requireEnabled(context.sessionId, providerId)
+    return this.compute.download(providerId, remotePath, dest, context, signal)
+  }
+
+  async submitJob(
+    context: AgentComputeContext,
+    providerId: string,
+    intent: string,
+    command: string,
+    options: Parameters<RawComputeService['submitJob']>[3],
+    signal?: AbortSignal
+  ): Promise<SubmitJobResult> {
+    await this.requireEnabled(context.sessionId, providerId)
+    if (externalComputeMode(providerId))
+      return this.compute.submitJob(providerId, intent, command, options, context, signal, () =>
+        this.requireEnabled(context.sessionId, providerId)
+      )
+    return this.compute.submitJob(providerId, intent, command, options, context, signal)
+  }
+
+  async getJobStatus(
+    context: AgentComputeContext,
+    providerId: string,
+    jobId: string
+  ): Promise<JobStatusResult> {
+    await this.requireEnabled(context.sessionId, providerId)
+    const status = await this.compute.getJobStatus(jobId, { ...context, providerId })
+    await this.observeJobRead(context, providerId, jobId, 'status', status)
+    return { ...status, follow_up_delivery: 'pending' }
+  }
+
+  async getJobResult(
+    context: AgentComputeContext,
+    providerId: string,
+    jobId: string
+  ): Promise<JobResult> {
+    await this.requireEnabled(context.sessionId, providerId)
+    const result = await this.compute.getJobResult(jobId, { ...context, providerId })
+    const followUpDelivery = await this.observeJobRead(context, providerId, jobId, 'result', result)
+    return { ...result, follow_up_delivery: followUpDelivery }
+  }
+
+  async cancelJob(
+    context: AgentComputeContext,
+    providerId: string,
+    jobId: string
+  ): Promise<JobStatusResult> {
+    await this.requireEnabled(context.sessionId, providerId)
+    return this.compute.cancelJob(jobId, { ...context, providerId })
+  }
+
+  setSessionConcurrencyLimit(sessionId: string, limit: number): Promise<void> {
+    return this.compute.setSessionConcurrencyLimit(sessionId, limit)
+  }
+
+  getSessionConcurrencyStatus(
+    sessionId: string
+  ): ReturnType<ComputeService['getSessionConcurrencyStatus']> {
+    return this.compute.getSessionConcurrencyStatus(sessionId)
+  }
+}
+
+export type {
+  AgentComputeContext,
+  AgentComputeLifecycle,
+  RawComputeService,
+  SessionComputeHostRegistry
+}

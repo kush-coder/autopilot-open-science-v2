@@ -1,0 +1,2062 @@
+import type { AcpMessageImage } from '../../../../shared/acp-image-contract'
+import * as annotationProtocol from '../../../../shared/annotations'
+import type { FileReference } from '../../../../shared/artifacts'
+import {
+  getActiveConversationContext,
+  rebindConversationGraphSessionId
+} from '../../../../shared/conversation-graph'
+import {
+  DEFAULT_PERMISSION_PROFILE,
+  type PermissionProfileId
+} from '../../../../shared/permission-profiles'
+import { VISION_MODEL_NOT_CONFIGURED_MESSAGE } from '../../../../shared/failure/messages'
+import {
+  withPdfContext as withPdf,
+  pdfProseReadingSelectionsFromContext,
+  withPdfProseReadingSelections,
+  type PdfProseReadingSelection,
+  type PdfReadingPositionSource
+} from '../../../../shared/session-pdf-context'
+import {
+  collectSessionReferences,
+  isSessionSizeLimitError,
+  materializeSessionConversationGraph,
+  MAX_SESSION_PDF_CONTEXTS,
+  type DeleteSessionRequest,
+  type SessionDeletionResult,
+  type DelegationPolicy,
+  type MessageAttribution,
+  type MessagePart,
+  type MessagePdfContextSnapshot,
+  type PdfReadingPosition,
+  type PersistedMessageAgentTarget,
+  type SessionPdfContextSource,
+  type SessionReference,
+  type SessionRuntimeContext
+} from '../../../../shared/session-persistence'
+import type { AgentFrameworkId, SessionAgentConfiguration } from '../../../../shared/settings'
+import {
+  DEFAULT_UPLOAD_PROJECT_ID,
+  toPersistedUploadedAttachment,
+  toRuntimeUploadedAttachment,
+  type UploadedAttachment
+} from '../../../../shared/uploads'
+import { i18next } from '../../i18n'
+import { validateImageAnnotationSourcesBeforeSend } from '../../pages/workspace/annotations/image-annotation-source-validation'
+import { toPersistedSession, useSessionStore } from '../../stores/session-store'
+import { isSessionDeletionAllowed } from '../../stores/session-actionability'
+import type { ChatMessage } from '../../stores/session-store-contract'
+import {
+  confirmPendingDelegationPolicyAuthority,
+  deleteSession,
+  flushSessionPersistence,
+  isSessionPersistenceDeferredError,
+  saveSessionInOrder
+} from '../session-persistence/session-persistence'
+import {
+  buildWorkspaceHistoryReplay,
+  resolveHistoryReplayTarget,
+  type HistoryReplayDescriptor
+} from './history-preamble'
+import type { useAcpRuntime } from './useAcpRuntime'
+import {
+  clearWorkspaceOperationError,
+  reportWorkspaceOperationError,
+  useWorkspaceOperationErrors
+} from './workspace-operation-error'
+import {
+  attemptWorkspacePromptRollback,
+  hasPendingWorkspacePromptRollback,
+  ownsWorkspacePromptPreparation,
+  prepareWorkspacePrompt,
+  retryPendingWorkspacePromptRollback,
+  rollbackWorkspacePrompt,
+  withdrawWorkspacePrompt,
+  type WorkspacePromptPreparation
+} from './workspace-prompt-preparation'
+import {
+  finalizeWorkspaceAttachments,
+  partitionWorkspacePromptAttachments
+} from './workspace-runtime-attachment-owner'
+import {
+  canAdmitExistingWorkspacePrompt,
+  consumePendingSessionRetry,
+  markPendingSessionRetryable,
+  prepareExistingWorkspacePrompt
+} from './workspace-runtime-prompt-preparation-owner'
+import {
+  branchWorkspaceSessionFromMessage,
+  reconcileBranchedAttachments
+} from './workspace-runtime-session-branch-owner'
+import { cleanupUnsentWorkspaceSession } from './workspace-runtime-session-cleanup-owner'
+type SendWorkspaceMessageIntent = {
+  expectedFrameworkId?: AgentFrameworkId
+  sessionId?: string
+  // Optional durable caller identity for restart-safe application-owned prompts.
+  messageId?: string
+  // Renderer-only notification: the real message now replaces the composer's pending preview.
+  onMessageAppended?: (message: SendWorkspaceMessageResult) => void
+  // Main has admitted this prompt; optimistic append alone does not establish ownership.
+  onPromptAccepted?: () => void
+  onPreparationRejected?: (
+    error: string,
+    sessionId?: string,
+    attachments?: UploadedAttachment[]
+  ) => void
+  onPreparationCancelled?: (sessionId?: string, attachments?: UploadedAttachment[]) => void
+  branchSourceSessionId?: string
+  branchSourceMessageId?: string
+  text: string
+  attribution?: MessageAttribution
+  requireExistingSession?: boolean
+  turnIntent?: 'plan-first'
+  attachments?: UploadedAttachment[]
+  annotations?: annotationProtocol.Annotation[]
+  cwd?: string
+  projectId?: string
+  permissionProfile?: PermissionProfileId
+  forcedSkillIds?: string[]
+  referencedArtifacts?: FileReference[]
+  pdfContext?: MessagePdfContextSnapshot
+  pdfReadingPosition?: PdfReadingPosition
+  pdfReadingPositionSource?: PdfReadingPositionSource
+  pdfProseReadingSelections?: readonly PdfProseReadingSelection[]
+  pendingPdfContextAttachmentIds?: string[]
+  pendingPdfContextVersions?: SessionPdfContextSource[]
+  parts?: MessagePart[]
+  specialistId?: string | null
+  enabledComputeHosts?: string[]
+  selectedComputeHosts?: string[]
+  agentConfiguration?: SessionAgentConfiguration
+  memoryEnabled?: boolean
+  autoReviewEnabled?: boolean
+  delegationPolicy?: DelegationPolicy
+  preserveSelection?: boolean
+  setupSessionToken?: string
+}
+type SendWorkspaceMessageCommand = SendWorkspaceMessageIntent & {
+  agentFrameworkId?: AgentFrameworkId
+  agentBackendId?: string
+  agentModel?: string
+  historyReplayDescriptor?: HistoryReplayDescriptor
+  forceHistoryReplay?: boolean
+  supportsImageInput?: boolean
+  supportsImageRelay?: boolean
+  truncateFromMessageId?: string
+  allowCompactionRecovery?: boolean
+}
+type SendWorkspaceMessageResult = { sessionId: string; messageId: string }
+type WorkspaceCommandLifecycle = {
+  // Ownership of asynchronous admission, before the command establishes its own prompt run.
+  isCurrent?: () => boolean
+  awaitPendingPreparation?: boolean
+  awaitPromptAdmission?: boolean
+  flushPersistence?: (target?: string) => Promise<void>
+  onSendPreparationStateChange?: (sessionId: string, inFlight: boolean) => void
+  drainRuntimeEvents?: (sessionId?: string) => Promise<void>
+  onSessionBound?: (pendingSessionId: string, sessionId: string) => void
+  onPdfContextLinked?: (sessionId: string, pdfContext: MessagePdfContextSnapshot) => void
+  onSessionSizeLimit?: (sessionId: string) => void
+}
+type ResendEditedMessageInput = {
+  expectedFrameworkId?: AgentFrameworkId
+  agentConfiguration?: SessionAgentConfiguration
+  onMessageAppended?: (message: SendWorkspaceMessageResult) => void
+  text: string
+  annotations?: annotationProtocol.Annotation[]
+  parts?: MessagePart[]
+  forcedSkillIds?: string[]
+  referencedArtifacts?: FileReference[]
+}
+type ResendEditedWorkspaceMessageOptions = WorkspaceCommandLifecycle & {
+  supportsImageInput?: boolean
+  supportsImageRelay?: boolean
+  agentFrameworkId?: AgentFrameworkId
+  agentBackendId?: string
+  agentModel?: string
+  agentConfiguration?: SessionAgentConfiguration
+  historyReplayDescriptor?: HistoryReplayDescriptor
+}
+type WorkspaceCommandRuntime = Pick<
+  ReturnType<typeof useAcpRuntime>,
+  'state' | 'createSession' | 'resumeSession' | 'resetSessionContext' | 'sendPrompt'
+> &
+  Partial<Pick<ReturnType<typeof useAcpRuntime>, 'currentRuntimeEvents' | 'deleteSession'>>
+type HistoryReplayContext = {
+  historyPreamble?: string
+  historyAttachments?: UploadedAttachment[]
+  historyImages?: AcpMessageImage[]
+}
+const errorMessage = (error: unknown): string =>
+  error instanceof Error ? error.message : String(error)
+
+// Snapshots the target a send actually runs with. Only a complete identity (framework + admitted
+// provider configuration) is stamped; a partial snapshot would mark false config changes.
+// Unpinned configurations omit model; catalog fallbacks on agentModel are not persisted.
+const resolveSendAgentTarget = (
+  input: Readonly<{
+    agentFrameworkId?: AgentFrameworkId
+    agentBackendId?: string
+    agentConfiguration?: SessionAgentConfiguration
+  }>
+): PersistedMessageAgentTarget | undefined => {
+  const configuration = input.agentConfiguration
+  if (!input.agentFrameworkId || !configuration) return undefined
+  const backendId = input.agentBackendId?.trim()
+  const model = configuration.model?.trim() || undefined
+  return {
+    frameworkId: input.agentFrameworkId,
+    ...(backendId ? { backendId } : {}),
+    providerId: configuration.providerId,
+    ...(model ? { model } : {}),
+    reasoningEffort: configuration.reasoningEffort
+  }
+}
+const createSessionFailureMessage = (error: unknown): string =>
+  errorMessage(error)
+    .replace(/^Error invoking remote method '[^']*':\s*/i, '')
+    .replace(/^Error(?::\s*|$)/i, '')
+    .trim() || 'Agent session could not be created.'
+const recoverPromptAttachments = (
+  sessionId: string,
+  messageId: string | undefined
+): UploadedAttachment[] | undefined => {
+  const source = useSessionStore.getState().sessions.find(({ id }) => id === sessionId)
+  const uploads = (
+    source?.conversationGraph?.messages.find(({ id }) => id === messageId) ??
+    source?.messages.find(({ id }) => id === messageId)
+  )?.uploads
+  const attempt = preparingSessionAttempts.get(sessionId)
+  const originals = attempt?.attachments ?? []
+  return uploads?.flatMap((upload) => {
+    const original = originals.find(({ id }) => id === upload.id)
+    const draftReceipt = attempt?.draftReceipts.get(upload.id)
+    const attachment =
+      upload.versionId || upload.path
+        ? toRuntimeUploadedAttachment(upload, source?.projectId)
+        : original
+    // Message projections deliberately omit Web draft receipts. Recover that renderer-only field
+    // from the original draft without replacing a finalized upload's current owner or Version.
+    return attachment ? [{ ...attachment, ...(draftReceipt ? { draftReceipt } : {}) }] : []
+  })
+}
+const rejectPreparedPrompt = async (
+  sessionId: string,
+  message: string,
+  preparation: WorkspacePromptPreparation | undefined,
+  rejected:
+    ((error: string, sessionId?: string, attachments?: UploadedAttachment[]) => void) | undefined,
+  providerTarget: Pick<SessionAgentConfiguration, 'providerId' | 'model'> | undefined
+): Promise<void> => {
+  if (preparingSessionAttempts.get(sessionId)?.cancelled) return
+  if (preparation && !ownsWorkspacePromptPreparation(preparation)) return
+  const attempt = preparingSessionAttempts.get(sessionId)
+  if (attempt) {
+    attempt.failed = true
+    attempt.endPresentation()
+  }
+  const restoredAttachments = recoverPromptAttachments(sessionId, preparation?.promptMessageId)
+  // Start compensation before removing optimistic intents; keep the exact write protected.
+  const cleanup = preparation ? attemptWorkspacePromptRollback(preparation) : undefined
+  if (attempt) attempt.rollback = cleanup
+  if (preparation) withdrawWorkspacePrompt(preparation)
+  markPendingSessionRetryable(sessionId)
+  reportWorkspaceOperationError(sessionId, message, { providerTarget })
+  rejected?.(message, sessionId, restoredAttachments)
+  void cleanup?.then(({ failure }) => {
+    if (failure !== undefined) console.warn('Unsent prompt rollback failed', failure)
+  })
+}
+const replayHistory = (
+  messages: ChatMessage[],
+  input: SendWorkspaceMessageCommand,
+  projectId?: string
+): HistoryReplayContext | undefined =>
+  buildWorkspaceHistoryReplay(
+    messages,
+    input.historyReplayDescriptor ?? { target: resolveHistoryReplayTarget(input.agentFrameworkId) },
+    projectId,
+    input.supportsImageInput === true || input.supportsImageRelay === true
+      ? true
+      : input.supportsImageInput
+  )
+
+const promptContext = (
+  sessionId: string,
+  messageId: string
+): ReturnType<typeof getActiveConversationContext> | { promptMessageId: string } => {
+  const graph = useSessionStore
+    .getState()
+    .sessions.find((item) => item.id === sessionId)?.conversationGraph
+  return graph ? getActiveConversationContext(graph, messageId) : { promptMessageId: messageId }
+}
+
+const ownsPrompt = (sessionId: string, messageId: string): boolean => {
+  const session = useSessionStore.getState().sessions.find((item) => item.id === sessionId)
+  return session?.status === 'running' && session.activeRun?.promptMessageId === messageId
+}
+
+type PromptDispatch = {
+  providerTarget: Pick<SessionAgentConfiguration, 'providerId' | 'model'> | undefined
+  sessionId: string
+  messageId: string
+  content: string
+  annotations?: annotationProtocol.Annotation[]
+  attachments: UploadedAttachment[]
+  forcedSkillIds?: string[]
+  referencedArtifacts?: FileReference[]
+  referencedSessions?: SessionReference[]
+  parts?: MessagePart[]
+  replay?: HistoryReplayContext & {
+    resumeFallback?: HistoryReplayContext
+    contextReset?: boolean
+  }
+  turnIntent?: SendWorkspaceMessageIntent['turnIntent']
+  accepted?: () => void
+  onPromptAccepted?: SendWorkspaceMessageIntent['onPromptAccepted']
+  preparation?: WorkspacePromptPreparation
+  rejected?: (error: string, sessionId?: string, attachments?: UploadedAttachment[]) => void
+  beforeDispatch?: () => void
+  cancelled?: () => boolean
+}
+
+const dispatchPrompt = (
+  runtime: WorkspaceCommandRuntime,
+  request: PromptDispatch
+): Promise<boolean> => {
+  // Recovery can rearm the same Message, so its ID cannot identify a dispatch attempt.
+  const admittedRun = useSessionStore
+    .getState()
+    .sessions.find((session) => session.id === request.sessionId)?.activeRun
+  const isCurrent = (): boolean => {
+    if (request.cancelled?.()) return false
+    if (request.preparation) return ownsWorkspacePromptPreparation(request.preparation)
+    const current = useSessionStore
+      .getState()
+      .sessions.find((session) => session.id === request.sessionId)?.activeRun
+    return (
+      admittedRun !== undefined &&
+      current?.promptMessageId === admittedRun.promptMessageId &&
+      current.startedAt === admittedRun.startedAt
+    )
+  }
+  let resolveAdmission!: (accepted: boolean) => void
+  const admission = new Promise<boolean>((resolve) => {
+    resolveAdmission = resolve
+  })
+  void admission.then((accepted) => {
+    if (accepted) request.onPromptAccepted?.()
+  })
+  const unsubscribe = useSessionStore.subscribe(() => {
+    if (!request.preparation) return
+    const session = useSessionStore
+      .getState()
+      .sessions.find((candidate) => candidate.id === request.sessionId)
+    if (
+      session?.runtimeSessionAdmissions?.some(
+        ({ promptMessageId, executionId }) =>
+          promptMessageId === request.messageId &&
+          !request.preparation!.previousAdmissionIds.has(executionId)
+      )
+    ) {
+      unsubscribe()
+      resolveAdmission(true)
+    }
+  })
+  const preparedAnnotations = annotationProtocol.prepareAnnotationsForAgent(
+    request.content,
+    request.annotations ?? [],
+    request.referencedArtifacts
+  )
+  const args = [
+    request.sessionId,
+    preparedAnnotations.promptText,
+    request.attachments,
+    request.forcedSkillIds,
+    preparedAnnotations.referencedArtifacts,
+    request.replay?.historyPreamble,
+    request.replay?.historyAttachments,
+    request.replay?.historyImages,
+    request.replay?.resumeFallback,
+    promptContext(request.sessionId, request.messageId),
+    request.replay?.contextReset,
+    request.turnIntent,
+    useSessionStore.getState().sessions.find((session) => session.id === request.sessionId)
+      ?.memoryEnabled !== false
+  ] as const
+  const currentImages = preparedAnnotations.images
+  const referencedSessions = request.referencedSessions?.length
+    ? request.referencedSessions
+    : undefined
+  let result: ReturnType<WorkspaceCommandRuntime['sendPrompt']>
+  try {
+    request.beforeDispatch?.()
+    result =
+      currentImages?.length || request.parts?.length
+        ? runtime.sendPrompt(...args, referencedSessions, currentImages, request.parts)
+        : referencedSessions
+          ? runtime.sendPrompt(...args, referencedSessions)
+          : runtime.sendPrompt(...args)
+  } catch (error) {
+    unsubscribe()
+    throw error
+  }
+  void result
+    .then(() => {
+      unsubscribe()
+      request.accepted?.()
+      resolveAdmission(true)
+    })
+    .catch(async (error) => {
+      unsubscribe()
+      if (
+        request.cancelled?.() &&
+        request.preparation &&
+        ownsWorkspacePromptPreparation(request.preparation)
+      ) {
+        // Stop after dispatch keeps the sent Message. If Main never admitted a turn, no terminal
+        // event can release its preparation; the exact receipt conditionally releases it instead.
+        await attemptWorkspacePromptRollback(request.preparation, true)
+      } else if (isCurrent()) {
+        const message = errorMessage(error).trim() || 'Agent run failed'
+        await rejectPreparedPrompt(
+          request.sessionId,
+          message,
+          request.preparation,
+          request.rejected,
+          request.providerTarget
+        )
+      }
+      resolveAdmission(false)
+    })
+  return admission
+}
+
+type PendingPromptRequest = SendWorkspaceMessageCommand & {
+  pending: SendWorkspaceMessageResult
+  content: string
+  attachments: UploadedAttachment[]
+  permissionProfile: PermissionProfileId
+  specialistId?: string
+  replay?: HistoryReplayContext
+  contextReset?: boolean
+}
+
+const readingSourceForSend = (
+  request: Pick<SendWorkspaceMessageIntent, 'pdfReadingPositionSource' | 'pdfContext'>,
+  attachments: UploadedAttachment[]
+): SessionPdfContextSource | undefined => {
+  const identity = request.pdfReadingPositionSource
+  if (!identity) {
+    return request.pdfContext?.bindings.find(
+      (binding) =>
+        binding.bindingId ===
+        (request.pdfContext?.activeBindingId ?? request.pdfContext?.bindings[0]?.bindingId)
+    )
+  }
+  if (!('attachmentId' in identity)) return identity
+  const attachment = attachments.find(({ id }) => id === identity.attachmentId)
+  return attachment?.versionId
+    ? { sourceKind: 'upload-version', sourceVersionId: attachment.versionId }
+    : undefined
+}
+
+const linkPdfContextForSend = async ({
+  sessionId,
+  pendingSessionId,
+  projectId,
+  sources,
+  pdfReadingPosition,
+  readingSource,
+  excludeSinglePage = false,
+  materializedRuntimeRevision
+}: {
+  sessionId: string
+  pendingSessionId?: string
+  projectId: string | undefined
+  sources: SessionPdfContextSource[]
+  pdfReadingPosition?: PdfReadingPosition
+  readingSource?: SessionPdfContextSource
+  excludeSinglePage?: boolean
+  materializedRuntimeRevision?: number
+}): Promise<MessagePdfContextSnapshot | undefined> => {
+  if (!projectId) throw new Error('The PDF Project is unavailable for Session context.')
+  const localSessionId = pendingSessionId ?? sessionId
+  let source = useSessionStore
+    .getState()
+    .sessions.find((candidate) => candidate.id === localSessionId)
+  if (!source) throw new Error(`Session not found: ${localSessionId}`)
+  const expectedRevision = materializedRuntimeRevision ?? source.runtimeContext?.revision ?? 0
+
+  const runtimeContext: SessionRuntimeContext = await window.api.sessions.linkPdfContext({
+    projectId,
+    sessionId,
+    expectedRevision,
+    sources,
+    ...(excludeSinglePage ? { excludeSinglePage: true } : {})
+  })
+  const pdfContext = runtimeContext.pdfContext
+  const readingBinding = readingSource
+    ? pdfContext?.bindings.find(
+        (binding) =>
+          binding.sourceKind === readingSource.sourceKind &&
+          binding.sourceVersionId === readingSource.sourceVersionId
+      )
+    : undefined
+  const activeBinding =
+    readingBinding ??
+    sources
+      .map(({ sourceKind, sourceVersionId }) =>
+        pdfContext?.bindings.find(
+          (binding) =>
+            binding.sourceKind === sourceKind && binding.sourceVersionId === sourceVersionId
+        )
+      )
+      .find((binding) => binding !== undefined)
+  const canApplyReadingPosition = readingBinding !== undefined && pdfReadingPosition !== undefined
+  const messagePdfContext: MessagePdfContextSnapshot | undefined = pdfContext
+    ? {
+        ...pdfContext,
+        ...(activeBinding ? { activeBindingId: activeBinding.bindingId } : {}),
+        ...(canApplyReadingPosition ? { readingPosition: pdfReadingPosition } : {})
+      }
+    : undefined
+
+  source = useSessionStore.getState().sessions.find((candidate) => candidate.id === localSessionId)
+  if (!source) throw new Error(`Session not found: ${localSessionId}`)
+  useSessionStore.getState().applyDurableSessionProjection({
+    source,
+    session: {
+      ...toPersistedSession(source),
+      runtimeContext,
+      updatedAt: Math.max(source.updatedAt, Date.now())
+    },
+    mode: 'runtime-context-authority'
+  })
+  return messagePdfContext
+}
+
+const finalizedPdfContextSources = ({
+  attachmentIds,
+  attachments
+}: {
+  attachmentIds: string[]
+  attachments: UploadedAttachment[]
+}): SessionPdfContextSource[] => {
+  const selected = attachmentIds.map((attachmentId) =>
+    attachments.find((candidate) => candidate.id === attachmentId)
+  )
+  if (selected.some((attachment) => !attachment?.versionId)) {
+    throw new Error('The staged PDF could not be finalized for Session context.')
+  }
+  return selected.map((attachment) => ({
+    sourceKind: 'upload-version',
+    sourceFileId: attachment!.id,
+    sourceVersionId: attachment!.versionId!
+  }))
+}
+
+const filterPendingPdfContext = async (
+  request: Pick<
+    PendingPromptRequest,
+    'attachments' | 'pendingPdfContextAttachmentIds' | 'pendingPdfContextVersions' | 'projectId'
+  >
+): Promise<{
+  attachmentIds: string[]
+  versions: SessionPdfContextSource[]
+}> => {
+  const selectedAttachmentIds = new Set(request.pendingPdfContextAttachmentIds ?? [])
+  const pendingAttachments: Array<{
+    attachmentId: string
+    path: string
+    name: string
+    mimeType?: string
+  }> = []
+  const versions: SessionPdfContextSource[] = [...(request.pendingPdfContextVersions ?? [])]
+  for (const attachmentId of selectedAttachmentIds) {
+    const attachment = request.attachments.find((candidate) => candidate.id === attachmentId)
+    if (!attachment) throw new Error('The staged PDF is no longer attached to this message.')
+    if (attachment.versionId) {
+      versions.push({
+        sourceKind: 'upload-version',
+        sourceFileId: attachment.id,
+        sourceVersionId: attachment.versionId
+      })
+      continue
+    }
+    pendingAttachments.push({
+      attachmentId,
+      path: attachment.path,
+      name: attachment.name,
+      ...(attachment.mimeType ? { mimeType: attachment.mimeType } : {})
+    })
+  }
+  const uniqueVersions = Array.from(
+    new Map(
+      versions.map((source) => [`${source.sourceKind}:${source.sourceVersionId}`, source])
+    ).values()
+  )
+  if (uniqueVersions.length === 0 && pendingAttachments.length === 0) {
+    return { attachmentIds: [], versions: [] }
+  }
+  if (!request.projectId) throw new Error('PDF context requires a Project.')
+  const eligible = await window.api.sessions.filterPdfContextCandidates({
+    projectId: request.projectId,
+    sources: uniqueVersions,
+    ...(pendingAttachments.length > 0 ? { pendingAttachments } : {})
+  })
+  const missingLiterature = (request.pendingPdfContextVersions ?? []).filter(
+    (source) =>
+      source.sourceKind === 'literature-attachment-version' &&
+      !eligible.sources.some(
+        (available) =>
+          available.sourceKind === source.sourceKind &&
+          available.sourceVersionId === source.sourceVersionId
+      )
+  )
+  if (missingLiterature.length) {
+    throw new Error(
+      i18next.t(
+        'Selected literature versions are unavailable: {{versions}}. Remove or reselect them before sending.',
+        { versions: missingLiterature.map(({ sourceVersionId }) => sourceVersionId).join(', ') }
+      )
+    )
+  }
+  return {
+    attachmentIds: [...eligible.pendingAttachmentIds],
+    versions: [...eligible.sources]
+  }
+}
+
+const pendingPromptSeed = (
+  source: Parameters<typeof toPersistedSession>[0],
+  promptMessageId: string,
+  sessionId = source.id
+): ReturnType<typeof toPersistedSession> => {
+  const seed = toPersistedSession(source)
+  const graph =
+    seed.conversationGraph &&
+    rebindConversationGraphSessionId(seed.conversationGraph, source.id, sessionId)
+  const prompt = graph?.messages.find(({ id }) => id === promptMessageId)
+  return {
+    ...seed,
+    id: sessionId,
+    status: 'idle',
+    delegationPolicy: source.delegationPolicyAuthorityPending ? 'allow' : seed.delegationPolicy,
+    activeRun: undefined,
+    error: undefined,
+    failure: undefined,
+    messages: seed.messages.filter(({ id }) => id !== promptMessageId),
+    ...(graph
+      ? {
+          conversationGraph: {
+            ...graph,
+            messages: graph.messages.filter(({ id }) => id !== promptMessageId),
+            branches: graph.branches.map((branch) =>
+              branch.headMessageId === promptMessageId
+                ? { ...branch, headMessageId: prompt?.parentMessageId }
+                : branch
+            )
+          }
+        }
+      : {})
+  }
+}
+const withdrawUnboundPendingPrompt = (pending: SendWorkspaceMessageResult): void => {
+  const source = useSessionStore.getState().sessions.find(({ id }) => id === pending.sessionId)
+  if (source?.isPending && source.activeRun?.promptMessageId === pending.messageId) {
+    useSessionStore.getState().applyDurableSessionProjection({
+      source,
+      session: pendingPromptSeed(source, pending.messageId),
+      mode: 'prompt-rollback-authority'
+    })
+    // A rejected pending admission may have a queued start-run command replayed by the
+    // authority projection. Keep the optimistic pending Session idle so the same composer can
+    // retry without exposing a renderer-owned terminal error state.
+    useSessionStore.setState((state) => ({
+      sessions: state.sessions.map((candidate) =>
+        candidate.id === pending.sessionId && candidate.isPending
+          ? {
+              ...candidate,
+              pendingRetryable: true,
+              status: 'idle',
+              activeRun: undefined,
+              activeRunRuntimeSegmentId: undefined,
+              agentStatus: undefined,
+              awaitingFirstAgentOutput: undefined,
+              agentPromptInFlight: undefined
+            }
+          : candidate
+      )
+    }))
+  }
+}
+const rejectUnboundPendingPrompt = async (
+  pending: SendWorkspaceMessageResult,
+  message: string,
+  rejected: SendWorkspaceMessageIntent['onPreparationRejected'],
+  providerTarget: Pick<SessionAgentConfiguration, 'providerId' | 'model'> | undefined
+): Promise<void> => {
+  if (!ownsPrompt(pending.sessionId, pending.messageId)) return
+  withdrawUnboundPendingPrompt(pending)
+  await rejectPreparedPrompt(pending.sessionId, message, undefined, rejected, providerTarget)
+}
+
+const startPendingPrompt = (
+  runtime: WorkspaceCommandRuntime,
+  request: PendingPromptRequest,
+  onSessionBound?: (pendingSessionId: string, sessionId: string) => void,
+  onPdfContextLinked?: (sessionId: string, pdfContext: MessagePdfContextSnapshot) => void,
+  onSessionSizeLimit?: (sessionId: string) => void,
+  attempt?: WorkspaceSendAttempt
+): Promise<SendWorkspaceMessageResult | undefined> => {
+  let bindingSessionId: string | undefined
+  return (async () => {
+    let promptPreparation: WorkspacePromptPreparation | undefined
+    const pending = request.pending
+    if (!ownsPrompt(pending.sessionId, pending.messageId)) return undefined
+    let created
+    let eligiblePendingPdfContext: Awaited<ReturnType<typeof filterPendingPdfContext>>
+    try {
+      eligiblePendingPdfContext = await filterPendingPdfContext(request)
+      if (attempt?.cancelled || !ownsPrompt(pending.sessionId, pending.messageId)) return undefined
+      const literatureContext =
+        (request.pdfContext?.bindings.length ?? 0) > 0 ||
+        eligiblePendingPdfContext.attachmentIds.length > 0 ||
+        eligiblePendingPdfContext.versions.length > 0
+      const target =
+        request.agentFrameworkId && request.agentConfiguration
+          ? { frameworkId: request.agentFrameworkId, ...request.agentConfiguration }
+          : undefined
+      const createSessionArgs = [
+        request.cwd,
+        request.projectId,
+        request.permissionProfile,
+        request.specialistId ?? undefined,
+        target,
+        request.memoryEnabled !== false
+      ] as const
+      created = literatureContext
+        ? await runtime.createSession(...createSessionArgs, true, request.setupSessionToken)
+        : await runtime.createSession(...createSessionArgs, undefined, request.setupSessionToken)
+    } catch (error) {
+      if (ownsPrompt(pending.sessionId, pending.messageId)) {
+        await rejectUnboundPendingPrompt(
+          pending,
+          createSessionFailureMessage(error),
+          request.onPreparationRejected,
+          request.agentConfiguration
+        )
+      }
+      return undefined
+    }
+    const discardCreated = (): void => {
+      if (!created?.sessionId) return
+      const cleanup = cleanupUnsentWorkspaceSession(
+        {
+          projectId: request.projectId ?? DEFAULT_UPLOAD_PROJECT_ID,
+          sessionId: created.sessionId
+        },
+        runtime.deleteSession ? () => runtime.deleteSession!(created.sessionId) : undefined
+      )
+      if (attempt) attempt.cleanup = cleanup
+    }
+    if (attempt?.cancelled || !ownsPrompt(pending.sessionId, pending.messageId)) {
+      discardCreated()
+      return undefined
+    }
+    if (!created?.sessionId) {
+      await rejectUnboundPendingPrompt(
+        pending,
+        'Agent session could not be created.',
+        request.onPreparationRejected,
+        request.agentConfiguration
+      )
+      return undefined
+    }
+    const cwd = created.cwd ?? request.cwd
+    if (!cwd) {
+      discardCreated()
+      await rejectUnboundPendingPrompt(
+        pending,
+        'Agent session did not return a workspace.',
+        request.onPreparationRejected,
+        request.agentConfiguration
+      )
+      return undefined
+    }
+    const pendingSession = useSessionStore
+      .getState()
+      .sessions.find((session) => session.id === pending.sessionId)
+    if (!pendingSession) {
+      discardCreated()
+      return undefined
+    }
+    // Persist an empty/copied-history seed while the optimistic prompt remains isPending and
+    // invisible to the saver. Main then captures a real baseline before binding publishes it.
+    const seed = pendingPromptSeed(pendingSession, pending.messageId, created.sessionId)
+    Object.assign(seed, {
+      cwd,
+      agentFrameworkId: created.frameworkId,
+      agentBackendId: created.backendId,
+      providerSessionId: created.providerSessionId,
+      providerContinuityToken: created.providerContinuityToken
+    })
+    let attachments = request.attachments
+    let pdfContext = request.pdfContext
+    let delegationAuthority: ReturnType<typeof toPersistedSession> | undefined
+    const bindPreparedPrompt = (): string | undefined => {
+      const bound = useSessionStore.getState().bindPendingSession({
+        pendingSessionId: pending.sessionId,
+        sessionId: created.sessionId,
+        cwd,
+        agentFrameworkId: created.frameworkId,
+        agentBackendId: created.backendId,
+        providerSessionId: created.providerSessionId,
+        providerContinuityToken: created.providerContinuityToken,
+        wslSetup: created.wslSetup,
+        preparationId: promptPreparation!.id,
+        preparationBaseline: promptPreparation!.authority
+      })
+      if (!bound) return undefined
+      if (attempt) {
+        attempt.preparation = promptPreparation
+        attempt.message = { sessionId: created.sessionId, messageId: bound.messageId! }
+        trackWorkspaceSendPreparation(attempt, created.sessionId)
+        attempt.endPresentation(pending.sessionId)
+      }
+      onSessionBound?.(pending.sessionId, created.sessionId)
+      if (delegationAuthority)
+        useSessionStore.getState().applyDelegationPolicyAuthority(promptPreparation!.authority)
+      return bound?.messageId
+    }
+    const rollbackCancelledPreparation = async (): Promise<void> => {
+      const rollback = await attemptWorkspacePromptRollback(promptPreparation!)
+      if (rollback.failure !== undefined) {
+        console.warn('Unsent prompt rollback failed', rollback.failure)
+        if (!useSessionStore.getState().sessions.some(({ id }) => id === created.sessionId))
+          useSessionStore.getState().upsertPersistedSession(promptPreparation!.authority)
+      } else if (attempt?.message?.sessionId !== created.sessionId) discardCreated()
+      if (attempt) attempt.preparation = undefined
+    }
+    // Main publishes the seed before preparation finishes. Keep that authority in the store,
+    // but present only its optimistic row until binding replaces the two identities atomically.
+    bindingSessionId = created.sessionId
+    useSessionStore.setState((state) => ({
+      sessions: state.sessions.map((session) =>
+        session.id === pending.sessionId && session.isPending
+          ? { ...session, pendingBindingSessionId: bindingSessionId }
+          : session
+      )
+    }))
+    try {
+      const durableSeed = await saveSessionInOrder(seed)
+      if (attempt?.cancelled || !ownsPrompt(pending.sessionId, pending.messageId)) {
+        discardCreated()
+        return undefined
+      }
+      promptPreparation = await prepareWorkspacePrompt(durableSeed, pending.messageId, 'new')
+      if (!ownsPrompt(pending.sessionId, pending.messageId)) {
+        await rollbackCancelledPreparation()
+        return undefined
+      }
+      if (attempt) attempt.bindForCancellation = bindPreparedPrompt
+      // Normal admission binds after immutable inputs complete. Stop may bind earlier solely to
+      // preserve an upload's retry owner, withdrawing its append/start intents synchronously.
+      if (pendingSession.delegationPolicyAuthorityPending) {
+        delegationAuthority = await window.api.sessions.setDelegationPolicy(
+          durableSeed.projectId,
+          durableSeed.id,
+          pendingSession.delegationPolicy ?? 'allow'
+        )
+        promptPreparation.authority = delegationAuthority
+        if (!ownsPrompt(pending.sessionId, pending.messageId)) {
+          await rollbackCancelledPreparation()
+          return undefined
+        }
+      }
+      attachments = await finalizeWorkspaceAttachments({
+        sessionId: created.sessionId,
+        attachments,
+        projectId: request.projectId
+      })
+      if (attempt) attempt.attachments = attachments
+      if (attempt?.cancelled || !ownsPrompt(pending.sessionId, pending.messageId)) {
+        await rollbackCancelledPreparation()
+        return undefined
+      }
+      useSessionStore.getState().replaceMessageUploads({
+        sessionId: pending.sessionId,
+        messageId: pending.messageId,
+        uploads: attachments.map(toPersistedUploadedAttachment)
+      })
+      const pdfContextSources = [
+        ...finalizedPdfContextSources({
+          attachmentIds: eligiblePendingPdfContext.attachmentIds,
+          attachments
+        }),
+        ...eligiblePendingPdfContext.versions
+      ].slice(0, Math.max(0, MAX_SESSION_PDF_CONTEXTS - (pdfContext?.bindings.length ?? 0)))
+      if (pdfContextSources.length > 0) {
+        pdfContext = await linkPdfContextForSend({
+          sessionId: created.sessionId,
+          pendingSessionId: pending.sessionId,
+          projectId: request.projectId,
+          sources: pdfContextSources,
+          pdfReadingPosition: request.pdfReadingPosition,
+          readingSource: readingSourceForSend(request, attachments),
+          excludeSinglePage: true,
+          materializedRuntimeRevision:
+            (delegationAuthority ?? durableSeed).runtimeContext?.revision ?? 0
+        })
+        if (!ownsPrompt(pending.sessionId, pending.messageId)) {
+          await rollbackCancelledPreparation()
+          return undefined
+        }
+      }
+      pdfContext = withPdfProseReadingSelections(
+        pdfContext,
+        request.pdfProseReadingSelections ??
+          pdfProseReadingSelectionsFromContext(request.pdfContext),
+        attachments
+      )
+      if (pdfContext)
+        useSessionStore.getState().replaceMessagePdfContext({
+          sessionId: pending.sessionId,
+          messageId: pending.messageId,
+          pdfContext
+        })
+    } catch (error) {
+      if (promptPreparation) {
+        if (!ownsPrompt(pending.sessionId, pending.messageId)) {
+          await rollbackCancelledPreparation()
+          return undefined
+        }
+        const messageId = bindPreparedPrompt()
+        if (isSessionSizeLimitError(error)) onSessionSizeLimit?.(created.sessionId)
+        if (pendingSession.delegationPolicyAuthorityPending && !delegationAuthority) {
+          void runtime.deleteSession?.(created.sessionId).catch((cleanupError) => {
+            console.warn('Agent Session cleanup after persistence failure failed', cleanupError)
+          })
+        }
+        if (messageId && ownsPrompt(created.sessionId, messageId))
+          await rejectPreparedPrompt(
+            created.sessionId,
+            errorMessage(error),
+            promptPreparation,
+            request.onPreparationRejected,
+            request.agentConfiguration
+          )
+        return undefined
+      }
+      if (isSessionSizeLimitError(error)) onSessionSizeLimit?.(pending.sessionId)
+      // The pending Session retries by creating a new Agent Session, so the seed persisted under
+      // created.sessionId (it may carry copied Branch history) would otherwise remain as a ghost.
+      // Only this attempt's own new Session is deleted; a Branch source is never touched.
+      if (attempt?.cancelled || !ownsPrompt(pending.sessionId, pending.messageId)) {
+        discardCreated()
+        return undefined
+      }
+      await rejectUnboundPendingPrompt(
+        pending,
+        errorMessage(error),
+        request.onPreparationRejected,
+        request.agentConfiguration
+      )
+      discardCreated()
+      return undefined
+    }
+    const boundMessageId = bindPreparedPrompt()
+    if (!boundMessageId || !ownsPrompt(created.sessionId, boundMessageId)) return undefined
+
+    if (
+      pdfContext &&
+      (eligiblePendingPdfContext.attachmentIds.length > 0 ||
+        eligiblePendingPdfContext.versions.length > 0)
+    )
+      onPdfContextLinked?.(created.sessionId, pdfContext)
+
+    try {
+      const ready = useSessionStore
+        .getState()
+        .sessions.find((candidate) => candidate.id === created.sessionId)
+      if (!ready) return undefined
+      await saveSessionInOrder(toPersistedSession(ready))
+    } catch (error) {
+      if (attempt?.cancelled) return undefined
+      if (isSessionSizeLimitError(error)) onSessionSizeLimit?.(created.sessionId)
+      await rejectPreparedPrompt(
+        created.sessionId,
+        errorMessage(error),
+        promptPreparation,
+        request.onPreparationRejected,
+        request.agentConfiguration
+      )
+      return undefined
+    }
+    if (attempt?.cancelled || !ownsPrompt(created.sessionId, boundMessageId)) {
+      await attemptWorkspacePromptRollback(promptPreparation)
+      if (attempt) attempt.preparation = undefined
+      return undefined
+    }
+    try {
+      const admission = dispatchPrompt(runtime, {
+        providerTarget: request.agentConfiguration,
+        sessionId: created.sessionId,
+        messageId: boundMessageId,
+        content: request.content,
+        annotations: request.annotations,
+        attachments,
+        forcedSkillIds: request.forcedSkillIds,
+        referencedArtifacts: withPdf(request.projectId, request.referencedArtifacts, pdfContext),
+        referencedSessions: collectSessionReferences(request.parts),
+        parts: request.parts,
+        replay: {
+          ...request.replay,
+          ...(request.specialistId ? { resumeFallback: request.replay } : {}),
+          contextReset: Boolean(request.contextReset)
+        },
+        turnIntent: request.turnIntent,
+        beforeDispatch: () => {
+          if (attempt) {
+            attempt.dispatched = true
+            useSessionStore.setState((state) => ({
+              sessions: state.sessions.map((session) =>
+                attempt.sessionIds.has(session.id) && session.firstPromptDraft
+                  ? { ...session, firstPromptDraft: undefined, pendingRetryable: undefined }
+                  : session
+              )
+            }))
+            attempt.endPresentation()
+          }
+        },
+        preparation: promptPreparation,
+        cancelled: () => attempt?.cancelled === true,
+        rejected: request.onPreparationRejected,
+        onPromptAccepted: request.onPromptAccepted,
+        accepted: () =>
+          useSessionStore.getState().clearPendingContextReplay(created.sessionId, boundMessageId)
+      })
+      if (attempt) attempt.promptAdmission = admission
+    } catch (error) {
+      if (ownsWorkspacePromptPreparation(promptPreparation)) {
+        await rejectPreparedPrompt(
+          created.sessionId,
+          errorMessage(error),
+          promptPreparation,
+          request.onPreparationRejected,
+          request.agentConfiguration
+        )
+      }
+      return undefined
+    }
+    return { sessionId: created.sessionId, messageId: boundMessageId }
+  })().finally(() => {
+    if (!bindingSessionId) return
+    // Retain the real identity if cleanup failed so Delete can retry it. An older attempt
+    // must not release a newer retry's binding.
+    const releaseBinding = (): void =>
+      useSessionStore.setState((state) => {
+        if (
+          !state.sessions.some(
+            (session) =>
+              session.id === request.pending.sessionId &&
+              session.pendingBindingSessionId === bindingSessionId
+          )
+        )
+          return state
+        return {
+          sessions: state.sessions.map((session) =>
+            session.id === request.pending.sessionId &&
+            session.pendingBindingSessionId === bindingSessionId
+              ? { ...session, pendingBindingSessionId: undefined }
+              : session
+          )
+        }
+      })
+    if (attempt?.cleanup)
+      void attempt.cleanup.then((result) => {
+        if (result.status === 'deleted') releaseBinding()
+        else if (!useWorkspaceOperationErrors.getState().errors[request.pending.sessionId])
+          reportWorkspaceOperationError(
+            request.pending.sessionId,
+            'Agent Session cleanup did not complete.'
+          )
+      })
+    else releaseBinding()
+  })
+}
+
+const performSendWorkspaceMessage = async (
+  runtime: WorkspaceCommandRuntime,
+  input: SendWorkspaceMessageCommand,
+  lifecycle: WorkspaceCommandLifecycle = {},
+  attempt?: WorkspaceSendAttempt
+): Promise<SendWorkspaceMessageResult | undefined> => {
+  let promptPreparation: WorkspacePromptPreparation | undefined
+  if (input.sessionId) clearWorkspaceOperationError(input.sessionId)
+  if (input.sessionId && hasPendingWorkspacePromptRollback(input.sessionId)) {
+    // A prior rejected preparation whose rollback failed still owns the Session in Main.
+    const { failure } = await retryPendingWorkspacePromptRollback(input.sessionId)
+    if (failure !== undefined) {
+      reportWorkspaceOperationError(input.sessionId, failure)
+      return undefined
+    }
+  }
+  if (input.branchSourceSessionId && input.branchSourceMessageId) {
+    return branchWorkspaceSessionFromMessage(
+      runtime,
+      {
+        sourceSessionId: input.branchSourceSessionId,
+        sourceMessageId: input.branchSourceMessageId,
+        agentFrameworkId: input.agentFrameworkId,
+        agentBackendId: input.agentBackendId,
+        agentModel: input.agentModel,
+        agentConfiguration: input.agentConfiguration,
+        delegationPolicy: input.delegationPolicy,
+        specialistId: input.specialistId
+      },
+      lifecycle.onSessionSizeLimit
+    )
+  }
+  if (lifecycle.isCurrent?.() === false) return undefined
+  const content = input.text.trim()
+  const replaySession = input.sessionId
+    ? useSessionStore.getState().sessions.find((item) => item.id === input.sessionId)
+    : undefined
+  const replayPrompt = replaySession?.pendingContextReplayMessageId
+    ? replaySession.messages.find((item) => item.id === replaySession.pendingContextReplayMessageId)
+    : undefined
+  const initialReadingSource = readingSourceForSend(input, [])
+  const initialReadingBinding = input.pdfContext?.bindings.find(
+    (binding) =>
+      binding.sourceKind === initialReadingSource?.sourceKind &&
+      binding.sourceVersionId === initialReadingSource.sourceVersionId
+  )
+  let pdfContext = replayPrompt
+    ? replayPrompt.pdfContext
+    : input.pdfContext && input.pdfReadingPosition && initialReadingBinding
+      ? {
+          ...input.pdfContext,
+          activeBindingId: initialReadingBinding.bindingId,
+          readingPosition: input.pdfReadingPosition
+        }
+      : input.pdfContext
+  const attachments = input.attachments ?? []
+  const annotations = input.annotations ?? []
+  if (lifecycle.isCurrent?.() === false) return undefined
+  if (annotationProtocol.validateAnnotations(annotations, content)) return undefined
+  if (
+    input.supportsImageInput !== true &&
+    input.supportsImageRelay !== true &&
+    annotations.some(
+      (annotation) =>
+        annotation.kind === 'pdf' &&
+        annotation.selector.kind === 'region' &&
+        !!annotation.selector.image
+    )
+  ) {
+    throw new Error(VISION_MODEL_NOT_CONFIGURED_MESSAGE)
+  }
+  await validateImageAnnotationSourcesBeforeSend(annotations)
+  if (lifecycle.isCurrent?.() === false) return undefined
+  const effectiveAttachments =
+    attachments.length > 0 || !replayPrompt?.uploads?.length
+      ? attachments
+      : replayPrompt.uploads.map((upload) =>
+          toRuntimeUploadedAttachment(upload, replaySession?.projectId)
+        )
+  if (!content && effectiveAttachments.length === 0 && annotations.length === 0) return undefined
+
+  // Validate explicit library choices before adding a message or creating a pending Session,
+  // so the composer's existing rejection path preserves the draft and selection.
+  const selectedLiterature = input.pendingPdfContextVersions?.filter(
+    ({ sourceKind }) => sourceKind === 'literature-attachment-version'
+  )
+  if (selectedLiterature?.length) {
+    await filterPendingPdfContext({
+      projectId: input.projectId ?? replaySession?.projectId,
+      attachments: [],
+      pendingPdfContextVersions: selectedLiterature
+    })
+    if (lifecycle.isCurrent?.() === false) return undefined
+  }
+
+  if (input.branchSourceSessionId) {
+    const pending = useSessionStore.getState().branchInNewSession({
+      sourceSessionId: input.branchSourceSessionId,
+      content,
+      attachments,
+      annotations,
+      parts: input.parts,
+      turnIntent: input.turnIntent,
+      permissionProfile: input.permissionProfile,
+      agentFrameworkId: input.agentFrameworkId,
+      agentBackendId: input.agentBackendId,
+      agentModel: input.agentModel,
+      agentConfiguration: input.agentConfiguration,
+      agentTarget: resolveSendAgentTarget(input),
+      delegationPolicy: input.delegationPolicy,
+      specialistId: input.specialistId
+    })
+    if (!pending?.messageId) return undefined
+    const pendingPrompt = { sessionId: pending.sessionId, messageId: pending.messageId }
+    input.onMessageAppended?.(pendingPrompt)
+    const session = useSessionStore
+      .getState()
+      .sessions.find((item) => item.id === pending.sessionId)
+    if (!session) return undefined
+    let history = session.messages.filter((message) => message.id !== pendingPrompt.messageId)
+    try {
+      await reconcileBranchedAttachments(
+        input.branchSourceSessionId,
+        pending.sessionId,
+        history,
+        session.projectId
+      )
+      const reconciled = useSessionStore
+        .getState()
+        .sessions.find((item) => item.id === pending.sessionId)
+      if (!reconciled) return undefined
+      if (!ownsPrompt(pendingPrompt.sessionId, pendingPrompt.messageId)) return pendingPrompt
+      history = reconciled.messages.filter((message) => message.id !== pendingPrompt.messageId)
+    } catch (error) {
+      await rejectUnboundPendingPrompt(
+        pendingPrompt,
+        errorMessage(error),
+        input.onPreparationRejected,
+        input.agentConfiguration
+      )
+      return undefined
+    }
+    let replay: HistoryReplayContext | undefined
+    try {
+      replay = replayHistory(history, input, session.projectId)
+    } catch (error) {
+      await rejectUnboundPendingPrompt(
+        pendingPrompt,
+        errorMessage(error),
+        input.onPreparationRejected,
+        input.agentConfiguration
+      )
+      return undefined
+    }
+    const preparation = startPendingPrompt(
+      runtime,
+      {
+        ...input,
+        pdfContext: undefined,
+        ...(pdfContext
+          ? {
+              pendingPdfContextVersions: pdfContext.bindings.map(
+                ({ sourceKind, sourceFileId, sourceVersionId }) => ({
+                  sourceKind,
+                  sourceFileId,
+                  sourceVersionId
+                })
+              ),
+              pdfReadingPosition: pdfContext.readingPosition,
+              pdfProseReadingSelections:
+                input.pdfProseReadingSelections ?? pdfProseReadingSelectionsFromContext(pdfContext),
+              pdfReadingPositionSource: readingSourceForSend({ pdfContext }, [])
+            }
+          : {}),
+        pending: pendingPrompt,
+        content,
+        attachments,
+        cwd: session.cwd || input.cwd,
+        projectId: session.projectId,
+        permissionProfile: session.permissionProfile ?? DEFAULT_PERMISSION_PROFILE,
+        specialistId: session.specialistId,
+        replay,
+        contextReset: true
+      },
+      lifecycle.onSessionBound,
+      lifecycle.onPdfContextLinked,
+      lifecycle.onSessionSizeLimit,
+      attempt
+    )
+    if (attempt) attempt.pendingPreparation = preparation
+    if (lifecycle.awaitPendingPreparation) {
+      return preparation
+    }
+    void preparation.catch((error) =>
+      rejectUnboundPendingPrompt(
+        pendingPrompt,
+        errorMessage(error),
+        input.onPreparationRejected,
+        input.agentConfiguration
+      )
+    )
+    return pendingPrompt
+  }
+
+  if (input.sessionId) {
+    const sessionId = input.sessionId
+    let session = useSessionStore.getState().sessions.find((item) => item.id === sessionId)
+    const stableMessageId = input.messageId?.trim()
+    const submissionMessageId = stableMessageId ?? `message-${crypto.randomUUID()}`
+    if (input.messageId !== undefined && !stableMessageId) return undefined
+    let existingStableMessage = stableMessageId
+      ? session?.messages.find((message) => message.id === stableMessageId)
+      : undefined
+    const graphStableMessage = stableMessageId
+      ? session?.conversationGraph?.messages.find((message) => message.id === stableMessageId)
+      : undefined
+    if (!existingStableMessage && graphStableMessage && session) {
+      if (graphStableMessage.role !== 'user' || graphStableMessage.content !== content) {
+        return undefined
+      }
+      useSessionStore
+        .getState()
+        .activateMessageBranch(sessionId, graphStableMessage.introducedOnBranchId)
+      session = useSessionStore.getState().sessions.find((item) => item.id === sessionId)
+      existingStableMessage = session?.messages.find((message) => message.id === stableMessageId)
+      if (!existingStableMessage) return undefined
+    }
+    let rearmExistingStableMessage = false
+    if (existingStableMessage) {
+      if (existingStableMessage.role !== 'user' || existingStableMessage.content !== content) {
+        return undefined
+      }
+      const hasResponse = session?.messages.some(
+        (message) =>
+          message.role === 'agent' &&
+          message.responseToMessageId === existingStableMessage.id &&
+          !(input.allowCompactionRecovery && message.status === 'error')
+      )
+      if (hasResponse || session?.activeRun?.promptMessageId === existingStableMessage.id) {
+        return { sessionId, messageId: existingStableMessage.id }
+      }
+      rearmExistingStableMessage = true
+    }
+    if (input.requireExistingSession && !session) return undefined
+    if (!canAdmitExistingWorkspacePrompt(runtime.state, input)) return undefined
+    if (session?.delegationPolicyAuthorityPending) {
+      try {
+        await confirmPendingDelegationPolicyAuthority(session)
+        if (lifecycle.isCurrent?.() === false) return undefined
+        session = useSessionStore.getState().sessions.find((item) => item.id === sessionId)
+      } catch (error) {
+        if (lifecycle.isCurrent?.() === false) return undefined
+        if (session?.isPending) markPendingSessionRetryable(sessionId)
+        reportWorkspaceOperationError(sessionId, errorMessage(error))
+        return undefined
+      }
+    }
+    const projectId = input.projectId ?? session?.projectId
+    if (session?.isPending) {
+      const cwd = input.cwd || session.cwd || undefined
+      let replay: HistoryReplayContext | undefined
+      if (session.pendingContextReplayMessageId) {
+        try {
+          replay = replayHistory(
+            session.messages.filter((item) => item.id !== session.pendingContextReplayMessageId),
+            input,
+            projectId
+          )
+        } catch (error) {
+          markPendingSessionRetryable(session.id)
+          reportWorkspaceOperationError(session.id, errorMessage(error))
+          return { sessionId: session.id, messageId: session.pendingContextReplayMessageId }
+        }
+      }
+      const appended = useSessionStore.getState().appendUserMessage({
+        sessionId,
+        content,
+        attachments: effectiveAttachments,
+        annotations,
+        parts: input.parts,
+        pdfContext,
+        turnIntent: input.turnIntent,
+        attribution: input.attribution,
+        cwd,
+        projectId: input.projectId ?? session.projectId,
+        agentFrameworkId: input.agentFrameworkId,
+        agentBackendId: input.agentBackendId,
+        agentModel: input.agentModel,
+        agentConfiguration: input.agentConfiguration,
+        agentTarget: resolveSendAgentTarget(input),
+        preserveSelection: input.preserveSelection || attempt?.selectionChanged
+      })
+      if (!appended) return undefined
+      // This submission now owns the retry; a concurrent send must not also bypass admission.
+      consumePendingSessionRetry(sessionId)
+      input.onMessageAppended?.(appended)
+      const preparation = startPendingPrompt(
+        runtime,
+        {
+          ...input,
+          pdfContext,
+          pending: appended,
+          content,
+          attachments: effectiveAttachments,
+          cwd,
+          projectId,
+          permissionProfile: session.permissionProfile ?? DEFAULT_PERMISSION_PROFILE,
+          specialistId: session.pendingContextReplayMessageId ? session.specialistId : undefined,
+          replay,
+          contextReset: Boolean(session.pendingContextReplayMessageId)
+        },
+        lifecycle.onSessionBound,
+        lifecycle.onPdfContextLinked,
+        lifecycle.onSessionSizeLimit,
+        attempt
+      )
+      if (attempt) attempt.pendingPreparation = preparation
+      if (lifecycle.awaitPendingPreparation) {
+        return preparation
+      }
+      void preparation
+      return appended
+    }
+
+    // An unresolved earlier save must not append another unsent user Message on every retry.
+    // Stable application-owned messages already have identity-based retry handling below.
+    if (!stableMessageId) {
+      try {
+        await (lifecycle.flushPersistence ?? flushSessionPersistence)(`session:${sessionId}`)
+      } catch (error) {
+        if (lifecycle.isCurrent?.() === false) return undefined
+        if (isSessionPersistenceDeferredError(error)) return undefined
+        if (isSessionSizeLimitError(error)) lifecycle.onSessionSizeLimit?.(sessionId)
+        reportWorkspaceOperationError(sessionId, errorMessage(error))
+        return undefined
+      }
+      if (lifecycle.isCurrent?.() === false) return undefined
+      if (!canAdmitExistingWorkspacePrompt(runtime.state, input)) return undefined
+    }
+
+    const prepared = await prepareExistingWorkspacePrompt(runtime, {
+      sessionId,
+      requireExistingSession: input.requireExistingSession,
+      cwd: input.cwd,
+      projectId,
+      permissionProfile: input.permissionProfile,
+      selectedRuntime: {
+        frameworkId: input.agentFrameworkId,
+        backendId: input.agentBackendId,
+        agentModel: input.agentModel,
+        agentConfiguration: input.agentConfiguration,
+        supportsImageInput: input.supportsImageInput,
+        supportsImageRelay: input.supportsImageRelay
+      },
+      replay: {
+        descriptor: input.historyReplayDescriptor,
+        cutMessageId: input.truncateFromMessageId,
+        excludeMessageId: rearmExistingStableMessage ? existingStableMessage?.id : undefined,
+        force: input.forceHistoryReplay,
+        includeResumeFallback: Boolean(input.forcedSkillIds?.length || session?.specialistId)
+      },
+      onPreparationStateChange: lifecycle.onSendPreparationStateChange,
+      drainRuntimeEvents: lifecycle.drainRuntimeEvents,
+      isCurrent: lifecycle.isCurrent
+    })
+    if (lifecycle.isCurrent?.() === false) return undefined
+    if (!prepared) return undefined
+    let promptAttachments
+    try {
+      const eligiblePendingPdfContext = await filterPendingPdfContext({
+        attachments: effectiveAttachments,
+        pendingPdfContextAttachmentIds: input.pendingPdfContextAttachmentIds,
+        pendingPdfContextVersions: input.pendingPdfContextVersions,
+        projectId
+      })
+      if (lifecycle.isCurrent?.() === false) return undefined
+      promptAttachments = await finalizeWorkspaceAttachments({
+        sessionId,
+        attachments: effectiveAttachments,
+        projectId,
+        preserveSourceOwnership: Boolean(input.truncateFromMessageId)
+      })
+      if (attempt) attempt.attachments = promptAttachments
+      if (lifecycle.isCurrent?.() === false) return undefined
+      const pdfContextSources = [
+        ...finalizedPdfContextSources({
+          attachmentIds: eligiblePendingPdfContext.attachmentIds,
+          attachments: promptAttachments
+        }),
+        ...eligiblePendingPdfContext.versions
+      ].slice(0, Math.max(0, MAX_SESSION_PDF_CONTEXTS - (pdfContext?.bindings.length ?? 0)))
+      if (pdfContextSources.length > 0) {
+        pdfContext = await linkPdfContextForSend({
+          sessionId,
+          projectId,
+          sources: pdfContextSources,
+          pdfReadingPosition: input.pdfReadingPosition,
+          readingSource: readingSourceForSend(input, promptAttachments),
+          excludeSinglePage: true
+        })
+      }
+      pdfContext = withPdfProseReadingSelections(
+        pdfContext,
+        input.pdfProseReadingSelections ?? pdfProseReadingSelectionsFromContext(input.pdfContext),
+        promptAttachments
+      )
+      if (
+        pdfContext &&
+        (eligiblePendingPdfContext.attachmentIds.length > 0 ||
+          eligiblePendingPdfContext.versions.length > 0)
+      ) {
+        lifecycle.onPdfContextLinked?.(sessionId, pdfContext)
+      }
+    } catch (error) {
+      if (lifecycle.isCurrent?.() === false) return undefined
+      if (isSessionSizeLimitError(error)) lifecycle.onSessionSizeLimit?.(sessionId)
+      reportWorkspaceOperationError(sessionId, errorMessage(error))
+      return undefined
+    }
+    if (lifecycle.isCurrent?.() === false) return undefined
+    if (!canAdmitExistingWorkspacePrompt(runtime.state, input)) return undefined
+    // Replay conversion may reject malformed media; complete it before establishing a run.
+    const replay = prepared.replay()
+    let preparationSource = useSessionStore
+      .getState()
+      .sessions.find((candidate) => candidate.id === sessionId)
+    if (!preparationSource) {
+      const now = Date.now()
+      const seed = materializeSessionConversationGraph({
+        id: sessionId,
+        projectId: projectId ?? DEFAULT_UPLOAD_PROJECT_ID,
+        title: content.slice(0, 80),
+        cwd: input.cwd ?? runtime.state.cwd ?? '',
+        status: 'idle',
+        messages: [],
+        createdAt: now,
+        updatedAt: now,
+        permissionProfile: input.permissionProfile,
+        agentFrameworkId: input.agentFrameworkId,
+        agentBackendId: input.agentBackendId,
+        agentConfiguration: input.agentConfiguration,
+        memoryEnabled: input.memoryEnabled,
+        autoReviewEnabled: input.autoReviewEnabled
+      })
+      try {
+        const durable = await saveSessionInOrder(seed)
+        if (lifecycle.isCurrent?.() === false) return undefined
+        useSessionStore.getState().upsertPersistedSession(durable)
+        preparationSource = useSessionStore
+          .getState()
+          .sessions.find((candidate) => candidate.id === sessionId)
+      } catch (error) {
+        if (isSessionSizeLimitError(error)) lifecycle.onSessionSizeLimit?.(sessionId)
+        await rejectPreparedPrompt(
+          sessionId,
+          errorMessage(error),
+          undefined,
+          input.onPreparationRejected,
+          input.agentConfiguration
+        )
+        return undefined
+      }
+    }
+    if (!preparationSource) return undefined
+    try {
+      // Establish the receipt before the first append or edit Branch command can be saved.
+      promptPreparation = await prepareWorkspacePrompt(
+        toPersistedSession(preparationSource),
+        submissionMessageId,
+        rearmExistingStableMessage ? (preparationSource.resumeRecovery ? 'resume' : 'rearm') : 'new'
+      )
+    } catch (error) {
+      if (isSessionSizeLimitError(error)) lifecycle.onSessionSizeLimit?.(sessionId)
+      await rejectPreparedPrompt(
+        sessionId,
+        errorMessage(error),
+        undefined,
+        input.onPreparationRejected,
+        input.agentConfiguration
+      )
+      return undefined
+    }
+    if (attempt) attempt.preparation = promptPreparation
+    if (lifecycle.isCurrent?.() === false) {
+      // Stop owns compensation after the in-flight preparation has returned its exact receipt.
+      if (!attempt?.cancelled) {
+        await rollbackWorkspacePrompt(promptPreparation)
+        if (attempt) attempt.preparation = undefined
+      }
+      return undefined
+    }
+    if (input.truncateFromMessageId) {
+      useSessionStore
+        .getState()
+        .truncateSessionFromMessage(sessionId, input.truncateFromMessageId, promptPreparation.id)
+    }
+    const appended = useSessionStore.getState().appendUserMessage({
+      sessionId,
+      messageId: submissionMessageId,
+      preparationId: promptPreparation.id,
+      rearmExisting: rearmExistingStableMessage,
+      content,
+      attachments: promptAttachments,
+      annotations,
+      parts: input.parts,
+      pdfContext,
+      turnIntent: input.turnIntent,
+      attribution: input.attribution,
+      cwd: input.cwd,
+      projectId: input.projectId ?? prepared.appendOwnership.projectId,
+      agentFrameworkId: prepared.appendOwnership.agentFrameworkId,
+      agentBackendId: prepared.appendOwnership.agentBackendId,
+      agentModel: input.agentModel,
+      agentConfiguration: input.agentConfiguration,
+      agentTarget: resolveSendAgentTarget({
+        agentFrameworkId: prepared.appendOwnership.agentFrameworkId ?? input.agentFrameworkId,
+        agentBackendId: prepared.appendOwnership.agentBackendId ?? input.agentBackendId,
+        agentConfiguration: input.agentConfiguration
+      }),
+      // Preparing a send must not undo navigation that happened while it was awaiting I/O.
+      preserveSelection: input.preserveSelection || attempt?.selectionChanged
+    })
+    if (!appended) return undefined
+    input.onMessageAppended?.(appended)
+    // Application-owned stable identities need an explicit save because they may be dispatched
+    // outside the mounted store saver. Ordinary user Messages are already queued by that saver;
+    // drain it before provider dispatch so Delegation cannot authenticate against a stale root
+    // conversation snapshot. Main-owned recovery also persists its new start-run command before
+    // dispatch, even though the user Message already exists in the durable transcript.
+    const mainOwnedRecovery =
+      input.allowCompactionRecovery &&
+      rearmExistingStableMessage &&
+      useSessionStore.getState().sessions.find((candidate) => candidate.id === sessionId)
+        ?.runtimeTranscriptOwner === 'main'
+    if (
+      stableMessageId &&
+      (!(input.allowCompactionRecovery && rearmExistingStableMessage) || mainOwnedRecovery)
+    ) {
+      const durableSession = useSessionStore
+        .getState()
+        .sessions.find((candidate) => candidate.id === sessionId)
+      if (!durableSession) return undefined
+      try {
+        await saveSessionInOrder(toPersistedSession(durableSession))
+      } catch (error) {
+        if (attempt?.cancelled) return undefined
+        if (isSessionPersistenceDeferredError(error)) return undefined
+        if (isSessionSizeLimitError(error)) lifecycle.onSessionSizeLimit?.(sessionId)
+        await rejectPreparedPrompt(
+          sessionId,
+          errorMessage(error),
+          promptPreparation,
+          input.onPreparationRejected,
+          input.agentConfiguration
+        )
+        return undefined
+      }
+      if (!ownsPrompt(sessionId, appended.messageId)) return undefined
+    } else if (!rearmExistingStableMessage) {
+      try {
+        await (lifecycle.flushPersistence ?? flushSessionPersistence)(`session:${sessionId}`)
+      } catch (error) {
+        if (attempt?.cancelled) return undefined
+        if (isSessionPersistenceDeferredError(error)) return undefined
+        if (isSessionSizeLimitError(error)) lifecycle.onSessionSizeLimit?.(sessionId)
+        await rejectPreparedPrompt(
+          sessionId,
+          errorMessage(error),
+          promptPreparation,
+          input.onPreparationRejected,
+          input.agentConfiguration
+        )
+        return undefined
+      }
+      if (!ownsPrompt(sessionId, appended.messageId)) return undefined
+    }
+    if (attempt?.cancelled) return undefined
+    const promptMedia =
+      input.truncateFromMessageId && promptAttachments.length > 0
+        ? partitionWorkspacePromptAttachments({
+            historyAttachments: replay?.historyAttachments,
+            latestAttachments: promptAttachments,
+            supportsImageInput: input.supportsImageInput,
+            supportsImageRelay: input.supportsImageRelay
+          })
+        : undefined
+    try {
+      const admission = dispatchPrompt(runtime, {
+        providerTarget: input.agentConfiguration,
+        sessionId,
+        messageId: appended.messageId,
+        content,
+        annotations,
+        attachments: promptMedia?.currentAttachments ?? promptAttachments,
+        forcedSkillIds: input.forcedSkillIds,
+        referencedArtifacts: withPdf(projectId, input.referencedArtifacts, pdfContext),
+        referencedSessions: collectSessionReferences(input.parts),
+        parts: input.parts,
+        replay: promptMedia
+          ? { ...replay, historyAttachments: promptMedia.historyAttachments }
+          : replay,
+        turnIntent: input.turnIntent,
+        onPromptAccepted: input.onPromptAccepted,
+        accepted: () => prepared.acceptPrompt(appended.messageId),
+        beforeDispatch: () => {
+          if (attempt) {
+            attempt.dispatched = true
+            useSessionStore.setState((state) => ({
+              sessions: state.sessions.map((session) =>
+                attempt.sessionIds.has(session.id) && session.firstPromptDraft
+                  ? { ...session, firstPromptDraft: undefined, pendingRetryable: undefined }
+                  : session
+              )
+            }))
+            attempt.endPresentation()
+          }
+        },
+        preparation: promptPreparation,
+        cancelled: () => attempt?.cancelled === true,
+        rejected: input.onPreparationRejected
+      })
+      if (attempt) attempt.promptAdmission = admission
+      if (lifecycle.awaitPromptAdmission && !(await admission))
+        return attempt?.cancelled && attempt.dispatched ? appended : undefined
+    } catch (error) {
+      if (ownsWorkspacePromptPreparation(promptPreparation)) {
+        await rejectPreparedPrompt(
+          sessionId,
+          errorMessage(error),
+          promptPreparation,
+          input.onPreparationRejected,
+          input.agentConfiguration
+        )
+      }
+      return undefined
+    }
+    return appended
+  }
+
+  const pending = useSessionStore.getState().appendPendingUserMessage({
+    content,
+    attachments,
+    annotations,
+    parts: input.parts,
+    pdfContext,
+    turnIntent: input.turnIntent,
+    cwd: input.cwd,
+    projectId: input.projectId,
+    permissionProfile: input.permissionProfile,
+    agentFrameworkId: input.agentFrameworkId,
+    agentBackendId: input.agentBackendId,
+    agentModel: input.agentModel,
+    agentConfiguration: input.agentConfiguration,
+    memoryEnabled: input.memoryEnabled,
+    autoReviewEnabled: input.autoReviewEnabled,
+    agentTarget: resolveSendAgentTarget(input),
+    specialistId: input.specialistId ?? undefined,
+    delegationPolicy: input.delegationPolicy,
+    enabledComputeHosts: input.enabledComputeHosts,
+    selectedComputeHosts: input.selectedComputeHosts
+  })
+  if (!pending) return undefined
+  input.onMessageAppended?.(pending)
+  const preparation = startPendingPrompt(
+    runtime,
+    {
+      ...input,
+      pdfContext,
+      pending,
+      content,
+      attachments,
+      cwd: input.cwd,
+      projectId: input.projectId,
+      permissionProfile: input.permissionProfile ?? DEFAULT_PERMISSION_PROFILE,
+      specialistId: input.specialistId ?? undefined,
+      turnIntent: input.turnIntent
+    },
+    lifecycle.onSessionBound,
+    lifecycle.onPdfContextLinked,
+    lifecycle.onSessionSizeLimit,
+    attempt
+  )
+  if (attempt) attempt.pendingPreparation = preparation
+  if (lifecycle.awaitPendingPreparation) {
+    return preparation
+  }
+  void preparation.catch((error) =>
+    rejectUnboundPendingPrompt(
+      pending,
+      errorMessage(error),
+      input.onPreparationRejected,
+      input.agentConfiguration
+    )
+  )
+  return pending
+}
+
+type WorkspaceSendAttempt = {
+  selectionChanged: boolean
+  cancellationEligible: boolean
+  cancelled: boolean
+  dispatched: boolean
+  failed: boolean
+  message?: SendWorkspaceMessageResult
+  preparation?: WorkspacePromptPreparation
+  pendingPreparation?: Promise<SendWorkspaceMessageResult | undefined>
+  promptAdmission?: Promise<boolean>
+  rollback?: ReturnType<typeof attemptWorkspacePromptRollback>
+  cleanup?: Promise<SessionDeletionResult>
+  settlement?: Promise<void>
+  bindForCancellation?: () => string | undefined
+  attachments: UploadedAttachment[]
+  draftReceipts: ReadonlyMap<string, string>
+  sessionIds: Set<string>
+  endPresentation: (sessionId?: string) => void
+  notifyPreparation?: WorkspaceCommandLifecycle['onSendPreparationStateChange']
+  restore: SendWorkspaceMessageIntent['onPreparationCancelled']
+  stop: () => void
+}
+const preparingSessionAttempts = new Map<string, WorkspaceSendAttempt>()
+const trackWorkspaceSendPreparation = (attempt: WorkspaceSendAttempt, sessionId: string): void => {
+  if (attempt.sessionIds.has(sessionId)) return
+  attempt.sessionIds.add(sessionId)
+  preparingSessionAttempts.set(sessionId, attempt)
+  if (!attempt.cancelled && !attempt.failed && !attempt.dispatched)
+    attempt.notifyPreparation?.(sessionId, true)
+}
+
+// Stop is latched synchronously, before any asynchronous save or cancellation can advance dispatch.
+const cancelPreparingWorkspacePrompt = (sessionId: string): boolean => {
+  const attempt = preparingSessionAttempts.get(sessionId)
+  if (!attempt || !attempt.cancellationEligible) return false
+  if (attempt.dispatched) {
+    attempt.cancelled = true
+    return false
+  }
+  if (attempt.cancelled || attempt.failed) return true
+  attempt.cancelled = true
+  attempt.endPresentation()
+  // If uploads may already be owned by the created Session, reuse that identity for draft retry.
+  attempt.bindForCancellation?.()
+  const attachments = recoverPromptAttachments(
+    attempt.message?.sessionId ?? sessionId,
+    attempt.message?.messageId
+  )
+  if (attempt.preparation) withdrawWorkspacePrompt(attempt.preparation)
+  else if (attempt.message) withdrawUnboundPendingPrompt(attempt.message)
+  markPendingSessionRetryable(attempt.message?.sessionId ?? sessionId)
+  attempt.restore?.(attempt.message?.sessionId ?? sessionId, attachments)
+  attempt.stop()
+  return true
+}
+
+const sendWorkspaceMessage = async (
+  runtime: WorkspaceCommandRuntime,
+  input: SendWorkspaceMessageCommand,
+  lifecycle: WorkspaceCommandLifecycle = {}
+): Promise<SendWorkspaceMessageResult | undefined> => {
+  const sessionId = input.sessionId
+  const previousSession = useSessionStore.getState().sessions.find(({ id }) => id === sessionId)
+  const existingAttempt = sessionId ? preparingSessionAttempts.get(sessionId) : undefined
+  if (
+    existingAttempt?.dispatched === false &&
+    !(
+      (existingAttempt.cancelled || existingAttempt.failed) &&
+      previousSession?.isPending &&
+      previousSession.pendingRetryable &&
+      !previousSession.pendingBindingSessionId &&
+      !existingAttempt.preparation
+    )
+  )
+    return undefined
+  if (existingAttempt?.dispatched && !canAdmitExistingWorkspacePrompt(runtime.state, input)) {
+    // A refused contender must not replace the submitted attempt that Stop still needs to latch.
+    return input.messageId === existingAttempt.message?.messageId
+      ? existingAttempt.message
+      : undefined
+  }
+  let stop!: () => void
+  const stopped = new Promise<undefined>((resolve) => {
+    stop = () => resolve(undefined)
+  })
+  const visibleSessionIds = new Set<string>()
+  const attempt: WorkspaceSendAttempt = {
+    selectionChanged: false,
+    cancellationEligible:
+      !input.allowCompactionRecovery &&
+      !previousSession?.compacting &&
+      !previousSession?.activeRun &&
+      previousSession?.status !== 'running' &&
+      !runtime.state.promptInFlightSessionIds.includes(sessionId ?? ''),
+    cancelled: false,
+    dispatched: false,
+    failed: false,
+    attachments: input.attachments ?? [],
+    draftReceipts: new Map(
+      (input.attachments ?? []).flatMap(({ id, draftReceipt }) =>
+        draftReceipt ? [[id, draftReceipt] as const] : []
+      )
+    ),
+    sessionIds: new Set(),
+    notifyPreparation: (id, inFlight) => {
+      if (inFlight === visibleSessionIds.has(id)) return
+      if (inFlight) visibleSessionIds.add(id)
+      else visibleSessionIds.delete(id)
+      lifecycle.onSendPreparationStateChange?.(id, inFlight)
+    },
+    endPresentation: (id) => {
+      for (const target of id ? [id] : [...visibleSessionIds])
+        attempt.notifyPreparation?.(target, false)
+    },
+    restore: input.onPreparationCancelled,
+    stop
+  }
+  if (sessionId) trackWorkspaceSendPreparation(attempt, sessionId)
+  const unsubscribeSelection = useSessionStore.subscribe((state, previous) => {
+    if (state.selectedSessionId !== previous.selectedSessionId) attempt.selectionChanged = true
+    // Late authoritative saves may still contain the unsent optimistic run. Keep only this
+    // receipt withdrawn until its old writes and conditional rollback have finished.
+    if ((attempt.failed || (attempt.cancelled && !attempt.dispatched)) && attempt.preparation)
+      if (ownsWorkspacePromptPreparation(attempt.preparation))
+        withdrawWorkspacePrompt(attempt.preparation)
+  })
+  const operation = performSendWorkspaceMessage(
+    runtime,
+    {
+      ...input,
+      onMessageAppended: (message) => {
+        attempt.message = message
+        trackWorkspaceSendPreparation(attempt, message.sessionId)
+        input.onMessageAppended?.(message)
+      },
+      onPreparationRejected: (error, id, attachments) => {
+        attempt.failed = true
+        attempt.endPresentation()
+        input.onPreparationRejected?.(error, id, attachments)
+      }
+    },
+    {
+      ...lifecycle,
+      // The command owns presentation for the entire preparation, including resume substeps.
+      onSendPreparationStateChange: undefined,
+      isCurrent: () => !attempt.cancelled && !attempt.failed && lifecycle.isCurrent?.() !== false
+    },
+    attempt
+  )
+  const finish = async (): Promise<void> => {
+    try {
+      if (attempt.pendingPreparation) await attempt.pendingPreparation
+      if (attempt.promptAdmission) await attempt.promptAdmission
+      if (attempt.rollback) await attempt.rollback
+      if (attempt.cancelled && !attempt.dispatched && attempt.preparation)
+        await attemptWorkspacePromptRollback(attempt.preparation)
+      if (attempt.cleanup) await attempt.cleanup
+    } finally {
+      unsubscribeSelection()
+      attempt.endPresentation()
+      for (const id of attempt.sessionIds)
+        if (preparingSessionAttempts.get(id) === attempt) preparingSessionAttempts.delete(id)
+    }
+  }
+  attempt.settlement = operation.then(finish, finish)
+  void attempt.settlement.catch((error) => console.warn('Prompt preparation cleanup failed', error))
+  return Promise.race([operation, stopped])
+}
+
+const deleteWorkspaceSession = async (
+  request: DeleteSessionRequest
+): Promise<SessionDeletionResult> => {
+  const source = useSessionStore
+    .getState()
+    .sessions.find(
+      (session) => session.id === request.sessionId && session.projectId === request.projectId
+    )
+  if (!source?.isPending && !source?.firstPromptDraft) return deleteSession(request)
+  if (!isSessionDeletionAllowed(source))
+    return { status: 'failed', reason: 'runtime', runtimeDetached: false }
+  const attempt = preparingSessionAttempts.get(source.id)
+  if (attempt && !attempt.dispatched) attempt.cancelled = true
+  consumePendingSessionRetry(source.id)
+  const boundId = source.isPending ? source.pendingBindingSessionId : source.id
+  if (!boundId) {
+    useSessionStore.getState().deleteSession(source.id)
+    clearWorkspaceOperationError(source.id)
+    return { status: 'deleted', runtimeDetached: true }
+  }
+  try {
+    await attempt?.settlement
+    const cleanupResult = source.isPending ? await attempt?.cleanup : undefined
+    const result =
+      cleanupResult?.status === 'deleted'
+        ? cleanupResult
+        : source.isPending
+          ? await cleanupUnsentWorkspaceSession({ ...request, sessionId: boundId })
+          : await deleteSession({ ...request, sessionId: boundId })
+    if (result.status === 'deleted') {
+      if (source.isPending) {
+        useSessionStore.getState().deleteSession(boundId)
+        useSessionStore.getState().deleteSession(source.id)
+      }
+      clearWorkspaceOperationError(source.id)
+    } else markPendingSessionRetryable(source.id)
+    return result
+  } catch (error) {
+    markPendingSessionRetryable(source.id)
+    throw error
+  }
+}
+
+const resendEditedWorkspaceMessage = async (
+  runtime: WorkspaceCommandRuntime,
+  input: ResendEditedMessageInput & { sessionId: string; messageId: string },
+  options: ResendEditedWorkspaceMessageOptions = {}
+): Promise<boolean> => {
+  const session = useSessionStore.getState().sessions.find((item) => item.id === input.sessionId)
+  if (!session) return false
+  const sourceMessage = session.messages.find((message) => message.id === input.messageId)
+  const annotations = input.annotations ?? sourceMessage?.annotations ?? []
+  const cwd = session.cwd || runtime.state.cwd
+  if (
+    !cwd ||
+    (!input.text.trim() && annotations.length === 0 && !sourceMessage?.uploads?.length) ||
+    !sourceMessage ||
+    runtime.state.promptInFlightSessionIds.includes(input.sessionId)
+  )
+    return false
+  let attachments: UploadedAttachment[]
+  try {
+    attachments = (sourceMessage.uploads ?? []).map((upload) =>
+      toRuntimeUploadedAttachment(upload, session.projectId)
+    )
+  } catch (error) {
+    reportWorkspaceOperationError(input.sessionId, errorMessage(error))
+    return false
+  }
+  return Boolean(
+    await sendWorkspaceMessage(
+      runtime,
+      {
+        sessionId: input.sessionId,
+        text: input.text.trim(),
+        attachments,
+        annotations,
+        parts: input.parts,
+        cwd,
+        projectId: session.projectId,
+        permissionProfile: session.permissionProfile ?? DEFAULT_PERMISSION_PROFILE,
+        forcedSkillIds: input.forcedSkillIds,
+        referencedArtifacts: input.referencedArtifacts,
+        pdfContext: sourceMessage.pdfContext,
+        turnIntent:
+          sourceMessage.turnIntent === 'plan-first' ? sourceMessage.turnIntent : undefined,
+        agentFrameworkId: options.agentFrameworkId,
+        agentBackendId: options.agentBackendId,
+        agentModel: options.agentModel,
+        agentConfiguration: options.agentConfiguration,
+        onMessageAppended: input.onMessageAppended,
+        historyReplayDescriptor: options.historyReplayDescriptor,
+        truncateFromMessageId: input.messageId,
+        supportsImageInput: options.supportsImageInput,
+        supportsImageRelay: options.supportsImageRelay
+      },
+      { ...options, awaitPromptAdmission: true }
+    )
+  )
+}
+export {
+  cancelPreparingWorkspacePrompt,
+  deleteWorkspaceSession,
+  resendEditedWorkspaceMessage,
+  sendWorkspaceMessage
+}
+export type { ResendEditedMessageInput, SendWorkspaceMessageIntent, SendWorkspaceMessageResult }

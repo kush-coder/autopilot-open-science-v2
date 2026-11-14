@@ -1,0 +1,2197 @@
+import { type SettingsEditorLeaveState, SettingsFormFooter } from './SettingsLayout'
+import { dismissSettingsManualUpdateGuide } from './settings-manual-update-guide'
+import { createBookmarkPreviewItem } from '../workspace/annotations/annotation-reveal'
+import type { PdfAnnotation } from '../../../../shared/pdf-annotations'
+import type { PreviewFileItem } from '@/stores/preview-workbench-contract'
+import { Notice } from '@/components/notice'
+import { ErrorNotice } from '@/components/error-notice'
+/* Hallmark · pre-emit critique: P5 H5 E5 S5 R5 V4 */
+/* Hallmark · component: settings side rail · genre: modern-minimal · theme: existing Open-Science tokens · slop: pass */
+import {
+  AlertTriangle,
+  Loader2,
+  Archive,
+  ArrowLeft,
+  ArrowRight,
+  Bell,
+  Bot,
+  Brain,
+  BrainCircuit,
+  ChartNoAxesCombined,
+  Cloud,
+  Globe,
+  KeyRound,
+  LockKeyhole,
+  Maximize2,
+  Menu,
+  MessageSquare,
+  Minimize2,
+  MonitorSmartphone,
+  Palette,
+  Settings2,
+  TerminalSquare,
+  Tags as TagsIcon,
+  X,
+  Zap
+} from 'lucide-react'
+import { ActionToastStack } from '@/components/ActionToast'
+import * as Dialog from '@/components/ui/dialog'
+import { motion } from 'motion/react'
+import { FocusScope } from '@radix-ui/react-focus-scope'
+import {
+  forwardRef,
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useImperativeHandle,
+  useRef,
+  useState
+} from 'react'
+import { useTranslation } from 'react-i18next'
+
+import {
+  resolveCodexSubscriptionType,
+  type ValidateProviderResult,
+  type ProviderView,
+  type UpsertProviderRequest
+} from '../../../../shared/settings'
+import { APP } from '../../../../shared/app-config'
+import { Button } from '@/components/ui/button'
+import { ConfirmActionDialog } from '@/components/ui/confirm-action-dialog'
+import type { NetworkEditorLeaveState } from './NotebookNetworkDomainsForm'
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
+import { useMediaQuery } from '@/hooks/useMediaQuery'
+import { cn } from '@/lib/utils'
+import type { SessionCatalogRecovery } from '@/lib/session-persistence/session-persistence'
+import { preloadComputeHosts, useComputeStore } from '@/stores/compute-store'
+import { useMemoryStore } from '@/stores/memory-store'
+import { useNavigationStore } from '@/stores/navigation-store'
+import { useProjectStore } from '@/stores/project-store'
+import { useSessionStore } from '@/stores/session-store'
+import {
+  selectActiveAgentFramework,
+  selectFrameworkApiEndpoints,
+  useSettingsStore
+} from '@/stores/settings-store'
+import { takeSettingsReturnFocusTarget } from '@/stores/settings-return-focus'
+import {
+  INITIAL_SETTINGS_ROUTE,
+  settingsPanelRoute,
+  type ModelView,
+  type NetworkView,
+  type SettingsPanelId,
+  type SettingsRoute
+} from '@/lib/settings-navigation'
+import { useSpecialistStore } from '@/stores/specialist-store'
+import { useTagStore } from '@/stores/tag-store'
+import { ProvidersPanel } from './ProvidersPanel'
+import { ModelPanel } from './ModelPanel'
+import type { ConnectorsView } from '@/lib/settings-navigation'
+import { computeTargetAddLabels, type ComputeView } from '@/lib/settings-navigation'
+import type { ArchivedView } from '@/lib/settings-navigation'
+import type { MemoryView } from '@/lib/settings-navigation'
+import type { TagsView } from '@/lib/settings-navigation'
+import type { CredentialsView } from '@/lib/settings-navigation'
+import { resolveVendorModelsUrl } from '@aipoch/providers'
+import { ProviderForm } from './ProviderForm'
+import {
+  createEmptyProviderFormValue,
+  defaultCustomApiEndpoint,
+  defaultProviderKindKey,
+  getProviderFormErrors,
+  hasProviderFormErrors,
+  providerFormApiEndpoints,
+  providerFormTokenLimits,
+  providerKindPatch,
+  type ProviderFormValue
+} from './provider-form-value'
+import { SettingsPanelLoadingBoundary } from './SettingsPanelLoadingBoundary'
+import { localizeProviderResourceMessage } from './validation-message'
+import { ProviderTestResultCard } from './ProviderTestResultCard'
+import { loadSettingsPanel } from './settings-panel-loader'
+import { SettingsGlobalSearch } from './SettingsGlobalSearch'
+import type { SettingsWriteErrorCode } from '../../../../shared/settings'
+
+const AgentPanel = lazy(async () => ({ default: (await import('./AgentPanel')).AgentPanel }))
+const GeneralPanel = lazy(async () => ({ default: (await import('./GeneralPanel')).GeneralPanel }))
+const AppearancePanel = lazy(async () => ({
+  default: (await import('./AppearancePanel')).AppearancePanel
+}))
+const NotificationsPanel = lazy(async () => ({
+  default: (await import('./NotificationsPanel')).NotificationsPanel
+}))
+const NetworkPanel = lazy(async () => ({ default: (await import('./NetworkPanel')).NetworkPanel }))
+const StoragePanel = lazy(async () => {
+  const panelModule = await loadSettingsPanel(
+    () => import('./StoragePanel'),
+    () =>
+      import('@/stores/storage-info-store').then(({ useStorageInfoStore }) =>
+        useStorageInfoStore.getState().loadStatus()
+      )
+  )
+  return { default: panelModule.StoragePanel }
+})
+const RuntimesPanel = lazy(async () => {
+  const panelModule = await loadSettingsPanel(
+    () => import('./RuntimesPanel'),
+    () =>
+      import('@/stores/runtime-settings-store').then(({ useRuntimeSettingsStore }) =>
+        useRuntimeSettingsStore.getState().load()
+      )
+  )
+  return { default: panelModule.RuntimesPanel }
+})
+const RemoteControlPanel = lazy(async () => {
+  const panelModule = await import('./RemoteControlPanel')
+  await panelModule.RemoteControlPanel.preload().catch(() => undefined)
+  return { default: panelModule.RemoteControlPanel }
+})
+const MemoryPanel = lazy(async () => {
+  const panelModule = await import('./MemoryPanel')
+  return { default: panelModule.MemoryPanel }
+})
+const TagsPanel = lazy(async () => {
+  const tagState = useTagStore.getState()
+  const panelModule = await loadSettingsPanel(
+    () => import('./TagsPanel'),
+    () =>
+      Promise.all([
+        tagState.status === 'idle' ? tagState.load() : Promise.resolve(),
+        useSettingsStore.getState().loadSkills(),
+        useSettingsStore.getState().loadConnectors(),
+        useSpecialistStore.getState().load()
+      ])
+  )
+  return { default: panelModule.TagsPanel }
+})
+const ComputePanel = lazy(async () => {
+  const panelModule = await loadSettingsPanel(
+    () => import('./ComputePanel'),
+    () => preloadComputeHosts()
+  )
+  return { default: panelModule.ComputePanel }
+})
+const ComputeAddForm = lazy(async () => ({
+  default: (await import('./ComputeAddForm')).ComputeAddForm
+}))
+const ComputeTargetEditor = lazy(async () => ({
+  default: (await import('./ComputeTargetEditor')).ComputeTargetEditor
+}))
+const ComputeHostDetail = lazy(async () => ({
+  default: (await import('./ComputeHostDetail')).ComputeHostDetail
+}))
+const PermissionsPanel = lazy(async () => {
+  const panelModule = await loadSettingsPanel(
+    () => import('./PermissionsPanel'),
+    () =>
+      import('@/stores/permission-grants-store').then(({ usePermissionGrantsStore }) =>
+        usePermissionGrantsStore.getState().load()
+      )
+  )
+  return { default: panelModule.PermissionsPanel }
+})
+const CredentialsPanel = lazy(async () => ({
+  default: (await import('./CredentialsPanel')).CredentialsPanel
+}))
+const ArchivedPanel = lazy(async () => ({
+  default: (await import('./ArchivedPanel')).ArchivedPanel
+}))
+const TokenUsagePanel = lazy(async () => ({
+  default: (await import('./TokenUsagePanel')).TokenUsagePanel
+}))
+
+type SettingsPageProps = {
+  open: boolean
+  onClose: () => void
+  onOpenSession?: (sessionId: string) => void
+  canDeleteProjects?: boolean
+  hasCompleteSessionCatalog?: boolean
+  catalogRecovery?: SessionCatalogRecovery
+  onRetryCatalogRecovery?: () => void
+  sessionLoadError?: string
+  undoHostRef?: React.Ref<HTMLDivElement>
+}
+
+type SettingsPageHandle = {
+  requestLeave: (leave: () => void) => void
+  closeActivePane: () => boolean
+}
+
+// Builds a form value from an existing provider (never carrying the plaintext key).
+const toFormValue = (provider: ProviderView): ProviderFormValue =>
+  createEmptyProviderFormValue({
+    type:
+      provider.type === 'codex-shared' || provider.type === 'codex-isolated'
+        ? resolveCodexSubscriptionType(provider)
+        : provider.type,
+    codexTransport: provider.codexTransport ?? 'auto',
+    name: provider.name,
+    baseUrl: provider.baseUrl ?? '',
+    model: provider.model ?? '',
+    contextWindow: provider.contextWindow?.toString() ?? '',
+    maxInputTokens: provider.maxInputTokens?.toString() ?? '',
+    maxOutputTokens: provider.maxOutputTokens?.toString() ?? '',
+    apiEndpoint: provider.apiEndpoints?.[0] ?? 'messages',
+    supportsImageInput: provider.supportsImageInput,
+    reasoningEffortPreset: provider.reasoningEffortPreset ?? 'standard-5',
+    reasoningEffortTransport: provider.reasoningEffortTransport ?? 'reasoning-effort',
+    vendorId: provider.vendorId,
+    region: provider.region
+  })
+
+const toUpsertRequest = (
+  value: ProviderFormValue,
+  id: string | undefined
+): UpsertProviderRequest => ({
+  id,
+  type: value.type,
+  codexTransport: value.codexTransport,
+  name: value.name,
+  baseUrl: value.baseUrl,
+  model: value.model,
+  ...providerFormTokenLimits(value),
+  apiEndpoints: providerFormApiEndpoints(value),
+  supportsImageInput: value.supportsImageInput,
+  reasoningEffortPreset: value.type === 'custom' ? value.reasoningEffortPreset : undefined,
+  reasoningEffortTransport: value.type === 'custom' ? value.reasoningEffortTransport : undefined,
+  vendorId: value.vendorId,
+  region: value.region,
+  key: value.key || undefined
+})
+
+type SettingsPanel = {
+  id: SettingsPanelId
+  // A catalog key, not finished copy: this table is module-level, so a resolved string would freeze the
+  // language at import time and never re-render on a language change. Callers resolve it through t().
+  labelKey: string
+  Icon: React.ComponentType<{ className?: string }>
+}
+
+// The panels that can host a drilled-in sub-view, mapped from the capitalized name the breadcrumb
+// button shows to the lowercase form mid-sentence copy needs ("Back to skills"). English distinguishes
+// the two, Chinese does not, so they are separate catalog entries that resolve to the same translation.
+// Keyed rather than derived: the old code sliced a prefix off the key and cast the result, which hid
+// that one panel had no lowercase entry at all and rendered a raw key path to screen readers.
+const PANEL_NAME_LOWER = {
+  Model: 'model',
+  Network: 'network',
+  Compute: 'compute',
+  Memory: 'memory',
+  Tags: 'tags',
+  Credentials: 'credentials',
+  Archived: 'archived'
+} as const
+
+type DrillablePanelName = keyof typeof PANEL_NAME_LOWER
+
+type SettingsGroup = {
+  // The union rather than `string` is deliberate: a group added later cannot compile until its
+  // heading is a known catalog key, so it can never reach the nav as a raw untranslated label.
+  labelKey: 'Intelligence' | 'Connections' | 'Workspace' | 'System'
+  panels: ReadonlyArray<SettingsPanel>
+}
+
+// Four purpose-based groups: model/agent intelligence, external connections, workspace
+// organization, and the app-level system panel.
+const SETTINGS_GROUPS: ReadonlyArray<SettingsGroup> = [
+  {
+    labelKey: 'System',
+    panels: [
+      { id: 'general', labelKey: 'General', Icon: Settings2 },
+      { id: 'appearance', labelKey: 'Appearance', Icon: Palette },
+      { id: 'notifications', labelKey: 'Notifications', Icon: Bell }
+    ]
+  },
+  {
+    labelKey: 'Intelligence',
+    panels: [
+      { id: 'model', labelKey: 'Model', Icon: Brain },
+      { id: 'agent', labelKey: 'Agent', Icon: Bot },
+      { id: 'memory', labelKey: 'Memory', Icon: BrainCircuit }
+    ]
+  },
+  {
+    labelKey: 'Connections',
+    panels: [
+      { id: 'network', labelKey: 'Network', Icon: Globe },
+      { id: 'remote-control', labelKey: 'Remote', Icon: MonitorSmartphone },
+      { id: 'credentials', labelKey: 'Credentials', Icon: KeyRound },
+      { id: 'compute', labelKey: 'Compute', Icon: Zap }
+    ]
+  },
+  {
+    labelKey: 'Workspace',
+    panels: [
+      { id: 'tags', labelKey: 'Tags', Icon: TagsIcon },
+      { id: 'permissions', labelKey: 'Permissions', Icon: LockKeyhole },
+      { id: 'runtimes', labelKey: 'Runtimes', Icon: TerminalSquare },
+      { id: 'storage', labelKey: 'Storage', Icon: Cloud },
+      { id: 'usage', labelKey: 'Usage', Icon: ChartNoAxesCombined },
+      { id: 'archived', labelKey: 'Archived', Icon: Archive }
+    ]
+  }
+]
+
+// Flattened panel list for lookups (header title, etc.).
+const SETTINGS_PANELS: ReadonlyArray<SettingsPanel> = SETTINGS_GROUPS.flatMap(
+  (group) => group.panels
+)
+
+// Display copy for the write-failure codes produced by settings-write-coordinator. Module-level
+// table of catalog keys (not resolved strings), resolved through t() at render time.
+const SETTINGS_WRITE_ERROR_COPY: Record<SettingsWriteErrorCode, string> = {
+  'reasoning-effort': 'Could not save reasoning effort. Try again.',
+  'session-details-model':
+    'Could not save Session details model. Refresh the model catalog and try again.',
+  'reviewer-model': 'Could not save Reviewer model. Refresh the model catalog and try again.',
+  'subagent-model': 'Could not save Subagent model. Refresh the model catalog and try again.',
+  'prompt-optimization-model':
+    'Could not save Prompt optimization model. Refresh the model catalog and try again.',
+  'vision-model': 'Could not save Vision model. Refresh the model catalog and try again.',
+  notifications: 'Could not save notification preference. Try again.',
+  'notification-content': 'Could not save notification preference. Try again.',
+  'conversation-skill-import': 'Could not save conversation Skill import preference. Try again.',
+  'close-preference': 'Could not save window close preference. Try again.',
+  'app-icon': 'Could not save app icon preference. Try again.',
+  'project-files-filter': 'Could not save files filter preference. Try again.',
+  'default-permission-profile': 'Could not save the default permission mode. Try again.',
+  'active-provider': 'Could not switch active provider or model. Try again.',
+  'agent-framework': 'Could not switch agent framework. Try again.'
+}
+
+const EMPTY_USAGE_SESSIONS = [] as const
+const EMPTY_USAGE_PROJECTS = [] as const
+
+const PdfAnnotationPreviewDialog = lazy(() =>
+  import('../workspace/pdf-annotations/PdfAnnotationPreviewDialog').then((panelModule) => ({
+    default: panelModule.PdfAnnotationPreviewDialog
+  }))
+)
+
+// App-level model settings surface. Reuses the onboarding cards/form; manages providers (CRUD +
+// activate + test). Opened from the Home/Workspace gear entry.
+const SettingsPage = forwardRef<SettingsPageHandle, SettingsPageProps>(function SettingsPage(
+  {
+    open,
+    onClose,
+    onOpenSession,
+    canDeleteProjects = true,
+    hasCompleteSessionCatalog = true,
+    catalogRecovery = { kind: 'ready' },
+    onRetryCatalogRecovery,
+    sessionLoadError,
+    undoHostRef
+  },
+  ref
+): React.JSX.Element {
+  const { t } = useTranslation()
+  const [tagAnnotationError, setTagAnnotationError] = useState<string>()
+  const [openingTagAnnotation, setOpeningTagAnnotation] = useState(false)
+  const [tagAnnotationPreview, setTagAnnotationPreview] = useState<{
+    annotation: PdfAnnotation
+    item: PreviewFileItem
+  }>()
+  const tagAnnotationRequest = useRef(0)
+  useEffect(() => {
+    if (!open) {
+      tagAnnotationRequest.current += 1
+      setOpeningTagAnnotation(false)
+      setTagAnnotationError(undefined)
+      setTagAnnotationPreview(undefined)
+    }
+    return () => {
+      tagAnnotationRequest.current += 1
+    }
+  }, [open])
+  const openTaggedPdfAnnotation = async (id: string): Promise<void> => {
+    const sequence = ++tagAnnotationRequest.current
+    const reference = useTagStore.getState().pdfAnnotations?.find((item) => item.id === id)
+    setTagAnnotationError(undefined)
+    setOpeningTagAnnotation(true)
+    try {
+      if (!reference) throw new Error('Missing annotation')
+      const scope =
+        reference.literatureItemId && reference.versionId
+          ? { literatureVersionId: reference.versionId }
+          : { projectId: reference.projectId }
+      const result = await window.api.pdfAnnotations.list({ ...scope, id, limit: 1 })
+      if (sequence !== tagAnnotationRequest.current) return
+      const annotation = result.items.find((item) => item.id === id)
+      if (!annotation) throw new Error('Missing annotation')
+      const item = createBookmarkPreviewItem({ id, kind: 'pdf', ...annotation.target })
+      if (!item) throw new Error('Missing source')
+      setTagAnnotationPreview({ annotation, item })
+    } catch {
+      if (sequence === tagAnnotationRequest.current)
+        setTagAnnotationError(t('PDF annotations are unavailable for this source.'))
+    } finally {
+      if (sequence === tagAnnotationRequest.current) setOpeningTagAnnotation(false)
+    }
+  }
+  const providers = useSettingsStore((state) => state.providers)
+  const agentFrameworkId = useSettingsStore((state) => state.agentFrameworkId)
+  const frameworkEndpoints = useSettingsStore(selectFrameworkApiEndpoints)
+  const activeFramework = useSettingsStore(selectActiveAgentFramework)
+  const customApiEndpoint = defaultCustomApiEndpoint(frameworkEndpoints)
+  const opencode = useSettingsStore((state) => state.opencode)
+  const isDetectingOpencode = useSettingsStore((state) => state.isDetectingOpencode)
+  const detectOpencode = useSettingsStore((state) => state.detectOpencode)
+  const codex = useSettingsStore((state) => state.codex)
+  const isDetectingCodex = useSettingsStore((state) => state.isDetectingCodex)
+  const detectCodex = useSettingsStore((state) => state.detectCodex)
+  const codebuddy = useSettingsStore((state) => state.codebuddy)
+  const isDetectingCodeBuddy = useSettingsStore((state) => state.isDetectingCodeBuddy)
+  const detectCodeBuddy = useSettingsStore((state) => state.detectCodeBuddy)
+  const encryptionAvailable = useSettingsStore((state) => state.encryptionAvailable)
+  const load = useSettingsStore((state) => state.load)
+  const saveValidatedProvider = useSettingsStore((state) => state.saveValidatedProvider)
+  const persistProvider = useSettingsStore((state) => state.persistProvider)
+  const validateProvider = useSettingsStore((state) => state.validateProvider)
+  const refreshProviderModels = useSettingsStore((state) => state.refreshProviderModels)
+  const pendingSettingsIntent = useSettingsStore((state) => state.pendingSettingsIntent)
+  const consumePendingSettingsIntent = useSettingsStore(
+    (state) => state.consumePendingSettingsIntent
+  )
+  const preflightFailed = useSettingsStore((state) => state.preflightFailed)
+  const refreshPreflight = useSettingsStore((state) => state.refreshPreflight)
+  const settingsWriteError = useSettingsStore((state) => state.settingsWriteError)
+  const clearSettingsWriteError = useSettingsStore((state) => state.clearSettingsWriteError)
+  // Settings navigation history (browser-like back/forward). Each entry contains only its active
+  // panel route, so unrelated panel views cannot form impossible combinations.
+  const [history, setHistory] = useState<SettingsRoute[]>([INITIAL_SETTINGS_ROUTE])
+  const [historyIndex, setHistoryIndex] = useState(0)
+  const skillLeaveReturnFocus = useRef<HTMLElement | null>(null)
+  const networkEditorLeaveState = useRef<NetworkEditorLeaveState | null>(null)
+  const [networkEditorBusy, setNetworkEditorBusy] = useState(false)
+  const onNetworkLeaveStateChange = useCallback((state: NetworkEditorLeaveState | null) => {
+    networkEditorLeaveState.current = state
+    setNetworkEditorBusy(state?.busy ?? false)
+    if (state && !state.dirty && !state.busy) setPendingSkillLeave(null)
+  }, [])
+  const providerEditorLeaveState = useRef<SettingsEditorLeaveState | null>(null)
+  const [pendingSkillLeave, setPendingSkillLeave] = useState<(() => void) | null>(null)
+  const pendingSkillLeaveOwner = useRef<'connection' | 'network' | 'provider' | 'resource' | null>(
+    null
+  )
+  const resourceEditorLeaveState = useRef<SettingsEditorLeaveState | null>(null)
+  const [resourceEditorBusy, setResourceEditorBusy] = useState(false)
+  const onResourceEditorLeaveStateChange = useCallback((state: SettingsEditorLeaveState | null) => {
+    resourceEditorLeaveState.current = state
+    setResourceEditorBusy(state?.busy ?? false)
+    if (
+      (!state || (!state.dirty && !state.busy)) &&
+      pendingSkillLeaveOwner.current === 'resource'
+    ) {
+      pendingSkillLeaveOwner.current = null
+      setPendingSkillLeave(null)
+    }
+  }, [])
+  const [resourceDraftGeneration, setResourceDraftGeneration] = useState(0)
+  const [connectionDraftGeneration, setConnectionDraftGeneration] = useState(0)
+  const connectionEditorLeaveState = useRef<SettingsEditorLeaveState | null>(null)
+  const [connectionEditorBusy, setConnectionEditorBusy] = useState(false)
+  const onConnectionEditorLeaveStateChange = useCallback(
+    (state: SettingsEditorLeaveState | null) => {
+      connectionEditorLeaveState.current = state
+      setConnectionEditorBusy(state?.busy ?? false)
+      if (state === null) setPendingSkillLeave(null)
+    },
+    []
+  )
+  const requestLeave = useCallback((leave: () => void) => {
+    const owner = connectionEditorLeaveState.current
+      ? 'connection'
+      : networkEditorLeaveState.current
+        ? 'network'
+        : providerEditorLeaveState.current
+          ? 'provider'
+          : resourceEditorLeaveState.current
+            ? 'resource'
+            : null
+    const state =
+      connectionEditorLeaveState.current ??
+      networkEditorLeaveState.current ??
+      providerEditorLeaveState.current ??
+      resourceEditorLeaveState.current
+    if (state?.dirty || state?.busy) {
+      const focused = document.activeElement
+      if (
+        focused instanceof HTMLElement &&
+        !focused.closest('[data-testid="skill-discard-confirmation"]')
+      ) {
+        skillLeaveReturnFocus.current = focused
+      }
+      pendingSkillLeaveOwner.current = owner
+      setPendingSkillLeave(() => leave)
+    } else leave()
+  }, [])
+  const openResourceCenterSkill = useCallback(
+    (skillId: string): void => {
+      requestLeave(() => {
+        useNavigationStore.getState().openResourceCenter(
+          'user',
+          {
+            resource: 'skills',
+            skillId
+          },
+          onClose
+        )
+      })
+    },
+    [onClose, requestLeave]
+  )
+  const openResourceCenterSpecialist = useCallback(
+    (specialistId: string, kind: 'builtin' | 'edit' = 'edit'): void => {
+      requestLeave(() => {
+        useNavigationStore.getState().openResourceCenter(
+          'user',
+          {
+            resource: 'specialists',
+            specialistId,
+            specialistKind: kind
+          },
+          onClose
+        )
+      })
+    },
+    [onClose, requestLeave]
+  )
+  const requestClose = (): void => requestLeave(onClose)
+  const returnFocusRef = useRef<HTMLElement | null>(null)
+  // Whether the dialog is enlarged to near-fullscreen via the maximize control.
+  const [isExpanded, setIsExpanded] = useState(false)
+  const isMobile = useMediaQuery('(max-width: 767px)')
+  const [isMobileNavOpen, setIsMobileNavOpenState] = useState(false)
+  const isMobileNavOpenRef = useRef(false)
+  const setIsMobileNavOpen = useCallback((next: boolean) => {
+    // The dialog's Escape listener can retain an earlier render's callback.
+    // Update its navigation authority before scheduling the visual state change.
+    isMobileNavOpenRef.current = next
+    setIsMobileNavOpenState(next)
+  }, [])
+  const mobileNavRef = useRef<HTMLElement | null>(null)
+  const mobileNavTriggerRef = useRef<HTMLButtonElement | null>(null)
+  const mobileNavWasOpenRef = useRef(false)
+  const codebuddyAutoDetectAttempted = useRef(false)
+  const customServers = useSettingsStore((state) => state.customServers)
+  const deviceCredentials = useSettingsStore((state) => state.deviceCredentials)
+  const computeHosts = useComputeStore((state) => state.hosts)
+  const specialistItems = useSpecialistStore((state) => state.items)
+  const loadTags = useTagStore((state) => state.load)
+  const listenForTagChanges = useTagStore((state) => state.listen)
+  const loadMemory = useMemoryStore((state) => state.load)
+  const listenForMemoryChanges = useMemoryStore((state) => state.listen)
+  const browserSelectedTagId = useTagStore((state) => state.browserSelectedId)
+  const setSelectedTagId = useTagStore((state) => state.setBrowserSelectedId)
+  const [formValue, setFormValue] = useState<ProviderFormValue>(() =>
+    createEmptyProviderFormValue()
+  )
+  const [providerDraftBaseline, setProviderDraftBaseline] = useState<ProviderFormValue>(() =>
+    createEmptyProviderFormValue()
+  )
+  const [providerBase, setProviderBase] = useState<ProviderView>()
+  const [isSaving, setIsSaving] = useState(false)
+  const [isRefreshingModels, setIsRefreshingModels] = useState(false)
+  const [statusMessage, setStatusMessage] = useState<string | undefined>(undefined)
+  const [statusOk, setStatusOk] = useState(false)
+  const [busyProviderId, setBusyProviderId] = useState<string | undefined>(undefined)
+  const [postSaveValidationFailed, setPostSaveValidationFailed] = useState(false)
+  const postSaveValidationGeneration = useRef(0)
+  const postSaveValidationProviderId = useRef<string | undefined>(undefined)
+  useEffect(() => {
+    const providerId = postSaveValidationProviderId.current
+    if (!providerId || providers.some((provider) => provider.id === providerId)) return
+    postSaveValidationGeneration.current += 1
+    postSaveValidationProviderId.current = undefined
+    setBusyProviderId(undefined)
+    setPostSaveValidationFailed(false)
+  }, [providers])
+  const [isTestingConnection, setIsTestingConnection] = useState(false)
+  const [savedProviderWarning, setSavedProviderWarning] = useState<'reconnect' | 'refresh'>()
+  const [connectionResult, setConnectionResult] = useState<ValidateProviderResult>()
+  const formOperationGeneration = useRef(0)
+  const savingOperation = useRef(false)
+
+  // Refresh settings whenever the dialog opens so external changes are reflected.
+  useEffect(() => {
+    if (open) {
+      setSavedProviderWarning((current) => (current === 'refresh' ? undefined : current))
+      void load()
+    }
+  }, [open, load])
+
+  useEffect(() => {
+    if (!open) return
+    void loadTags()
+    return listenForTagChanges()
+  }, [listenForTagChanges, loadTags, open])
+
+  useEffect(() => {
+    if (!open) return
+    return listenForMemoryChanges()
+  }, [listenForMemoryChanges, open])
+
+  useEffect(() => {
+    if (isMobile && isMobileNavOpen) {
+      mobileNavWasOpenRef.current = true
+      const activeItem = mobileNavRef.current?.querySelector<HTMLElement>('[aria-current="page"]')
+      const firstItem = mobileNavRef.current?.querySelector<HTMLElement>('button')
+      ;(activeItem ?? firstItem)?.focus()
+      return
+    }
+    if (!mobileNavWasOpenRef.current) return
+    mobileNavWasOpenRef.current = false
+    mobileNavTriggerRef.current?.focus()
+  }, [isMobile, isMobileNavOpen])
+
+  // External route intents pass through the same draft protection as local navigation.
+  // Keep request identity independent of store consumption and Strict Mode effect replay.
+  const seededIntentId = useRef<number | undefined>(undefined)
+  useEffect(() => {
+    if (!open) {
+      seededIntentId.current = undefined
+      return
+    }
+    if (!pendingSettingsIntent || pendingSettingsIntent.requestId === seededIntentId.current) return
+    seededIntentId.current = pendingSettingsIntent.requestId
+    consumePendingSettingsIntent(pendingSettingsIntent.requestId)
+    requestLeave(() => {
+      const route = pendingSettingsIntent.route
+      if (
+        route.panel === 'skills' ||
+        route.panel === 'connectors' ||
+        route.panel === 'specialists'
+      ) {
+        useNavigationStore.getState().openResourceCenter(
+          'user',
+          route.panel === 'connectors'
+            ? { resource: 'connectors', view: route.view }
+            : route.panel === 'skills'
+              ? {
+                  resource: 'skills',
+                  skillId: route.view.kind === 'detail' ? route.view.id : undefined
+                }
+              : {
+                  resource: 'specialists',
+                  specialistId: route.view.kind === 'edit' ? route.view.id : undefined
+                },
+          onClose
+        )
+        return
+      }
+      setHistory([route])
+      setHistoryIndex(0)
+    })
+  }, [consumePendingSettingsIntent, onClose, open, pendingSettingsIntent, requestLeave])
+
+  useEffect(() => {
+    if (!open) setPendingSkillLeave(null)
+  }, [open])
+
+  const currentRoute = history[historyIndex]
+  const activePanel = currentRoute.panel
+
+  useEffect(() => {
+    if (open && activePanel === 'memory') void loadMemory()
+  }, [activePanel, loadMemory, open])
+
+  // Auto-detect opencode the first time its detection card is shown without a known path, so the card
+  // reflects reality without a manual re-detect. Guarded on path + in-flight to run at most once.
+  useEffect(() => {
+    if (
+      open &&
+      activePanel === 'agent' &&
+      agentFrameworkId === 'opencode' &&
+      !opencode?.resolvedPath &&
+      !isDetectingOpencode
+    ) {
+      void detectOpencode()
+    }
+  }, [
+    open,
+    activePanel,
+    agentFrameworkId,
+    opencode?.resolvedPath,
+    isDetectingOpencode,
+    detectOpencode
+  ])
+
+  // Codex detection probes the ACP adapter and its paired native runtime. Keep it lazy so opening
+  // settings for another framework does not spawn an unnecessary process.
+  useEffect(() => {
+    if (
+      open &&
+      activePanel === 'agent' &&
+      agentFrameworkId === 'codex' &&
+      !codex?.resolvedPath &&
+      !isDetectingCodex
+    ) {
+      void detectCodex()
+    }
+  }, [open, activePanel, agentFrameworkId, codex?.resolvedPath, isDetectingCodex, detectCodex])
+
+  useEffect(() => {
+    if (!open) {
+      codebuddyAutoDetectAttempted.current = false
+      return
+    }
+
+    if (
+      activePanel === 'agent' &&
+      !codebuddyAutoDetectAttempted.current &&
+      !codebuddy?.resolvedPath &&
+      !isDetectingCodeBuddy
+    ) {
+      codebuddyAutoDetectAttempted.current = true
+      void detectCodeBuddy()
+    }
+  }, [open, activePanel, codebuddy?.resolvedPath, isDetectingCodeBuddy, detectCodeBuddy])
+
+  const isUsageVisible = open && activePanel === 'usage'
+  const sessions = useSessionStore((state) =>
+    isUsageVisible ? state.sessions : EMPTY_USAGE_SESSIONS
+  )
+  const projects = useProjectStore((state) =>
+    isUsageVisible ? state.projects : EMPTY_USAGE_PROJECTS
+  )
+  const modelView: ModelView = currentRoute.panel === 'model' ? currentRoute.view : { kind: 'list' }
+  const notebookNetworkAvailable =
+    typeof window.api.settings.getNotebookNetworkStatus === 'function' &&
+    !document.documentElement.hasAttribute('data-open-science-notebook-network-unavailable')
+  const networkView: NetworkView =
+    currentRoute.panel === 'network' &&
+    (currentRoute.view.kind !== 'domains' || notebookNetworkAvailable)
+      ? currentRoute.view
+      : { kind: 'list' }
+  const computeView: ComputeView =
+    currentRoute.panel === 'compute' ? currentRoute.view : { kind: 'list' }
+  const editingComputeTarget = useComputeStore((state) =>
+    computeView.kind === 'target-editor' && computeView.providerId
+      ? state[`${computeView.backend}Targets`].find(
+          (target) => target.providerId === computeView.providerId
+        )
+      : undefined
+  )
+  const archivedView: ArchivedView =
+    currentRoute.panel === 'archived' ? currentRoute.view : { kind: 'list' }
+  const memoryView: MemoryView =
+    currentRoute.panel === 'memory' ? currentRoute.view : { kind: 'list' }
+  const tagsView: TagsView = currentRoute.panel === 'tags' ? currentRoute.view : { kind: 'list' }
+  const credentialsView: CredentialsView =
+    currentRoute.panel === 'credentials' ? currentRoute.view : { kind: 'list' }
+  const activeTagId =
+    tagsView.kind === 'list'
+      ? tagsView.tagId
+      : tagsView.kind === 'edit'
+        ? tagsView.tagId
+        : undefined
+  const canGoBack = historyIndex > 0
+  const canGoForward = historyIndex < history.length - 1
+
+  useEffect(() => {
+    if (activeTagId) setSelectedTagId(activeTagId)
+  }, [activeTagId, setSelectedTagId])
+
+  // Pushes a complete active route, dropping any forward entries. Routes contain only serializable
+  // navigation values, so comparing the whole route automatically covers fields added later.
+  const navigate = (route: SettingsRoute, onNavigated?: () => void): void => {
+    if (route.panel === 'skills' || route.panel === 'connectors' || route.panel === 'specialists') {
+      requestLeave(() => {
+        useNavigationStore
+          .getState()
+          .openResourceCenter(
+            'user',
+            route.panel === 'connectors'
+              ? { resource: 'connectors', view: route.view }
+              : { resource: route.panel },
+            () => {
+              onClose()
+              onNavigated?.()
+            }
+          )
+      })
+      return
+    }
+    if (JSON.stringify(route) === JSON.stringify(currentRoute)) {
+      onNavigated?.()
+      return
+    }
+    requestLeave(() => {
+      setHistory((entries) => [...entries.slice(0, historyIndex + 1), route])
+      setHistoryIndex((index) => index + 1)
+      onNavigated?.()
+    })
+  }
+
+  // Internal transitions retain history instead of reseeding an external entry point.
+  const navigatePanel = (panel: SettingsPanelId, onNavigated?: () => void): void => {
+    navigate(
+      panel === 'tags'
+        ? { panel, view: { kind: 'list', tagId: browserSelectedTagId } }
+        : settingsPanelRoute(panel),
+      onNavigated
+    )
+  }
+
+  const recordSelectedTag = useCallback(
+    (tagId: string): void => {
+      setHistory((entries) => {
+        const entry = entries[historyIndex]
+        if (entry?.panel !== 'tags' || entry.view.kind !== 'list' || entry.view.tagId === tagId) {
+          return entries
+        }
+        return entries.map((candidate, index) =>
+          index === historyIndex && candidate.panel === 'tags' && candidate.view.kind === 'list'
+            ? { ...candidate, view: { ...candidate.view, tagId } }
+            : candidate
+        )
+      })
+    },
+    [historyIndex]
+  )
+
+  // Connector links leave Settings and open their owner in Resource Center.
+  const navigateConnectors = (connectors: ConnectorsView): void =>
+    navigate({ panel: 'connectors', view: connectors })
+
+  // Navigates within the network panel (package-mirror list vs. configure) as a history entry, so the
+  // configure form gets a proper "Network / Package mirror" breadcrumb + back/forward.
+  const navigateNetwork = (network: NetworkView): void =>
+    navigate({ panel: 'network', view: network })
+
+  // Navigates within the compute panel (list/add/detail) as a history entry.
+  const navigateCompute = (compute: ComputeView): void =>
+    navigate({ panel: 'compute', view: compute })
+
+  const navigateArchived = (archived: ArchivedView): void =>
+    navigate({ panel: 'archived', view: archived })
+
+  const navigateMemory = (memory: MemoryView): void => navigate({ panel: 'memory', view: memory })
+
+  const navigateTags = (tags: TagsView): void => navigate({ panel: 'tags', view: tags })
+
+  const navigateCredentials = (credentials: CredentialsView): void =>
+    navigate({ panel: 'credentials', view: credentials })
+
+  // Shared header breadcrumb for a drilled-in sub-view (null when on a panel's list, so the plain
+  // panel title shows).
+  const breadcrumb = ((): {
+    rootLabelKey: DrillablePanelName
+    rootTo: SettingsRoute
+    leaf: string
+  } | null => {
+    if (
+      activePanel === 'model' &&
+      (modelView.kind === 'classification-create' || modelView.kind === 'classification-edit')
+    )
+      return {
+        rootLabelKey: 'Model',
+        rootTo: { panel: 'model', view: { kind: 'classification' } },
+        leaf:
+          modelView.kind === 'classification-create'
+            ? t('Add model service')
+            : t('Edit model service')
+      }
+    if (activePanel === 'model' && (modelView.kind === 'create' || modelView.kind === 'edit')) {
+      const name =
+        modelView.kind === 'edit'
+          ? (providers.find((provider) => provider.id === modelView.providerId)?.name ?? '')
+          : ''
+      return {
+        rootLabelKey: 'Model',
+        rootTo: { panel: 'model', view: { kind: 'list' } },
+        leaf: modelView.kind === 'create' ? t('Add provider') : t('Edit {{name}}', { name }).trim()
+      }
+    }
+    if (activePanel === 'network' && networkView.kind !== 'list') {
+      return {
+        rootLabelKey: 'Network',
+        rootTo: { panel: 'network', view: { kind: 'list' } },
+        leaf:
+          networkView.kind === 'proxy'
+            ? t('Proxy')
+            : networkView.kind === 'domains'
+              ? t('Notebook network access')
+              : t('Package mirror')
+      }
+    }
+    if (activePanel === 'compute' && computeView.kind !== 'list') {
+      const leaf =
+        computeView.kind === 'add'
+          ? t('Add SSH host')
+          : computeView.kind === 'target-editor'
+            ? computeView.providerId
+              ? editingComputeTarget
+                ? t('Edit {{name}}', { name: editingComputeTarget.displayName })
+                : t('Edit')
+              : t(computeTargetAddLabels[computeView.backend])
+            : (computeHosts.find((host) => host.providerId === computeView.providerId)
+                ?.displayName ?? computeView.providerId)
+      return {
+        rootLabelKey: 'Compute',
+        rootTo: { panel: 'compute', view: { kind: 'list' } },
+        leaf
+      }
+    }
+    if (activePanel === 'memory' && memoryView.kind !== 'list') {
+      return {
+        rootLabelKey: 'Memory',
+        rootTo: { panel: 'memory', view: { kind: 'list' } },
+        leaf: memoryView.kind === 'create' ? t('New category') : t('Edit category')
+      }
+    }
+    if (activePanel === 'tags' && tagsView.kind !== 'list') {
+      return {
+        rootLabelKey: 'Tags',
+        rootTo: {
+          panel: 'tags',
+          view: {
+            kind: 'list',
+            tagId: tagsView.kind === 'edit' ? tagsView.tagId : browserSelectedTagId
+          }
+        },
+        leaf: tagsView.kind === 'create' ? t('New Tag') : t('Edit Tag')
+      }
+    }
+    if (activePanel === 'credentials' && credentialsView.kind !== 'list') {
+      const leaf =
+        credentialsView.kind === 'create'
+          ? t('New credential')
+          : credentialsView.kind === 'credential'
+            ? (deviceCredentials.find(({ id }) => id === credentialsView.id)?.displayName ??
+              t('Credential'))
+            : credentialsView.serviceId === 'hugging-face'
+              ? 'Hugging Face'
+              : credentialsView.serviceId === 'modal'
+                ? 'Modal'
+                : credentialsView.serviceId === 'ray'
+                  ? t('Ray Jobs')
+                  : credentialsView.serviceId === 'github'
+                    ? t('GitHub')
+                    : credentialsView.serviceId === 'semantic-scholar'
+                      ? t('Semantic Scholar')
+                      : credentialsView.serviceId === 'openalex'
+                        ? t('OpenAlex')
+                        : credentialsView.serviceId === 'unpaywall'
+                          ? t('Unpaywall')
+                          : t('Literature access')
+      return {
+        rootLabelKey: 'Credentials',
+        rootTo: { panel: 'credentials', view: { kind: 'list' } },
+        leaf
+      }
+    }
+    if (activePanel === 'archived' && archivedView.kind === 'project') {
+      return {
+        rootLabelKey: 'Archived',
+        rootTo: { panel: 'archived', view: { kind: 'list' } },
+        leaf:
+          projects.find((project) => project.id === archivedView.projectId)?.name ??
+          t('Archived project')
+      }
+    }
+    return null
+  })()
+
+  const goBack = (): void => {
+    if (!canGoBack) return
+    requestLeave(() => setHistoryIndex((index) => index - 1))
+  }
+
+  const goForward = (): void => {
+    if (!canGoForward) return
+    requestLeave(() => setHistoryIndex((index) => index + 1))
+  }
+
+  useImperativeHandle(ref, () => ({
+    requestLeave,
+    closeActivePane: () => {
+      if (!open) return false
+      const activeDialog = Array.from(
+        document.querySelectorAll<HTMLElement>(
+          '[role="dialog"][data-state="open"], [role="alertdialog"][data-state="open"]'
+        )
+      )
+        .filter((dialog) => dialog.dataset.slot !== 'settings-dialog')
+        .at(-1)
+      if (activeDialog) {
+        activeDialog.dispatchEvent(
+          new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true })
+        )
+        return true
+      }
+      if (isMobileNavOpen) {
+        setIsMobileNavOpen(false)
+        return true
+      }
+      if (breadcrumb) {
+        if (canGoBack) goBack()
+        else {
+          requestLeave(() =>
+            setHistory((entries) =>
+              entries.map((entry, index) => (index === historyIndex ? breadcrumb.rootTo : entry))
+            )
+          )
+        }
+      } else {
+        setIsMobileNavOpen(false)
+        requestClose()
+      }
+      return true
+    }
+  }))
+
+  // Only create/edit locations open a provider form.
+  const isProviderFormOpen =
+    activePanel === 'model' && (modelView.kind === 'create' || modelView.kind === 'edit')
+  // Resolve the edited provider from the live store so a model refresh (which updates the cache) is
+  // reflected in the form; undefined until the provider is found (or when creating).
+  const editingProvider =
+    modelView.kind === 'edit'
+      ? providers.find((provider) => provider.id === modelView.providerId)
+      : undefined
+  const providerEditTargetMissing = modelView.kind === 'edit' && editingProvider === undefined
+  // Required-field errors for the open draft; a custom provider must be complete before it can save.
+  const formErrors = getProviderFormErrors(formValue, { hasStoredKey: editingProvider?.hasKey })
+  const providerConflict =
+    editingProvider &&
+    providerBase &&
+    (editingProvider.configRevision ?? 0) !== (providerBase.configRevision ?? 0)
+  const canSave =
+    !isSaving &&
+    !isTestingConnection &&
+    !providerEditTargetMissing &&
+    !providerConflict &&
+    !hasProviderFormErrors(formErrors)
+
+  // Seed the form value when entering a create/edit sub-view (adjust-state-during-render, keyed on the
+  // sub-view so typing isn't clobbered by background store updates; edit guards until the provider
+  // loads). A create pre-selects the official vendor matching the active agent framework. Also
+  // clears any stale status message on entry.
+  const modelViewKey = modelView.kind === 'edit' ? `edit:${modelView.providerId}` : modelView.kind
+  const [seededModelView, setSeededModelView] = useState<string | undefined>(modelViewKey)
+  if (open && modelViewKey !== seededModelView) {
+    setSeededModelView(modelViewKey)
+    if (modelView.kind === 'create') {
+      const initial = createEmptyProviderFormValue(
+        providerKindPatch(defaultProviderKindKey(agentFrameworkId))
+      )
+      setFormValue(initial)
+      setProviderDraftBaseline(initial)
+    } else if (modelView.kind === 'edit') {
+      const provider = providers.find((entry) => entry.id === modelView.providerId)
+      if (provider) {
+        const initial = toFormValue(provider)
+        setFormValue(initial)
+        setProviderDraftBaseline(initial)
+      }
+      setProviderBase(provider)
+    }
+    setStatusMessage(undefined)
+  }
+
+  const providerFormDirty = Object.entries({ ...providerDraftBaseline, ...formValue }).some(
+    ([key, value]) =>
+      key !== 'providerFormTouched' &&
+      value !== providerDraftBaseline[key as keyof ProviderFormValue]
+  )
+  useEffect(() => {
+    // This draft shares Settings' existing leave decision; the baseline contains no secret input.
+    providerEditorLeaveState.current =
+      open && isProviderFormOpen ? { dirty: providerFormDirty, busy: isSaving } : null
+  }, [open, isProviderFormOpen, providerFormDirty, isSaving])
+
+  // Invalidate observations when the user leaves, edits inputs, or the saved target changes.
+  useEffect(() => {
+    formOperationGeneration.current += 1
+    setConnectionResult(undefined)
+    setStatusMessage(undefined)
+    setIsTestingConnection(false)
+    setIsSaving(false)
+    savingOperation.current = false
+  }, [open, historyIndex, formValue])
+
+  useEffect(() => {
+    // A save can publish its own committed revision before the command returns.
+    // Main checks concurrent writes; only invalidate read-only tests here.
+    if (savingOperation.current) return
+    formOperationGeneration.current += 1
+    setConnectionResult(undefined)
+    setIsTestingConnection(false)
+  }, [editingProvider?.id, editingProvider?.configRevision])
+
+  const openCreate = (): void => {
+    postSaveValidationGeneration.current += 1
+    postSaveValidationProviderId.current = undefined
+    setBusyProviderId(undefined)
+    setPostSaveValidationFailed(false)
+    navigate({ panel: 'model', view: { kind: 'create' } })
+  }
+
+  const openEdit = (provider: ProviderView): void => {
+    postSaveValidationGeneration.current += 1
+    postSaveValidationProviderId.current = undefined
+    setBusyProviderId(undefined)
+    setPostSaveValidationFailed(false)
+    navigate({ panel: 'model', view: { kind: 'edit', providerId: provider.id } })
+  }
+
+  const closeForm = (): void => navigate({ panel: 'model', view: { kind: 'list' } })
+  const canTestConnection = formValue.type === 'custom' || formValue.type === 'official'
+  const prospectiveRequest = (): UpsertProviderRequest => ({
+    ...toUpsertRequest(formValue, editingProvider?.id),
+    ...(modelView.kind === 'edit'
+      ? { requireExisting: true, expectedConfigRevision: providerBase?.configRevision ?? 0 }
+      : {})
+  })
+
+  const handleTestConnection = async (): Promise<void> => {
+    if (!canSave || !canTestConnection) return
+    const generation = ++formOperationGeneration.current
+    setIsTestingConnection(true)
+    setConnectionResult(undefined)
+    setStatusMessage(undefined)
+    try {
+      const result = await validateProvider({ edit: prospectiveRequest() })
+      if (generation === formOperationGeneration.current) {
+        if (result.applied === false) {
+          setStatusOk(false)
+          setStatusMessage(t('Provider configuration changed. Your draft has not been saved.'))
+          void load().catch(() => undefined)
+        } else {
+          setConnectionResult(result)
+        }
+      }
+    } catch {
+      if (generation === formOperationGeneration.current) {
+        setStatusOk(false)
+        setStatusMessage(t('Could not test the provider connection.'))
+      }
+    } finally {
+      if (generation === formOperationGeneration.current) setIsTestingConnection(false)
+    }
+  }
+
+  const handleSave = async (): Promise<void> => {
+    if (!canSave) return
+    const generation = ++formOperationGeneration.current
+    savingOperation.current = true
+    setIsSaving(true)
+    setStatusMessage(undefined)
+    setConnectionResult(undefined)
+    try {
+      if (canTestConnection) {
+        const result = await saveValidatedProvider(prospectiveRequest())
+        if (generation !== formOperationGeneration.current) return
+        if (!result.providerId) {
+          setConnectionResult(result.validation)
+          return
+        }
+        setSavedProviderWarning(
+          result.runtimeReconnectFailed ? 'reconnect' : result.refreshFailed ? 'refresh' : undefined
+        )
+      } else {
+        // Subscription authentication continues through its existing flow.
+        const providerId = await persistProvider(prospectiveRequest())
+        if (generation !== formOperationGeneration.current) return
+        if (providerId) {
+          const validationGeneration = ++postSaveValidationGeneration.current
+          postSaveValidationProviderId.current = providerId
+          setBusyProviderId(providerId)
+          void validateProvider({ providerId })
+            .then(() => {
+              if (postSaveValidationGeneration.current === validationGeneration) {
+                postSaveValidationProviderId.current = undefined
+                setPostSaveValidationFailed(false)
+              }
+            })
+            .catch(() => {
+              if (postSaveValidationGeneration.current === validationGeneration) {
+                setPostSaveValidationFailed(true)
+              }
+            })
+            .finally(() => {
+              if (postSaveValidationGeneration.current === validationGeneration)
+                setBusyProviderId(undefined)
+            })
+        }
+      }
+      // The completed write has settled this draft. It must not prompt or honor an older leave request.
+      providerEditorLeaveState.current = null
+      skillLeaveReturnFocus.current = null
+      setPendingSkillLeave(null)
+      closeForm()
+    } catch (error) {
+      if (generation !== formOperationGeneration.current) return
+      setStatusOk(false)
+      setStatusMessage(
+        error instanceof Error
+          ? localizeProviderResourceMessage(error.message, t)
+          : t('Could not save provider.')
+      )
+    } finally {
+      if (generation === formOperationGeneration.current) {
+        savingOperation.current = false
+        setIsSaving(false)
+      }
+    }
+  }
+
+  // Pulls the vendor's live model list for the provider being edited; on success the form's tags and
+  // the model selectors reflect it. On failure the bundled catalog stays in place.
+  const handleRefreshModels = async (providerId: string): Promise<void> => {
+    setIsRefreshingModels(true)
+    setStatusMessage(undefined)
+
+    try {
+      const result = await refreshProviderModels(providerId)
+
+      setStatusOk(result.ok)
+      setStatusMessage(
+        result.ok
+          ? t('Loaded {{count}} models from the vendor.', {
+              defaultValue_one: 'Loaded {{count}} model from the vendor.',
+              count: result.models?.length ?? 0
+            })
+          : t("Couldn't fetch models: {{reason}}. Using the bundled list.", {
+              reason: result.message
+                ? localizeProviderResourceMessage(result.message, t)
+                : t('request failed')
+            })
+      )
+    } catch {
+      setStatusOk(false)
+      setStatusMessage(t('Could not refresh models from the vendor.'))
+    } finally {
+      setIsRefreshingModels(false)
+    }
+  }
+
+  return (
+    <Dialog.Root
+      open={open}
+      onOpenChange={(next) => {
+        if (next) return
+        setIsMobileNavOpen(false)
+        requestClose()
+      }}
+    >
+      <Dialog.Portal>
+        <Dialog.Overlay className="fixed inset-0 z-50 bg-black/50 data-[state=closed]:animate-out data-[state=open]:animate-in data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 motion-reduce:data-[state=closed]:animate-none motion-reduce:data-[state=open]:animate-none" />
+        <Dialog.Content
+          data-slot="settings-dialog"
+          className="pointer-events-none fixed inset-0 z-50 outline-none data-[state=closed]:animate-out motion-reduce:data-[state=closed]:animate-none"
+          onOpenAutoFocus={() => {
+            const activeElement = document.activeElement
+            const capturedReturnFocus = takeSettingsReturnFocusTarget()
+            if (returnFocusRef.current?.isConnected) return
+            returnFocusRef.current =
+              capturedReturnFocus ??
+              (activeElement instanceof HTMLElement && activeElement !== document.body
+                ? activeElement
+                : null)
+          }}
+          onCloseAutoFocus={(event) => {
+            const returnFocus = returnFocusRef.current
+            returnFocusRef.current = null
+            if (!returnFocus?.isConnected) return
+            event.preventDefault()
+            returnFocus.focus()
+          }}
+          // Don't let a click/focus outside the dialog dismiss it. A Radix Select inside the panel
+          // (provider type, active model, install source) portals its listbox outside the dialog's
+          // DOM, so an outside-click meant only to close the open dropdown would otherwise also close
+          // the whole panel. The dropdown's own dismiss still closes just the dropdown; the panel is
+          // closed intentionally via the ✕ button or Escape.
+          onInteractOutside={(event) => event.preventDefault()}
+          onEscapeKeyDown={(event) => {
+            // The inline guide owns Escape even after focus moves to another Settings control.
+            if (dismissSettingsManualUpdateGuide(event)) return
+            // Let a pending network choice consume Escape before the dialog's capture handler closes it.
+            if (networkEditorLeaveState.current?.cancelPendingMode) {
+              event.preventDefault()
+              networkEditorLeaveState.current.cancelPendingMode()
+              return
+            }
+            if (
+              event.target instanceof Element &&
+              event.target.closest('[data-testid="permission-undo-stack"]')
+            ) {
+              event.preventDefault()
+              return
+            }
+            // Radix observes Escape in capture, before the inline review can cancel itself.
+            if (
+              event.target instanceof Element &&
+              event.target.closest(
+                '[data-slot="skill-marketplace-batch-review"], [data-slot="batch-manage-review"]'
+              )
+            ) {
+              event.preventDefault()
+              return
+            }
+            // Global search: the combobox's own Escape closes the results list first; keep that
+            // keypress from also dismissing the whole dialog (Radix listens in capture phase).
+            if (
+              event.target instanceof HTMLElement &&
+              event.target.closest('[data-slot="settings-global-search"]') &&
+              document.querySelector('[data-slot="settings-global-search"] [role="listbox"]')
+            ) {
+              event.preventDefault()
+              return
+            }
+            if (!isMobileNavOpenRef.current) return
+            event.preventDefault()
+            setIsMobileNavOpen(false)
+          }}
+        >
+          <motion.div
+            layoutRoot
+            data-slot="settings-surface"
+            data-state={open ? 'open' : 'closed'}
+            className={cn(
+              'pointer-events-auto fixed z-50 flex overflow-hidden overscroll-contain rounded-xl border border-border bg-card text-foreground shadow-dialog outline-none data-[state=closed]:animate-out data-[state=open]:animate-in data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 data-[state=closed]:fill-mode-forwards motion-reduce:data-[state=closed]:animate-none motion-reduce:data-[state=open]:animate-none',
+              isExpanded
+                ? 'inset-x-0 bottom-0 top-[var(--windows-titlebar-height)] rounded-none md:bottom-4 md:left-4 md:right-4 md:top-[calc(var(--windows-titlebar-height)+1rem)] md:rounded-xl'
+                : 'inset-x-0 bottom-0 top-[var(--windows-titlebar-height)] h-[calc(100dvh-var(--windows-titlebar-height))] w-screen rounded-none md:bottom-auto md:left-1/2 md:right-auto md:top-[var(--windows-content-center-y)] md:h-[min(688px,var(--windows-content-max-height))] md:w-[min(960px,calc(100vw-2rem))] md:-translate-x-1/2 md:-translate-y-1/2 md:rounded-xl'
+            )}
+          >
+            {/* Radix requires a Title/Description for a11y; the visible panel title lives in the header. */}
+            <Dialog.Title className="sr-only">{t('Settings')}</Dialog.Title>
+            <Dialog.Description className="sr-only">
+              {t('Manage your agent runtime and model providers.')}
+            </Dialog.Description>
+
+            {isMobileNavOpen ? (
+              <button
+                type="button"
+                className="fixed inset-0 z-[65] bg-black/45 md:hidden"
+                aria-label={t('Close settings navigation')}
+                tabIndex={-1}
+                onClick={() => setIsMobileNavOpen(false)}
+              />
+            ) : null}
+
+            {/* Left navigation becomes an off-canvas drawer on narrow browser screens. */}
+            <FocusScope
+              asChild
+              loop={isMobile && isMobileNavOpen}
+              trapped={isMobile && isMobileNavOpen}
+            >
+              <div
+                data-slot="mobile-settings-navigation"
+                role={isMobile && isMobileNavOpen ? 'dialog' : undefined}
+                aria-modal={isMobile && isMobileNavOpen ? true : undefined}
+                aria-label={isMobile && isMobileNavOpen ? t('Settings navigation') : undefined}
+                className="contents"
+                onKeyDown={(event) => {
+                  if (event.key !== 'Escape' || !isMobileNavOpen) return
+                  event.preventDefault()
+                  event.stopPropagation()
+                  setIsMobileNavOpen(false)
+                }}
+              >
+                <nav
+                  ref={mobileNavRef}
+                  aria-label={t('Settings')}
+                  aria-hidden={isMobile && !isMobileNavOpen ? true : undefined}
+                  inert={isMobile && !isMobileNavOpen ? true : undefined}
+                  className={cn(
+                    'fixed bottom-0 left-0 top-[var(--windows-titlebar-height)] z-[70] flex min-h-0 w-[min(86vw,320px)] shrink-0 flex-col overflow-hidden border-r border-border bg-background transition-transform duration-200 ease-out md:static md:z-auto md:w-48 md:translate-x-0',
+                    isMobileNavOpen ? 'translate-x-0' : '-translate-x-full'
+                  )}
+                >
+                  <div
+                    data-slot="settings-navigation-scroll"
+                    className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto overscroll-contain p-3"
+                  >
+                    {isMobile ? (
+                      <div data-slot="settings-global-search" className="mb-4">
+                        <SettingsGlobalSearch
+                          panels={SETTINGS_PANELS}
+                          onNavigate={(panel, onNavigated) => {
+                            navigatePanel(panel, () => {
+                              setIsMobileNavOpen(false)
+                              onNavigated()
+                            })
+                          }}
+                        />
+                      </div>
+                    ) : null}
+                    {SETTINGS_GROUPS.map((group) => (
+                      <div key={group.labelKey} className="flex flex-col gap-0.5">
+                        <div className="px-2 pb-1 pt-1 text-xs font-medium text-muted-foreground">
+                          {t(group.labelKey)}
+                        </div>
+                        <ul className="flex flex-col gap-0.5">
+                          {group.panels.map(({ id, labelKey, Icon }) => {
+                            const isActive = activePanel === id
+                            return (
+                              <li key={id}>
+                                <button
+                                  type="button"
+                                  aria-current={isActive ? 'page' : undefined}
+                                  onClick={() => {
+                                    navigatePanel(id, () => setIsMobileNavOpen(false))
+                                  }}
+                                  className={`flex h-8 w-full items-center gap-2 rounded-lg px-2 text-left text-sm ${
+                                    isActive
+                                      ? 'bg-muted font-medium text-foreground'
+                                      : 'text-muted-foreground hover:bg-muted hover:text-foreground'
+                                  }`}
+                                >
+                                  <Icon
+                                    className="size-4 shrink-0 text-muted-foreground"
+                                    aria-hidden="true"
+                                  />
+                                  <span className="min-w-0 flex-1 truncate">{t(labelKey)}</span>
+                                </button>
+                              </li>
+                            )
+                          })}
+                        </ul>
+                      </div>
+                    ))}
+                  </div>
+                  <div
+                    data-slot="settings-navigation-footer"
+                    className="shrink-0 border-t border-border px-3 py-2"
+                  >
+                    <a
+                      href={APP.links.githubFeedback}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="flex h-8 w-full items-center gap-2 rounded-lg px-2 text-left text-sm text-muted-foreground hover:bg-muted hover:text-foreground"
+                    >
+                      <MessageSquare
+                        className="size-4 shrink-0 text-muted-foreground"
+                        aria-hidden="true"
+                      />
+                      <span className="min-w-0 flex-1 truncate">{t('Feedback')}</span>
+                    </a>
+                  </div>
+                </nav>
+              </div>
+            </FocusScope>
+
+            {/* Right column: header bar + scrollable panel content. */}
+            <div
+              data-slot="settings-main"
+              aria-hidden={isMobile && isMobileNavOpen ? true : undefined}
+              inert={isMobile && isMobileNavOpen ? true : undefined}
+              className="flex min-h-0 min-w-0 flex-1 flex-col bg-card"
+            >
+              <TooltipProvider>
+                <div className="flex h-12 shrink-0 items-center justify-between gap-2 border-b border-border bg-card px-2 md:px-3">
+                  <div className="flex min-w-0 items-center gap-1">
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <Button
+                          ref={mobileNavTriggerRef}
+                          type="button"
+                          variant="ghost"
+                          size="icon-sm"
+                          onClick={() => setIsMobileNavOpen(true)}
+                          aria-label={t('Open settings navigation')}
+                          className="shrink-0 rounded-lg text-muted-foreground md:hidden"
+                        >
+                          <Menu className="size-4" aria-hidden="true" />
+                        </Button>
+                      </TooltipTrigger>
+                      <TooltipContent>{t('Navigation')}</TooltipContent>
+                    </Tooltip>
+                    {/* Browser-like history controls for the settings navigation. */}
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="icon-sm"
+                          onClick={goBack}
+                          disabled={!canGoBack}
+                          aria-label={t('Back', { context: 'step' })}
+                          className="shrink-0 rounded-lg text-muted-foreground disabled:opacity-40"
+                        >
+                          <ArrowLeft className="size-4" aria-hidden="true" />
+                        </Button>
+                      </TooltipTrigger>
+                      <TooltipContent>{t('Back', { context: 'step' })}</TooltipContent>
+                    </Tooltip>
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="icon-sm"
+                          onClick={goForward}
+                          disabled={!canGoForward}
+                          aria-label={t('Forward')}
+                          className="shrink-0 rounded-lg text-muted-foreground disabled:opacity-40"
+                        >
+                          <ArrowRight className="size-4" aria-hidden="true" />
+                        </Button>
+                      </TooltipTrigger>
+                      <TooltipContent>{t('Forward')}</TooltipContent>
+                    </Tooltip>
+                    <span aria-hidden="true" className="mx-1 h-4 w-px shrink-0 bg-border" />
+                    {breadcrumb !== null ? (
+                      <div className="flex min-w-0 items-center gap-1.5 text-sm font-semibold">
+                        <button
+                          type="button"
+                          onClick={() => navigate(breadcrumb.rootTo)}
+                          aria-label={t('Back to {{panel}}', {
+                            panel: t(PANEL_NAME_LOWER[breadcrumb.rootLabelKey])
+                          })}
+                          className="shrink-0 text-muted-foreground transition-colors motion-reduce:transition-none hover:text-foreground"
+                        >
+                          {t(breadcrumb.rootLabelKey)}
+                        </button>
+                        <span className="shrink-0 text-muted-foreground" aria-hidden="true">
+                          ›
+                        </span>
+                        <span className="truncate text-foreground">{breadcrumb.leaf}</span>
+                      </div>
+                    ) : (
+                      <h2 className="truncate text-sm font-semibold text-foreground">
+                        {(() => {
+                          const panel = SETTINGS_PANELS.find((item) => item.id === activePanel)
+                          return panel ? t(panel.labelKey) : null
+                        })()}
+                      </h2>
+                    )}
+                  </div>
+                  {!isMobile ? (
+                    <div
+                      data-slot="settings-global-search"
+                      className="min-w-0 flex-1 px-2 md:max-w-xs"
+                    >
+                      <SettingsGlobalSearch panels={SETTINGS_PANELS} onNavigate={navigatePanel} />
+                    </div>
+                  ) : null}
+                  <div className="flex shrink-0 items-center gap-1">
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="icon-sm"
+                          onClick={() => setIsExpanded((value) => !value)}
+                          aria-label={isExpanded ? t('Restore') : t('Maximize')}
+                          className="rounded-lg text-muted-foreground"
+                        >
+                          {isExpanded ? (
+                            <Minimize2 className="size-4" aria-hidden="true" />
+                          ) : (
+                            <Maximize2 className="size-4" aria-hidden="true" />
+                          )}
+                        </Button>
+                      </TooltipTrigger>
+                      <TooltipContent>{isExpanded ? t('Restore') : t('Maximize')}</TooltipContent>
+                    </Tooltip>
+                    <Tooltip>
+                      <Dialog.Close asChild>
+                        <TooltipTrigger asChild>
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="icon-sm"
+                            aria-label={t('Close settings')}
+                            className="rounded-lg text-muted-foreground"
+                          >
+                            <X className="size-4" aria-hidden="true" />
+                          </Button>
+                        </TooltipTrigger>
+                      </Dialog.Close>
+                      <TooltipContent>{t('Close settings')}</TooltipContent>
+                    </Tooltip>
+                  </div>
+                </div>
+
+                {preflightFailed ? (
+                  <Notice
+                    inline
+                    level="error"
+                    role="alert"
+                    className="mx-3 mt-3"
+                    description={t(
+                      'Could not refresh environment readiness. Saved settings are unchanged.'
+                    )}
+                    primaryButton={{
+                      label: t('Retry preflight'),
+                      onClick: () => void refreshPreflight().catch(() => undefined)
+                    }}
+                  />
+                ) : null}
+
+                {settingsWriteError ? (
+                  <div data-slot="settings-write-error" className="mx-3 mt-3">
+                    <ErrorNotice
+                      tone="amber"
+                      role="alert"
+                      icon={AlertTriangle}
+                      title={t('Settings could not be saved')}
+                      description={settingsWriteError
+                        .split(' ')
+                        .map((code) => {
+                          const copyKey = SETTINGS_WRITE_ERROR_COPY[code as SettingsWriteErrorCode]
+                          return copyKey ? t(copyKey) : code
+                        })
+                        .join(' ')}
+                      dismissButton={{
+                        label: t('Dismiss settings error'),
+                        onClick: clearSettingsWriteError
+                      }}
+                    />
+                  </div>
+                ) : null}
+              </TooltipProvider>
+
+              <motion.div
+                layoutScroll
+                data-slot="settings-content-scroll"
+                data-settings-active-panel={activePanel}
+                className={cn(
+                  'min-h-0 flex-1 overflow-y-auto',
+                  activePanel === 'network' && networkView.kind === 'domains' && 'scroll-pb-32'
+                )}
+              >
+                <div
+                  className={cn(
+                    'mx-auto w-full max-w-[880px]',
+                    (activePanel === 'model' &&
+                      (modelView.kind === 'classification-create' ||
+                        modelView.kind === 'classification-edit')) ||
+                      activePanel === 'memory' ||
+                      activePanel === 'tags'
+                      ? 'h-full'
+                      : 'min-h-full'
+                  )}
+                >
+                  <SettingsPanelLoadingBoundary
+                    resetKey={
+                      activePanel === 'model' ? `${historyIndex}:${modelView.kind}` : undefined
+                    }
+                    panelKey={
+                      activePanel === 'model' &&
+                      (modelView.kind === 'list' ||
+                        modelView.kind === 'local-models' ||
+                        modelView.kind === 'classification')
+                        ? 'model:tabs'
+                        : `${activePanel}:${historyIndex}`
+                    }
+                    onClose={requestClose}
+                  >
+                    {activePanel === 'tags' ? (
+                      <>
+                        {openingTagAnnotation ? (
+                          <div
+                            role="status"
+                            className="flex items-center gap-2 px-4 py-2 text-sm text-muted-foreground"
+                          >
+                            <Loader2
+                              className="size-4 animate-spin motion-reduce:animate-none"
+                              aria-hidden="true"
+                            />
+                            {t('Loading annotations…')}
+                          </div>
+                        ) : null}
+                        {tagAnnotationError ? (
+                          <ErrorNotice tone="amber" description={tagAnnotationError} />
+                        ) : null}
+                        <TagsPanel
+                          key={`tags-${resourceDraftGeneration}`}
+                          view={tagsView}
+                          onNavigate={navigateTags}
+                          onLeaveStateChange={onResourceEditorLeaveStateChange}
+                          onSelectedTagChange={recordSelectedTag}
+                          onOpenResource={(reference) => {
+                            if (reference.resourceType === 'catalog.skill') {
+                              openResourceCenterSkill(reference.resourceId)
+                              return
+                            }
+                            if (reference.resourceType === 'catalog.connector') {
+                              navigate({
+                                panel: 'connectors',
+                                view: customServers.some(
+                                  (server) => server.id === reference.resourceId
+                                )
+                                  ? { kind: 'edit', id: reference.resourceId }
+                                  : { kind: 'detail', id: reference.resourceId }
+                              })
+                              return
+                            }
+                            if (reference.resourceType === 'pdf.annotation') {
+                              void openTaggedPdfAnnotation(reference.resourceId)
+                              return
+                            }
+                            if (reference.resourceType === 'literature.item') {
+                              useNavigationStore
+                                .getState()
+                                .openLiteratureItem(reference.resourceId, 'user')
+                              requestClose()
+                              return
+                            }
+                            const specialist = specialistItems.find(
+                              (item) => item.id === reference.resourceId
+                            )
+                            openResourceCenterSpecialist(
+                              reference.resourceId,
+                              specialist?.kind === 'builtin' ? 'builtin' : 'edit'
+                            )
+                          }}
+                        />
+                      </>
+                    ) : activePanel === 'memory' ? (
+                      <MemoryPanel
+                        key={`memory-${resourceDraftGeneration}`}
+                        view={memoryView}
+                        onNavigate={navigateMemory}
+                        onLeaveStateChange={onResourceEditorLeaveStateChange}
+                        onOpenProject={(projectId) => {
+                          useNavigationStore.getState().openProject(projectId, 'user', onClose)
+                        }}
+                      />
+                    ) : activePanel === 'compute' ? (
+                      computeView.kind === 'add' ? (
+                        // Revoke completion authority before the dialog's exit animation unmounts.
+                        open && (
+                          <ComputeAddForm
+                            onLeaveStateChange={onConnectionEditorLeaveStateChange}
+                            onCreated={(providerId) =>
+                              navigateCompute({ kind: 'detail', providerId })
+                            }
+                            onCancel={() => navigateCompute({ kind: 'list' })}
+                          />
+                        )
+                      ) : computeView.kind === 'target-editor' ? (
+                        open && (
+                          <ComputeTargetEditor
+                            key={`${computeView.backend}:${computeView.providerId ?? 'new'}:${connectionDraftGeneration}`}
+                            view={computeView}
+                            target={editingComputeTarget}
+                            onLeaveStateChange={onConnectionEditorLeaveStateChange}
+                            onBack={() => navigateCompute({ kind: 'list' })}
+                          />
+                        )
+                      ) : computeView.kind === 'detail' ? (
+                        <ComputeHostDetail
+                          providerId={computeView.providerId}
+                          authenticationFocus={computeView.authenticationFocus}
+                          authenticationRequestId={computeView.authenticationRequestId}
+                        />
+                      ) : (
+                        <ComputePanel onNavigate={navigateCompute} />
+                      )
+                    ) : activePanel === 'credentials' ? (
+                      <CredentialsPanel
+                        key={`credentials-${resourceDraftGeneration}`}
+                        view={credentialsView}
+                        onNavigate={navigateCredentials}
+                        onLeaveStateChange={onResourceEditorLeaveStateChange}
+                        onOpenConnector={(id) =>
+                          navigate({ panel: 'connectors', view: { kind: 'edit', id } })
+                        }
+                        onOpenProvider={(provider) => openEdit(provider)}
+                      />
+                    ) : activePanel === 'storage' ? (
+                      <StoragePanel
+                        onContinueToAgent={() => {
+                          navigatePanel('agent')
+                        }}
+                      />
+                    ) : activePanel === 'permissions' ? (
+                      <PermissionsPanel
+                        onOpenSession={onOpenSession}
+                        onOpenConnector={(id) =>
+                          navigateConnectors(
+                            customServers.some((server) => server.id === id)
+                              ? { kind: 'edit', id }
+                              : { kind: 'detail', id }
+                          )
+                        }
+                      />
+                    ) : activePanel === 'archived' ? (
+                      <ArchivedPanel
+                        view={archivedView}
+                        onNavigate={navigateArchived}
+                        canDeleteProjects={canDeleteProjects}
+                        hasCompleteSessionCatalog={hasCompleteSessionCatalog}
+                        catalogRecovery={catalogRecovery}
+                        onRetryCatalogRecovery={onRetryCatalogRecovery}
+                        sessionLoadError={sessionLoadError}
+                      />
+                    ) : activePanel === 'runtimes' ? (
+                      <RuntimesPanel
+                        title={t('Notebook runtimes')}
+                        description={t(
+                          'Choose which Python and R environments notebooks and the Agent can use. App-managed environments are enabled by default.'
+                        )}
+                        onOpenNetworkProtection={
+                          notebookNetworkAvailable
+                            ? () => navigateNetwork({ kind: 'domains' })
+                            : undefined
+                        }
+                      />
+                    ) : activePanel === 'network' ? (
+                      open && (
+                        <NetworkPanel
+                          onNetworkLeaveStateChange={onNetworkLeaveStateChange}
+                          view={networkView}
+                          onNavigate={navigateNetwork}
+                          notebookNetworkAvailable={notebookNetworkAvailable}
+                        />
+                      )
+                    ) : activePanel === 'usage' ? (
+                      <TokenUsagePanel sessions={sessions} projects={projects} />
+                    ) : activePanel === 'general' ? (
+                      <GeneralPanel />
+                    ) : activePanel === 'appearance' ? (
+                      <AppearancePanel />
+                    ) : activePanel === 'notifications' ? (
+                      <NotificationsPanel />
+                    ) : activePanel === 'remote-control' ? (
+                      <RemoteControlPanel />
+                    ) : activePanel === 'agent' ? (
+                      <AgentPanel
+                        title={t('Agent framework')}
+                        description={t(
+                          "Choose which coding-agent backend drives your sessions. Select a card to switch; switching starts a fresh agent session, and open conversations have their transcript replayed to the new backend. The active runtime can't be uninstalled — switch to the other one first."
+                        )}
+                      />
+                    ) : isProviderFormOpen ? (
+                      // Add/edit provider is a secondary page reached via the shared back/forward arrows.
+                      <div className="p-5">
+                        {/* Secret writes fail closed when the OS keychain is unavailable. */}
+                        {!encryptionAvailable ? (
+                          <ErrorNotice
+                            inline
+                            role="alert"
+                            tone="amber"
+                            className="mb-4"
+                            description={t(
+                              'Secure key storage is unavailable. API keys cannot be saved until the system keychain is unlocked or authorized.'
+                            )}
+                          />
+                        ) : null}
+                        {providerEditTargetMissing ? (
+                          <ErrorNotice
+                            inline
+                            role="alert"
+                            tone="amber"
+                            className="mb-4"
+                            description={t(
+                              'This Provider no longer exists. Your draft has not been saved.'
+                            )}
+                          />
+                        ) : null}
+                        {providerConflict ? (
+                          <ErrorNotice
+                            role="alert"
+                            className="mb-4"
+                            description={t(
+                              'Provider configuration changed. Your draft has not been saved.'
+                            )}
+                          >
+                            <details>
+                              <summary>{t('Latest saved configuration')}</summary>
+                              <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-sm">
+                                {[
+                                  [t('Provider type'), editingProvider.type],
+                                  [t('Name'), editingProvider.name],
+                                  [t('Base URL'), editingProvider.baseUrl],
+                                  [t('Model'), editingProvider.model],
+                                  [t('API format'), editingProvider.apiEndpoints?.join(', ')],
+                                  [t('Context window'), editingProvider.contextWindow],
+                                  [t('Maximum input tokens'), editingProvider.maxInputTokens],
+                                  [t('Maximum output tokens'), editingProvider.maxOutputTokens],
+                                  [
+                                    t('Image input'),
+                                    editingProvider.supportsImageInput
+                                      ? t('Enabled')
+                                      : t('Disabled')
+                                  ],
+                                  [
+                                    t('Supported effort levels'),
+                                    editingProvider.reasoningEffortPreset
+                                  ],
+                                  [
+                                    t('Reasoning request format'),
+                                    editingProvider.reasoningEffortTransport
+                                  ],
+                                  [t('Transport'), editingProvider.codexTransport],
+                                  [t('Vendor'), editingProvider.vendorId],
+                                  [t('Region'), editingProvider.region]
+                                ].map(([label, value]) => (
+                                  <div key={label} className="contents">
+                                    <dt>{label}</dt>
+                                    <dd className="break-all">
+                                      {value ?? t('Use provider default')}
+                                    </dd>
+                                  </div>
+                                ))}
+                              </dl>
+                            </details>
+                            <Button
+                              type="button"
+                              disabled={isSaving}
+                              onClick={() => {
+                                const base = toFormValue(providerBase)
+                                const latest = toFormValue(editingProvider)
+                                const changes = Object.fromEntries(
+                                  Object.entries(formValue).filter(
+                                    ([key, value]) => value !== base[key as keyof ProviderFormValue]
+                                  )
+                                )
+                                setFormValue({ ...latest, ...changes })
+                                setProviderDraftBaseline(latest)
+                                setProviderBase(editingProvider)
+                                setStatusMessage(undefined)
+                              }}
+                            >
+                              {t('Reapply my changes to the latest configuration')}
+                            </Button>
+                          </ErrorNotice>
+                        ) : null}
+                        <ProviderForm
+                          key={`${modelViewKey}:${providerBase?.configRevision ?? 'draft'}`}
+                          value={formValue}
+                          onChange={(patch) =>
+                            setFormValue((current) => ({ ...current, ...patch }))
+                          }
+                          hasStoredKey={editingProvider?.hasKey}
+                          maskedKey={editingProvider?.maskedKey}
+                          needsKey={editingProvider?.needsKey}
+                          errors={formErrors}
+                          supportedModels={
+                            editingProvider?.type === formValue.type &&
+                            editingProvider?.vendorId === formValue.vendorId &&
+                            editingProvider?.region === formValue.region
+                              ? editingProvider?.models
+                              : undefined
+                          }
+                          onRefreshModels={
+                            editingProvider?.type === 'official' &&
+                            editingProvider.hasKey &&
+                            editingProvider.vendorId &&
+                            resolveVendorModelsUrl(editingProvider.vendorId, editingProvider.region)
+                              ? () => void handleRefreshModels(editingProvider.id)
+                              : undefined
+                          }
+                          isRefreshingModels={isRefreshingModels}
+                          disabled={isSaving}
+                          encryptionAvailable={encryptionAvailable}
+                          showCodexSubscriptions={
+                            (agentFrameworkId === 'codex' ||
+                              agentFrameworkId === 'open-science-agent') &&
+                            modelView.kind === 'create'
+                          }
+                          showClaudeIsolated={
+                            agentFrameworkId === 'claude-code' && modelView.kind === 'create'
+                          }
+                          defaultCustomApiEndpoint={customApiEndpoint}
+                          framework={activeFramework}
+                        />
+                      </div>
+                    ) : (
+                      <ModelPanel
+                        view={modelView}
+                        navigate={(view) => navigate({ panel: 'model', view })}
+                        local={modelView.kind === 'local-models'}
+                        onChange={(local) =>
+                          navigate({
+                            panel: 'model',
+                            view: { kind: local ? 'local-models' : 'list' }
+                          })
+                        }
+                      >
+                        {postSaveValidationFailed ? (
+                          <ErrorNotice
+                            inline
+                            role="alert"
+                            className="mx-5 mt-5"
+                            description={t('Could not test the provider connection.')}
+                          />
+                        ) : null}
+                        {savedProviderWarning ? (
+                          <ErrorNotice
+                            inline
+                            role="alert"
+                            tone="amber"
+                            className="mx-5 mt-5"
+                            description={
+                              savedProviderWarning === 'reconnect'
+                                ? t(
+                                    'Provider saved, but the Agent could not reconnect. Your changes do not need to be saved again.'
+                                  )
+                                : t(
+                                    'Provider saved, but settings could not be refreshed. Reopen settings to refresh.'
+                                  )
+                            }
+                          />
+                        ) : null}
+                        <ProvidersPanel
+                          recoveryProviderId={
+                            modelView.kind === 'list' ? modelView.recoveryProviderId : undefined
+                          }
+                          recoveryModel={
+                            modelView.kind === 'list' ? modelView.recoveryModel : undefined
+                          }
+                          onCreateProvider={openCreate}
+                          onEditProvider={openEdit}
+                          busyProviderId={busyProviderId}
+                          onBusyProviderChange={(providerId) => {
+                            setBusyProviderId(providerId)
+                            if (providerId) {
+                              postSaveValidationGeneration.current += 1
+                              postSaveValidationProviderId.current = undefined
+                              setPostSaveValidationFailed(false)
+                            }
+                          }}
+                        />
+                      </ModelPanel>
+                    )}
+                  </SettingsPanelLoadingBoundary>
+                </div>
+              </motion.div>
+              {isProviderFormOpen ? (
+                <SettingsFormFooter data-slot="provider-form-footer">
+                  {connectionResult ? (
+                    <ProviderTestResultCard result={connectionResult} />
+                  ) : statusMessage ? (
+                    <ErrorNotice
+                      inline
+                      role={statusOk ? 'status' : 'alert'}
+                      level={statusOk ? 'success' : 'error'}
+                      description={statusMessage}
+                    />
+                  ) : null}
+                  <div className="flex items-center justify-between gap-2">
+                    <div>
+                      {canTestConnection ? (
+                        <Button
+                          type="button"
+                          variant="outline"
+                          disabled={!canSave}
+                          onClick={() => void handleTestConnection()}
+                        >
+                          {isTestingConnection ? (
+                            <Loader2 className="size-4 animate-spin" aria-hidden="true" />
+                          ) : null}
+                          {isTestingConnection ? t('Testing…') : t('Test connection')}
+                        </Button>
+                      ) : null}
+                    </div>
+                    <div className="flex gap-2">
+                      <Button type="button" variant="ghost" onClick={closeForm} disabled={isSaving}>
+                        {t('Cancel')}
+                      </Button>
+                      <Button type="button" onClick={() => void handleSave()} disabled={!canSave}>
+                        {isSaving ? (
+                          <Loader2 className="size-4 animate-spin" aria-hidden="true" />
+                        ) : null}
+                        {isSaving ? t('Saving…') : t('Save')}
+                      </Button>
+                    </div>
+                  </div>
+                </SettingsFormFooter>
+              ) : null}
+            </div>
+          </motion.div>
+          <div
+            hidden={isMobile && isMobileNavOpen}
+            inert={isMobile && isMobileNavOpen}
+            className="relative z-[60] max-md:[&_[data-testid=permission-undo-stack]]:max-w-[calc(100vw-7rem)]"
+          >
+            <ActionToastStack ref={undoHostRef} />
+          </div>
+        </Dialog.Content>
+      </Dialog.Portal>
+      <ConfirmActionDialog
+        open={open && pendingSkillLeave !== null}
+        title={t('Discard unsaved changes?')}
+        description={
+          connectionEditorLeaveState.current
+            ? connectionEditorBusy
+              ? t('Wait for the current save to finish before leaving.')
+              : t('Your changes have not been saved. Discard them and leave?')
+            : networkEditorLeaveState.current
+              ? t('Your network rules have not been saved. Discard them and leave?')
+              : resourceEditorLeaveState.current
+                ? resourceEditorBusy
+                  ? t('Wait for the current save to finish before leaving.')
+                  : t('Your changes have not been saved. Discard them and leave the editor?')
+                : isProviderFormOpen
+                  ? isSaving
+                    ? t('Wait for the provider save to finish before leaving.')
+                    : t(
+                        'Your provider edits have not been saved. Discard them and leave the editor?'
+                      )
+                  : t('Your changes have not been saved. Discard them and leave the editor?')
+        }
+        cancelLabel={t('Keep editing')}
+        confirmLabel={t('Discard changes')}
+        loading={
+          connectionEditorBusy ||
+          networkEditorBusy ||
+          resourceEditorBusy ||
+          (isProviderFormOpen && isSaving)
+        }
+        loadingLabel={t('Please wait…')}
+        destructive
+        testId="skill-discard-confirmation"
+        onCancel={() => {
+          pendingSkillLeaveOwner.current = null
+          setPendingSkillLeave(null)
+        }}
+        onCloseAutoFocus={(event) => {
+          const target = skillLeaveReturnFocus.current
+          skillLeaveReturnFocus.current = null
+          if (!target?.isConnected) return
+          event.preventDefault()
+          target.focus({ preventScroll: true })
+        }}
+        onConfirm={() => {
+          if (
+            connectionEditorLeaveState.current?.busy ||
+            networkEditorLeaveState.current?.busy ||
+            resourceEditorLeaveState.current?.busy ||
+            providerEditorLeaveState.current?.busy
+          )
+            return
+          if (isProviderFormOpen) {
+            // Settings stays mounted while closed. Clear the draft and seed a fresh saved revision
+            // on entry, even when closing does not change the current create/edit route.
+            const empty = createEmptyProviderFormValue()
+            setFormValue(empty)
+            setProviderDraftBaseline(empty)
+            setProviderBase(undefined)
+            setSeededModelView(undefined)
+            providerEditorLeaveState.current = null
+          }
+          if (connectionEditorLeaveState.current) setConnectionDraftGeneration((value) => value + 1)
+          if (resourceEditorLeaveState.current) {
+            setResourceDraftGeneration((value) => value + 1)
+            resourceEditorLeaveState.current = null
+          }
+          const leave = pendingSkillLeave
+          pendingSkillLeaveOwner.current = null
+          skillLeaveReturnFocus.current = null
+          setPendingSkillLeave(null)
+          leave?.()
+        }}
+      />
+      {open && tagAnnotationPreview ? (
+        <Suspense fallback={null}>
+          <PdfAnnotationPreviewDialog
+            {...tagAnnotationPreview}
+            onClose={() => setTagAnnotationPreview(undefined)}
+            onError={setTagAnnotationError}
+          />
+        </Suspense>
+      ) : null}
+    </Dialog.Root>
+  )
+})
+
+export { SettingsPage, type SettingsPageHandle }

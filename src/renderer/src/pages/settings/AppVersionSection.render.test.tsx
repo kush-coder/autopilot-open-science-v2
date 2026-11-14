@@ -1,0 +1,345 @@
+// @vitest-environment jsdom
+import { act } from 'react'
+import { createRoot, type Root } from 'react-dom/client'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+
+import { i18next } from '@/i18n'
+import { useLocaleStore } from '@/stores/locale-store'
+import { useThemeStore } from '@/stores/theme-store'
+import { useUpdateStore } from '@/stores/update-store'
+import { AppVersionSection } from './AppVersionSection'
+
+vi.mock('@/assets/logo.png', () => ({ default: 'logo.png' }))
+vi.mock('@/assets/logo-dark.png', () => ({ default: 'logo-dark.png' }))
+
+let container: HTMLDivElement
+let root: Root
+
+beforeEach(() => {
+  useLocaleStore.setState({ preference: 'system', locale: 'en' })
+  useThemeStore.getState().setPreference('light')
+  container = document.createElement('div')
+  document.body.appendChild(container)
+  root = createRoot(container)
+
+  useUpdateStore.setState({
+    appInfo: {
+      name: 'Open-Science',
+      version: '0.2.0',
+      copyright: '© 2026 AIPOCH. All rights reserved.'
+    },
+    status: { state: 'up-to-date', current: '0.2.0', latest: '0.2.0' }
+  })
+})
+
+afterEach(async () => {
+  act(() => root.unmount())
+  container.remove()
+  useLocaleStore.setState({ preference: 'system', locale: 'en' })
+  await i18next.changeLanguage('en')
+  vi.restoreAllMocks()
+  vi.unstubAllGlobals()
+})
+
+describe('AppVersionSection', () => {
+  it('opens the project license from a resource row without an inline disclosure', () => {
+    act(() => root.render(<AppVersionSection />))
+    const link = container.querySelector('a[aria-label="Open-source license"]')
+    expect(link?.getAttribute('href')).toBe(
+      'https://github.com/aipoch/open-science/blob/main/LICENSE'
+    )
+    expect(link?.textContent).toContain('Apache-2.0')
+    expect(container.querySelector('details, pre')).toBeNull()
+  })
+
+  it('shows the app name, version, and copyright', () => {
+    act(() => {
+      root.render(<AppVersionSection />)
+    })
+
+    expect(container.textContent).toContain('Open-Science')
+    expect(container.textContent).toContain('v0.2.0')
+    expect(container.textContent).toContain('© 2026 AIPOCH')
+  })
+
+  it('links help and release history to the canonical external resources', () => {
+    act(() => {
+      root.render(<AppVersionSection />)
+    })
+
+    const links = Array.from(container.querySelectorAll('a'))
+    expect(links).toHaveLength(6)
+    expect(links.map((link) => link.getAttribute('href'))).toEqual([
+      'https://aipoch.com/open-science/download',
+      'https://www.aipoch.com/docs/guides/installation/#manual-update',
+      'https://www.aipoch.com/docs/',
+      'https://github.com/aipoch/open-science/releases',
+      'https://github.com/aipoch/open-science/blob/main/LICENSE',
+      'https://github.com/aipoch/open-science/blob/main/SECURITY.md'
+    ])
+    expect(links.every((link) => link.target === '_blank' && link.rel === 'noreferrer')).toBe(true)
+    expect(container.querySelector('[data-testid="manual-update-links"] a')).toBeNull()
+    expect(container.querySelector('[data-settings-anchor="general.download"]')).not.toBeNull()
+  })
+
+  it('uses a compact two-column grid for external resources', () => {
+    act(() => root.render(<AppVersionSection />))
+
+    const grid = container.querySelector('[data-testid="about-resource-grid"]')
+    const cards = Array.from(
+      grid?.querySelectorAll<HTMLAnchorElement>('[data-slot="about-resource-card"]') ?? []
+    )
+
+    expect(grid).not.toBeNull()
+    expect(grid?.classList.contains('grid')).toBe(true)
+    expect(grid?.classList.contains('sm:grid-cols-2')).toBe(true)
+    expect(cards).toHaveLength(6)
+    expect(cards.every((card) => card.classList.contains('min-h-20'))).toBe(true)
+    expect(cards.every((card) => card.classList.contains('bg-muted/40'))).toBe(true)
+    expect(cards.every((card) => card.classList.contains('border-border'))).toBe(true)
+    expect(cards.every((card) => card.classList.contains('dark:hover:bg-background/40'))).toBe(true)
+    expect(cards.every((card) => card.classList.contains('rounded-lg'))).toBe(true)
+  })
+
+  it('links manual installation guidance to the localized AIPOCH docs page', async () => {
+    await act(async () => {
+      root.render(<AppVersionSection />)
+    })
+    const link = container.querySelector<HTMLAnchorElement>(
+      '[data-settings-anchor="general.manual-install"]'
+    )
+    expect(link?.href).toBe('https://www.aipoch.com/docs/guides/installation/#manual-update')
+    expect(link?.textContent).toContain('Manual install or update')
+    expect(link?.textContent).toContain('If an update runs into a problem')
+
+    await act(async () => {
+      useLocaleStore.getState().setPreference('zh-Hans')
+    })
+    expect(link?.href).toBe(
+      'https://www.aipoch.com/docs/zh-Hans/guides/installation/#manual-update'
+    )
+    expect(link?.textContent).toContain('手动安装或更新')
+    expect(link?.textContent).toContain('更新遇到问题')
+  })
+
+  it.each([
+    ['en', '/docs/'],
+    ['zh-Hans', '/docs/zh-Hans/'],
+    ['zh-Hant', '/docs/zh-Hant/'],
+    ['ja', '/docs/ja/'],
+    ['ko', '/docs/ko/'],
+    ['fr', '/docs/fr/'],
+    ['ru', '/docs/ru/'],
+    ['de', '/docs/de/'],
+    ['es', '/docs/es/']
+  ] as const)('opens the documentation homepage for the active %s locale', async (locale, path) => {
+    await act(async () => {
+      useLocaleStore.getState().setPreference(locale)
+      root.render(<AppVersionSection />)
+    })
+
+    const link = container.querySelector<HTMLAnchorElement>(
+      '[data-settings-anchor="general.help-center"]'
+    )!
+    expect(link.href).toBe(`https://www.aipoch.com${path}`)
+    expect(link.getAttribute('aria-label')).toBe(i18next.t('Open Help Center in your browser'))
+    expect(link.target).toBe('_blank')
+    expect(link.rel).toBe('noreferrer')
+
+    const security = container.querySelector<HTMLAnchorElement>(
+      'a[href="https://github.com/aipoch/open-science/blob/main/SECURITY.md"]'
+    )!
+    expect(security.getAttribute('aria-label')).toBe(i18next.t('Security'))
+    expect(security.textContent).toContain(
+      i18next.t('Read the security policy and report vulnerabilities.')
+    )
+  })
+
+  it('updates the existing help link after a language switch and resolves System through the app', async () => {
+    act(() => root.render(<AppVersionSection />))
+    const link = container.querySelector<HTMLAnchorElement>(
+      '[data-settings-anchor="general.help-center"]'
+    )!
+    expect(link.href).toBe('https://www.aipoch.com/docs/')
+
+    await act(async () => useLocaleStore.getState().setPreference('es'))
+    expect(link.href).toBe('https://www.aipoch.com/docs/es/')
+
+    vi.spyOn(navigator, 'languages', 'get').mockReturnValue(['zh-TW', 'en-US'])
+    await act(async () => useLocaleStore.getState().setPreference('system'))
+    expect(useLocaleStore.getState().preference).toBe('system')
+    expect(link.href).toBe('https://www.aipoch.com/docs/zh-Hant/')
+
+    await act(async () => useLocaleStore.getState().setPreference('en'))
+    expect(link.href).toBe('https://www.aipoch.com/docs/')
+  })
+
+  it('keeps resource details visible and highlights icons on pointer hover or keyboard focus', () => {
+    act(() => {
+      root.render(<AppVersionSection />)
+    })
+
+    const links = Array.from(container.querySelectorAll('a.group'))
+    const icons = Array.from(container.querySelectorAll('[data-slot="about-resource-icon"]'))
+    const titles = Array.from(container.querySelectorAll('[data-slot="about-resource-title"]'))
+    const descriptions = Array.from(
+      container.querySelectorAll('[data-slot="about-resource-description"]')
+    )
+
+    expect(links).toHaveLength(6)
+    expect(links.every((link) => link.classList.contains('group'))).toBe(true)
+    expect(icons).toHaveLength(6)
+    expect(
+      icons.every(
+        (icon) =>
+          icon.classList.contains('group-hover:text-primary') &&
+          icon.classList.contains('group-focus-visible:text-primary')
+      )
+    ).toBe(true)
+    expect(titles).toHaveLength(6)
+    expect(titles.every((title) => !title.className.includes('translate-y'))).toBe(true)
+    expect(titles.every((title) => title.classList.contains('whitespace-normal'))).toBe(true)
+    expect(descriptions).toHaveLength(6)
+    expect(descriptions.every((description) => !description.className.includes('opacity-'))).toBe(
+      true
+    )
+  })
+
+  it('switches the About logo with an explicit app Theme', () => {
+    act(() => {
+      root.render(<AppVersionSection />)
+    })
+
+    expect(container.querySelector('img')?.getAttribute('src')).toBe('logo.png')
+
+    act(() => useThemeStore.getState().setPreference('dark'))
+
+    expect(container.querySelector('img')?.getAttribute('src')).toBe('logo-dark.png')
+  })
+
+  it('switches the About logo when System follows an OS appearance change', () => {
+    let systemListener: ((event: { matches: boolean }) => void) | undefined
+    vi.stubGlobal(
+      'matchMedia',
+      vi.fn(() => ({
+        matches: false,
+        media: '(prefers-color-scheme: dark)',
+        addEventListener: (_event: string, listener: (event: { matches: boolean }) => void) => {
+          systemListener = listener
+        },
+        removeEventListener: vi.fn()
+      }))
+    )
+
+    act(() => {
+      useThemeStore.getState().setPreference('system')
+      root.render(<AppVersionSection />)
+    })
+    expect(container.querySelector('img')?.getAttribute('src')).toBe('logo.png')
+
+    act(() => systemListener?.({ matches: true }))
+
+    expect(useThemeStore.getState().preference).toBe('system')
+    expect(container.querySelector('img')?.getAttribute('src')).toBe('logo-dark.png')
+  })
+
+  it('keeps the full update error available and routes retry to the existing owner', () => {
+    const check = vi.fn(async () => {})
+    useUpdateStore.setState({
+      status: { state: 'error', current: '0.2.0', error: 'net::ERR_NAME_NOT_RESOLVED' },
+      check
+    })
+    act(() => root.render(<AppVersionSection />))
+    expect(container.querySelector('[role="alert"]')?.textContent).toBe(
+      'net::ERR_NAME_NOT_RESOLVED'
+    )
+    const button = Array.from(container.querySelectorAll('button')).find((element) =>
+      /check now/i.test(element.textContent ?? '')
+    )!
+    act(() => button.click())
+    expect(check).toHaveBeenCalledOnce()
+  })
+
+  it('shows an update action when a new version is available', () => {
+    useUpdateStore.setState({
+      status: { state: 'available', current: '0.2.0', latest: '0.3.0', notes: 'n' }
+    })
+
+    act(() => {
+      root.render(<AppVersionSection />)
+    })
+
+    const button = Array.from(container.querySelectorAll('button')).find((element) =>
+      /update to 0\.3\.0/i.test(element.textContent ?? '')
+    )
+
+    expect(button).toBeDefined()
+  })
+
+  it.each([
+    ['restart', 'Restart to update'],
+    ['installer', 'Update downloaded — open the installer to finish']
+  ] as const)('shows the ready instruction for the %s apply strategy', (applyKind, message) => {
+    useUpdateStore.setState({
+      status: { state: 'ready', current: '0.2.0', latest: '0.3.0', applyKind }
+    })
+
+    act(() => {
+      root.render(<AppVersionSection />)
+    })
+
+    expect(container.textContent).toContain(message)
+  })
+
+  it.each([
+    ['downloading', true],
+    ['ready', false]
+  ] as const)('sets check availability while the update is %s', (state, disabled) => {
+    useUpdateStore.setState({
+      status: { state, current: '0.2.0', latest: '0.3.0' }
+    })
+
+    act(() => {
+      root.render(<AppVersionSection />)
+    })
+
+    const checkButton = Array.from(container.querySelectorAll('button')).find((element) =>
+      /check now/i.test(element.textContent ?? '')
+    )
+    expect(checkButton?.disabled).toBe(disabled)
+  })
+})
+
+it('shows a rejected update action while preserving the ready installer action', () => {
+  useUpdateStore.setState({
+    status: { state: 'ready', current: '0.2.0', latest: '0.3.0', error: 'IPC unavailable' }
+  })
+  act(() => root.render(<AppVersionSection />))
+  expect(container.querySelector('[role="alert"]')?.textContent).toContain('IPC unavailable')
+  expect(useUpdateStore.getState().status.state).toBe('ready')
+})
+
+it.each(['idle', 'checking', 'up-to-date', 'error'] as const)(
+  'keeps official download and manual update guidance available while %s',
+  (state) => {
+    const check = vi.fn(async () => {})
+    const download = vi.fn(async () => {})
+    const apply = vi.fn(async () => {})
+    useUpdateStore.setState({ check, download, apply, status: { state, current: '0.2.0' } })
+    act(() => root.render(<AppVersionSection />))
+    const websiteLink = container.querySelector<HTMLAnchorElement>(
+      '[data-settings-anchor="general.download"]'
+    )!
+    expect(websiteLink.getAttribute('href')).toBe('https://aipoch.com/open-science/download')
+    const manualLink = container.querySelector<HTMLAnchorElement>(
+      '[data-settings-anchor="general.manual-install"]'
+    )
+    expect(manualLink?.getAttribute('href')).toBe(
+      'https://www.aipoch.com/docs/guides/installation/#manual-update'
+    )
+    expect(manualLink?.textContent).toContain('Manual install or update')
+    expect(check).not.toHaveBeenCalled()
+    expect(download).not.toHaveBeenCalled()
+    expect(apply).not.toHaveBeenCalled()
+  }
+)

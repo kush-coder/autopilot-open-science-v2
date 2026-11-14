@@ -1,0 +1,494 @@
+import { SandboxNetworkApprovalOwner } from './sandbox-network-approval-owner'
+import { recordResourceEvent } from '../resource-diagnostics/recorder'
+import { createLogger } from '@aipoch/diagnostics/node'
+import type { SessionPermissionProfileState } from '../../shared/permission-profiles'
+import { SESSION_PLAN_SYSTEM_PROMPT_APPEND } from '../session-plan/guidance'
+import { SESSION_PLAN_FILE_SYSTEM_PROMPT_APPEND } from '../session-plan/plan-context-guidance'
+import { AcpAppContinuationOwner } from './app-continuation-owner'
+import { AcpClientInteractionOwner } from './client-interaction-owner'
+import { AcpContextUsagePolicy } from './context-usage-policy'
+import { AcpDurableContinuationContextOwner } from './durable-continuation-context-owner'
+import { AcpElicitationOwner } from './elicitation-owner'
+import { AcpPermissionContext } from './permission-context'
+import type { PiPermissionContext, PiPermissionState } from './pi-permission-correlation'
+import { AcpPermissionWaitOwner } from './permission-wait-owner'
+import { ReviewerSessionOwner } from './reviewer-session-owner'
+import type { AcpRuntimeBaseOwners } from './runtime-base-composition'
+import type { AcpRuntimeOptions } from './runtime-contract'
+import { AcpRuntimePublicationOwner } from './runtime-publication-owner'
+import type { RuntimeSnapshotProjection } from './runtime-snapshot-owner'
+import { AcpSessionEnvironmentPolicy } from './session-environment-policy'
+import { AcpSessionRegistry } from './session-registry'
+import {
+  AcpSessionUpdateProjector,
+  type AcpToolFailureDiagnostic
+} from './session-update-projector'
+
+const log = createLogger('acp')
+
+/* eslint-disable @typescript-eslint/explicit-function-return-type */
+const composeAcpRuntimeSessionOwners = (options: AcpRuntimeOptions, base: AcpRuntimeBaseOwners) => {
+  const callbacks = options.callbacks ?? {}
+  let toolFailureObserver: ((failure: AcpToolFailureDiagnostic) => void) | undefined
+  const bindToolFailureObserver = (observer: (failure: AcpToolFailureDiagnostic) => void): void => {
+    if (toolFailureObserver) throw new Error('ACP tool failure observer is already bound.')
+    toolFailureObserver = observer
+  }
+  const activeSessionIds = (): string[] =>
+    sessionRegistry.entries(true).map(({ appSessionId }) => appSessionId)
+  const promptInFlightSessionIds = (): string[] => {
+    const interactions = base.sessionInteractions.snapshot()
+    return Array.from(
+      new Set([
+        ...interactions.filter(({ kind }) => kind === 'prompt').map(({ sessionId }) => sessionId),
+        ...interactions
+          .filter(({ kind }) => kind === 'compaction')
+          .map(({ sessionId }) => sessionId),
+        ...appContinuations.sessionIds()
+      ])
+    )
+  }
+  const agentPromptInFlightSessionIds = (): string[] =>
+    Array.from(
+      new Set([
+        ...base.sessionInteractions
+          .snapshot()
+          .filter(({ kind }) => kind === 'prompt')
+          .map(({ sessionId }) => sessionId),
+        ...appContinuations.sessionIds()
+      ])
+    )
+  const snapshotProjection = (): RuntimeSnapshotProjection => {
+    const sessionIds = activeSessionIds()
+    const promptInFlightIds = promptInFlightSessionIds()
+    const permissionProfiles: Record<string, SessionPermissionProfileState> = {}
+    for (const { appSessionId: sessionId, aggregate } of sessionRegistry.entries()) {
+      const profile = aggregate.snapshot().permissionProfile
+      if (profile) permissionProfiles[sessionId] = profile as SessionPermissionProfileState
+    }
+
+    return {
+      sessionId: sessionRegistry.currentSessionId,
+      sessionIds,
+      pendingElicitations: elicitationOwner.getPendingRequests(),
+      pendingPermissions: permissionContext.getPendingRequests(),
+      permissionProfiles,
+      permissionGrants: Object.fromEntries(
+        sessionIds.map((sessionId) => [sessionId, permissionContext.listGrants(sessionId)])
+      ),
+      contextUsageBySession: base.contextUsageTracker.usageSnapshot(),
+      nativeContextCompactionSessionIds:
+        base.backendGeneration.current.framework.contextCompaction.kind === 'native-command'
+          ? sessionIds
+          : [],
+      promptInFlight: promptInFlightIds.length > 0,
+      agentPromptInFlightSessionIds: agentPromptInFlightSessionIds(),
+      promptInFlightSessionIds: promptInFlightIds
+    }
+  }
+  const publication = new AcpRuntimePublicationOwner({
+    snapshotOwner: base.snapshotOwner,
+    interactions: base.sessionInteractions,
+    snapshotProjection,
+    callbacks
+  })
+  const appContinuations = new AcpAppContinuationOwner({
+    activityChanged: base.notifyGenerationActivityChanged
+  })
+  base.generationActivity.bindAdditionalActivity(() => appContinuations.hasPending())
+  const elicitationOwner = new AcpElicitationOwner({
+    onProjection: (request, projection) => {
+      publication.pushEvent({
+        kind: 'tool',
+        level: 'info',
+        sessionId: request.sessionId,
+        toolCallId: request.toolCallId,
+        promptMessageId: request.durable?.promptMessageId,
+        title: request.message,
+        status: 'in_progress',
+        elicitation: projection
+      })
+      publication.emitState()
+    }
+  })
+  const sessionRegistry: AcpSessionRegistry = new AcpSessionRegistry({
+    onAttachmentChanged: ({ appSessionId, attachment, aggregate, generation }) => {
+      recordResourceEvent(attachment ? 'session-attached' : 'session-detached', {
+        runtimeId: base.resourceRuntimeId,
+        // Teardown may already have superseded the connection. The retained attachment generation
+        // joins detach to its original attach without attributing it to the replacement epoch.
+        epoch: attachment ? base.connectionResources.epoch : undefined,
+        sessionId: appSessionId,
+        providerSessionId: attachment?.providerSessionId,
+        generation,
+        projectId: aggregate.snapshot().projectId
+      })
+      const profile = aggregate.snapshot().permissionProfile
+      if (attachment && profile) {
+        permissionContext.setLivePermissionProfile(
+          appSessionId,
+          { ...profile, availableModeIds: [...profile.availableModeIds] },
+          () => sessionRegistry.lookup(appSessionId)?.attachment === attachment
+        )
+      } else permissionContext.clearLivePermissionProfile(appSessionId)
+    },
+    addStartupBlocker: (token) => base.generationActivity.acquireStartup(token),
+    foreignIdentityCollision: (sessionIds): Error | undefined => {
+      const pendingReviewerCollision: string | undefined = sessionIds.find((sessionId) =>
+        reviewerSessions.hasPendingSessionId(sessionId)
+      )
+      if (pendingReviewerCollision) {
+        return new Error(
+          `Primary session id collision with pending reviewer: ${pendingReviewerCollision}`
+        )
+      }
+      const activeReviewerCollision = sessionIds.find((sessionId) =>
+        reviewerSessions.hasActiveSessionId(sessionId)
+      )
+      return activeReviewerCollision
+        ? new Error(`Primary session id collision with reviewer: ${activeReviewerCollision}`)
+        : undefined
+    },
+    removeStartupBlocker: (token) => base.generationActivity.releaseStartup(token)
+  })
+  const sessionEnvironment = new AcpSessionEnvironmentPolicy({
+    backendGeneration: base.backendGeneration,
+    capabilities: base.sessionCapabilities,
+    presentation: base.sessionPresentationPolicy,
+    registry: sessionRegistry,
+    defaultProjectId: options.artifacts?.projectId,
+    ...(options.sessionCapabilityPolicy
+      ? { capabilityPolicy: options.sessionCapabilityPolicy }
+      : {}),
+    ...(base.planService
+      ? {
+          planSystemPromptAppend: [
+            SESSION_PLAN_SYSTEM_PROMPT_APPEND,
+            ...(options.notebook && options.artifacts?.dataRoot
+              ? [SESSION_PLAN_FILE_SYSTEM_PROMPT_APPEND]
+              : [])
+          ].join('\n\n')
+        }
+      : {})
+  })
+  const contextUsagePolicy = new AcpContextUsagePolicy({
+    backend: () => base.backendGeneration.current,
+    appliedModel: (sessionId) =>
+      sessionRegistry.lookup(sessionId)?.aggregate.snapshot().appliedModel,
+    systemPromptAppends: () => sessionEnvironment.systemPromptAppends(),
+    tooling: () => sessionEnvironment.toolingAvailability()
+  })
+  const durableContinuationContext = new AcpDurableContinuationContextOwner(
+    options.permissionWait?.sessions,
+    options.permissionWait?.onContinuationSessionUpdated
+  )
+  const sandboxNetworkApprovalOwner =
+    options.permissionWait?.networkApprovalOwner ??
+    new SandboxNetworkApprovalOwner(
+      options.permissionWait?.sessions,
+      options.permissionWait?.onSessionUpdated,
+      options.permissionWait?.allowNetworkDomain,
+      options.permissionWait?.allowNetworkDestination
+    )
+  const permissionWaitOwner = new AcpPermissionWaitOwner(
+    options.permissionWait?.sessions,
+    options.permissionWait?.onSessionUpdated,
+    options.runtimeSessions
+      ? (candidate) =>
+          options.runtimeSessions!.preparePermissionTranscript(
+            candidate.request,
+            candidate.promptMessageId!
+          )
+      : undefined
+  )
+  // This experimental path is reachable only for a registered Pi session. Every identity and
+  // capability comes from Main's live owners; an ACP message cannot supply this context.
+  const piPermissionContextFor = (
+    appSessionId: string,
+    expectedProviderSessionId?: string
+  ): PiPermissionContext | undefined => {
+    const attachment = sessionRegistry.lookup(appSessionId)?.attachment
+    if (
+      !attachment ||
+      (expectedProviderSessionId && attachment.providerSessionId !== expectedProviderSessionId)
+    ) {
+      return undefined
+    }
+    const providerSessionId = attachment.providerSessionId
+    const generation = attachment.generation
+    const readCurrent = (): PiPermissionState | undefined => {
+      const entry = sessionRegistry.lookup(appSessionId)
+      const currentAttachment = entry?.attachment
+      const scope = base.sessionInteractions.current(appSessionId)
+      const capability = base.sessionCapabilities.piPermissionCapabilitiesFor(appSessionId)
+      // Side chat turns are not Main messages and carry no prompt message id; their interaction
+      // sequence identifies the turn instead.
+      const promptMessageId =
+        scope?.kind !== 'prompt'
+          ? undefined
+          : (scope.promptMessageId ??
+            (capability?.role === 'side-chat' ? `side-chat-turn-${scope.sequence}` : undefined))
+      if (
+        !entry ||
+        !currentAttachment ||
+        currentAttachment.providerSessionId !== providerSessionId ||
+        currentAttachment.generation !== generation ||
+        String(entry.aggregate.snapshot().frameworkId) !== 'pi' ||
+        scope?.kind !== 'prompt' ||
+        !promptMessageId ||
+        !capability
+      )
+        return undefined
+      return {
+        appSessionId,
+        providerSessionId,
+        promptMessageId,
+        interactionSequence: scope.sequence,
+        capabilityRevision: capability.revision,
+        mcpServerNames: capability.mcpServerNames,
+        allowedToolIdentities: capability.allowedToolIdentities,
+        cancelled: base.sessionInteractions.isCancellationAccepted(scope)
+      }
+    }
+    const current = readCurrent()
+    return current ? { ...current, readCurrent } : undefined
+  }
+  const permissionContext = new AcpPermissionContext({
+    emitPermissionRequest: (request) => publication.publishPermissionRequest(request),
+    routing: {
+      resolveAppSessionId: (sessionId) => sessionRegistry.resolveAppSessionId(sessionId),
+      sessionSnapshot: (sessionId) => {
+        const snapshot = sessionRegistry.lookup(sessionId)?.aggregate.snapshot()
+        return snapshot
+          ? {
+              modelRoute: base.backendGeneration.current.modelRoute,
+              ...(snapshot.cwd === undefined ? {} : { cwd: snapshot.cwd }),
+              ...(snapshot.frameworkId === undefined ? {} : { frameworkId: snapshot.frameworkId }),
+              ...(snapshot.permissionProfile === undefined
+                ? {}
+                : {
+                    permissionProfile: {
+                      ...snapshot.permissionProfile,
+                      availableModeIds: [...snapshot.permissionProfile.availableModeIds]
+                    }
+                  })
+            }
+          : undefined
+      },
+      hasActivePrimarySession: (sessionId) =>
+        sessionRegistry.lookup(sessionId)?.attachment !== undefined,
+      capturePrompt: (sessionId) => {
+        const scope = base.sessionInteractions.current(sessionId)
+        return scope?.kind === 'prompt'
+          ? {
+              sequence: scope.sequence,
+              permissionPrompts: scope.permissionPrompts,
+              promptMessageId: scope.promptMessageId,
+              isCancellationAccepted: () => base.sessionInteractions.isCancellationAccepted(scope)
+            }
+          : undefined
+      },
+      permissionPromptsForSession: (sessionId) =>
+        base.sessionInteractions.permissionPromptsForSession(sessionId),
+      currentInteractionSequence: (sessionId) =>
+        base.sessionInteractions.current(sessionId)?.sequence,
+      mcpServerNamesFor: (sessionId) => base.sessionCapabilities.mcpServerNamesFor(sessionId),
+      piPermissionContextFor,
+      authorizeRuntimeBindingAdmission: options.notebook?.authorizeRuntimeBindingAdmission,
+      canOwnRuntimeBindingDecision: options.notebook?.canOwnRuntimeBindingDecision,
+      shellRuntimeBindingFor: (sessionId) =>
+        base.sessionCapabilities.shellRuntimeBindingFor(sessionId),
+      piReviewerPermissionContextFor: (sessionId) =>
+        reviewerSessions.piPermissionContextFor(sessionId),
+      reviewerContextFor: (sessionId) => reviewerSessions.contextFor(sessionId),
+      resolveReviewerPermission: (request) => reviewerSessions.resolvePermission(request),
+      currentFramework: () => base.backendGeneration.current.framework,
+      resolveProjectId: (sessionId) => sessionEnvironment.projectId(sessionId)
+    },
+    conversationGrants: options.permissionGrantStore,
+    permissionGrantRegistry: options.permissionGrantRegistry,
+    permissionGrantContext: options.permissionGrantContext,
+    permissionWaitHooks: {
+      persist: (candidate) => permissionWaitOwner.persist(candidate),
+      settleLive: (candidate) => permissionWaitOwner.clearLive(candidate)
+    },
+    setTimer: base.setTimer,
+    clearTimer: base.clearTimer,
+    onPermissionSettled: (requestId, state) => {
+      try {
+        callbacks.onPermissionSettled?.(requestId, state)
+      } finally {
+        // RPC cancellation settles through the broker without a renderer response command.
+        // Incremental tool events do not publish the updated pending-permission list.
+        publication.emitState()
+      }
+    },
+    onToolPermissionSettled: (request, state, context) => {
+      const frameworkId = sessionRegistry
+        .lookup(request.sessionId)
+        ?.aggregate.snapshot().frameworkId
+      const codeRiskReview =
+        request.appOwned === true &&
+        request.rawInput !== null &&
+        typeof request.rawInput === 'object' &&
+        'notebookCodeRisk' in request.rawInput
+      // The host is the only publisher for these approvals; providers cannot emit their receipt.
+      if (state === 'resolved' && frameworkId !== 'codebuddy' && !codeRiskReview) return
+      const interaction = base.sessionInteractions.current(request.sessionId)
+      const unattended = interaction?.kind === 'prompt' && interaction.permissionPrompts === 'none'
+      publication.pushEvent({
+        kind: 'tool',
+        level: 'info',
+        sessionId: request.sessionId,
+        toolCallId: request.toolCallId,
+        promptMessageId: context?.promptMessageId,
+        title: request.title,
+        providerToolName: request.providerToolName ?? request.mcpIdentity,
+        appOwned: request.appOwned,
+        rawInput: request.rawInput,
+        ...(state === 'rejected' && unattended
+          ? {
+              text: 'Permission denied: no human approver is available for this execution. Do not retry this request.'
+            }
+          : {}),
+        status:
+          state === 'rejected'
+            ? 'completed'
+            : state === 'resolved'
+              ? codeRiskReview
+                ? 'completed'
+                : (request.status ?? 'in_progress')
+              : 'in_progress',
+        ...(state === 'resolved'
+          ? {}
+          : {
+              toolDisposition:
+                state === 'rejected' ? ('declined' as const) : ('permission-closed' as const)
+            })
+      })
+    },
+    onNotebookExecutionAuthorized: (authorization) => {
+      const executionInvocationId = options.notebook?.authorizeExecution?.({
+        sessionId: authorization.sessionId,
+        toolCallId: authorization.toolCallId,
+        promptMessageId: authorization.promptMessageId,
+        method: authorization.method,
+        rawInput: authorization.executionInput
+      })
+      if (!executionInvocationId) return
+      publication.pushEvent({
+        kind: 'tool',
+        level: 'info',
+        sessionId: authorization.sessionId,
+        toolCallId: permissionContext.presentationToolCallId(
+          authorization.sessionId,
+          authorization.toolCallId
+        ),
+        promptMessageId: authorization.promptMessageId,
+        title: authorization.title,
+        providerToolName: authorization.providerToolName,
+        rawInput: authorization.rawInput,
+        status: 'in_progress',
+        executionInvocationId
+      })
+    },
+    onOpenCodeWaitTimeout: ({ sessionId, toolCallId, waitMs }) => {
+      log.warn('OpenCode permission context wait timed out', { sessionId, toolCallId, waitMs })
+    }
+  })
+  const reviewerSessions: ReviewerSessionOwner = new ReviewerSessionOwner({
+    addStartupBlocker: (token) => base.generationActivity.acquireStartup(token),
+    assertCurrentConnection: (connection) => {
+      if (
+        base.connectionResources.connection !== connection ||
+        base.snapshotOwner.status !== 'connected'
+      ) {
+        throw new Error('ACP session startup was superseded.')
+      }
+    },
+    clearPermissionCorrelations: (sessionId) =>
+      permissionContext.clearCorrelationsForSession(sessionId),
+    currentSessionSetup: () => ({
+      framework: base.backendGeneration.current.framework,
+      sessionOptions: base.backendGeneration.current.session.options
+    }),
+    currentStartupGeneration: () => sessionRegistry.startupGeneration,
+    isPrimarySessionIdClaimed: (sessionId) => sessionRegistry.isIdentityClaimed(sessionId),
+    onActiveSessionReleased: base.notifyGenerationActivityChanged,
+    registerBridgeSession: (sessionId) =>
+      base.connectionResources.registerBridgeReviewerSession(sessionId),
+    removeStartupBlocker: (token) => base.generationActivity.releaseStartup(token),
+    unregisterBridgeSession: (sessionId) =>
+      base.connectionResources.unregisterBridgeReviewerSession(sessionId)
+  })
+  const clientInteractions = new AcpClientInteractionOwner({
+    routing: {
+      resolveAppSessionId: (sessionId) => sessionRegistry.resolveAppSessionId(sessionId),
+      isActiveSession: (sessionId) => sessionRegistry.lookup(sessionId)?.attachment !== undefined,
+      frameworkForSession: (sessionId) =>
+        sessionRegistry.lookup(sessionId)?.aggregate.snapshot().frameworkId,
+      reviewerFrameworkForSession: (sessionId) =>
+        reviewerSessions.contextFor(sessionId)?.frameworkId,
+      permissionPromptsForSession: (sessionId) => {
+        const interaction = base.sessionInteractions.current(sessionId)
+        return interaction?.kind === 'prompt' ? interaction.permissionPrompts : undefined
+      },
+      promptMessageIdForSession: (sessionId) => {
+        const interaction = base.sessionInteractions.current(sessionId)
+        return interaction?.kind === 'prompt' ? interaction.promptMessageId : undefined
+      }
+    },
+    elicitation: elicitationOwner,
+    permission: permissionContext
+  })
+  const sessionUpdateProjector = new AcpSessionUpdateProjector({
+    separateProviderNotices: options.separateProviderNotices,
+    registry: sessionRegistry,
+    contextUsage: base.contextUsageTracker,
+    contextPolicy: contextUsagePolicy,
+    hasActiveSession: (sessionId) => sessionRegistry.lookup(sessionId)?.attachment !== undefined,
+    currentFramework: () => base.backendGeneration.current.framework.id,
+    reconnectPending: () => base.connectionTransitions.providerReconnectPending,
+    mcpServerNamesFor: (sessionId) => base.sessionCapabilities.mcpServerNamesFor(sessionId),
+    presentationToolCallId: (notification, context, providerToolCallId) =>
+      permissionContext.presentationToolCallIdForUpdate(notification, context) ??
+      providerToolCallId,
+    nextEventId: () => publication.nextEventId(),
+    setProviderPermissionProfile: (sessionId, profile) =>
+      permissionContext.setProviderPermissionProfile(sessionId, profile),
+    emitState: () => publication.emitState(),
+    pushEvent: (event) => publication.pushEvent(event),
+    reportToolFailure: (effect) => {
+      log.warn('tool call failed', {
+        tool: effect.tool,
+        toolCallId: effect.toolCallId,
+        sessionId: effect.sessionId,
+        reason: effect.reason
+      })
+      toolFailureObserver?.(effect)
+    }
+  })
+
+  return Object.freeze({
+    sessionRegistry,
+    sessionEnvironment,
+    contextUsagePolicy,
+    publication,
+    appContinuations,
+    elicitationOwner,
+    durableContinuationContext,
+    permissionWaitOwner,
+    sandboxNetworkApprovalOwner,
+    permissionContext,
+    clientInteractions,
+    reviewerSessions,
+    sessionUpdateProjector,
+    bindToolFailureObserver
+  })
+}
+/* eslint-enable @typescript-eslint/explicit-function-return-type */
+
+type AcpRuntimeSessionOwners = ReturnType<typeof composeAcpRuntimeSessionOwners>
+
+export { composeAcpRuntimeSessionOwners }
+export type { AcpRuntimeSessionOwners }

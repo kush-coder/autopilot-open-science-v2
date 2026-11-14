@@ -1,0 +1,756 @@
+import { createDatabaseAtReleasedManifest } from '../test/fixtures/application-database'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+
+import { describe, expect, it } from 'vitest'
+
+import {
+  MIGRATION_MANIFEST,
+  migrateApplicationDatabase
+} from '../src/main/database/migration-service'
+import {
+  assertApplicationMigrationLedger,
+  parsePackagedSqliteVersion,
+  readDesktopSqliteVersion,
+  seedLegacyDatabase,
+  verifyLegacyProjectPreserved,
+  writeDatabaseMigrationCertification
+} from './database-migration-ledger-smoke.mjs'
+import { PrismaClient } from '@prisma/client'
+
+// Match the production SQLite connection limit: migration PRAGMAs are connection-local.
+
+const rebuildComputeJobWithoutAnalysisConstraints = async (
+  client: PrismaClient,
+  dropAnalysisColumns: boolean
+): Promise<void> => {
+  await client.$executeRawUnsafe('ALTER TABLE "ComputeHost" DROP COLUMN "executionMode"')
+  await client.$executeRawUnsafe('ALTER TABLE "ComputeJob" DROP COLUMN "fileEvidence"')
+  await client.$executeRawUnsafe('ALTER TABLE "ComputeJob" DROP COLUMN "producerRunId"')
+  const [{ sql }] = await client.$queryRawUnsafe<Array<{ sql: string }>>(
+    `SELECT "sql" FROM "sqlite_schema" WHERE "type" = 'table' AND "name" = 'ComputeJob'`
+  )
+  const removedLines = [
+    '"remoteCleanupDisposition" TEXT',
+    'CONSTRAINT "ComputeJob_remoteCleanupDisposition_check"',
+    'CONSTRAINT "ComputeJob_analysisState_check"',
+    'CONSTRAINT "ComputeJob_analysisBundle_check"',
+    'CONSTRAINT "ComputeJob_analysisConsumption_check"',
+    ...(dropAnalysisColumns
+      ? ['"analysisState" TEXT', '"analysisMessageId" TEXT', '"analysisUpdatedAt" DATETIME']
+      : [])
+  ]
+  const legacyDdl = sql
+    .replace(/,\s*"executionMode" TEXT NOT NULL DEFAULT 'direct_ssh'/u, '')
+    .split('\n')
+    .filter((line) => removedLines.every((removed) => !line.includes(removed)))
+    .join('\n')
+    .replace(/CREATE TABLE (?:IF NOT EXISTS )?"ComputeJob"/u, 'CREATE TABLE "__legacy_ComputeJob"')
+  const columns = await client.$queryRawUnsafe<Array<{ name: string }>>(
+    `PRAGMA table_info('ComputeJob')`
+  )
+  const copiedColumns = columns
+    .map(({ name }) => name)
+    .filter(
+      (name) =>
+        name !== 'executionMode' &&
+        name !== 'remoteCleanupDisposition' &&
+        (!dropAnalysisColumns ||
+          !['analysisState', 'analysisMessageId', 'analysisUpdatedAt'].includes(name))
+    )
+    .map((name) => `"${name}"`)
+    .join(', ')
+
+  await client.$executeRawUnsafe(legacyDdl)
+  await client.$executeRawUnsafe(
+    `INSERT INTO "__legacy_ComputeJob" (${copiedColumns}) SELECT ${copiedColumns} FROM "ComputeJob"`
+  )
+  await client.$executeRawUnsafe('DROP TABLE "ComputeJob"')
+  await client.$executeRawUnsafe('ALTER TABLE "__legacy_ComputeJob" RENAME TO "ComputeJob"')
+  await client.$executeRawUnsafe(
+    'CREATE INDEX "ComputeJob_providerId_idx" ON "ComputeJob"("providerId")'
+  )
+  await client.$executeRawUnsafe(
+    'CREATE INDEX "ComputeJob_sessionId_idx" ON "ComputeJob"("sessionId")'
+  )
+  await client.$executeRawUnsafe('CREATE INDEX "ComputeJob_status_idx" ON "ComputeJob"("status")')
+}
+
+const removeArchiveAndLiteratureSchema = async (client: PrismaClient): Promise<void> => {
+  for (const table of ['SessionSelectionSnapshot', 'SessionReplayState']) {
+    await client.$executeRawUnsafe(`DROP TABLE IF EXISTS "${table}"`)
+  }
+  await client.$executeRawUnsafe('DROP TABLE "bookmarks"')
+  await client.$executeRawUnsafe('ALTER TABLE "PermissionGrant" DROP COLUMN "approvalSummary"')
+  await client.$executeRawUnsafe('ALTER TABLE "Project" DROP COLUMN "archiveRevision"')
+  for (const table of [
+    'PdfTranslationUsage',
+    'PdfTranslationBlock',
+    'PdfTranslation',
+    'ClassificationUsage',
+    'LiteratureSmartRunItem',
+    'LiteratureSmartRun',
+    'LiteratureSmartOverride',
+    'LiteratureSmartAssessment',
+    'LiteratureSmartRuleRevision',
+    'LiteratureSmartCollection',
+    'LiteratureMetadataCommitReceipt',
+    'ArtifactLiteratureManifest',
+    'ProjectLiterature',
+    'LiteratureCollectionItem',
+    'LiteratureCollection',
+    'LiteratureSourceRecord',
+    'LiteratureInboxPdf',
+    'LiteratureCandidateDiscovery',
+    'LiteratureInboxCandidate',
+    'LiteratureIdentifier',
+    'LiteratureItemCreator',
+    'LiteratureCreator',
+    'LiteratureAttachmentVersion',
+    'LiteratureAttachment',
+    'LiteratureItem'
+  ]) {
+    await client.$executeRawUnsafe(`DROP TABLE IF EXISTS "${table}"`)
+  }
+  await client.$executeRawUnsafe('DROP INDEX "UploadVersion_contentBlobId_idx"')
+  await client.$executeRawUnsafe('DROP INDEX "ArtifactVersion_contentBlobId_idx"')
+  await client.$executeRawUnsafe('ALTER TABLE "UploadVersion" DROP COLUMN "contentBlobId"')
+  await client.$executeRawUnsafe('ALTER TABLE "ArtifactVersion" DROP COLUMN "contentBlobId"')
+  await client.$executeRawUnsafe('DROP TABLE "ContentBlob"')
+}
+
+describe('packaged database migration ledger smoke', () => {
+  it('pins every packaged application migration identity and checksum', () => {
+    expect(MIGRATION_MANIFEST.slice(22).map(({ id, checksum }) => ({ id, checksum }))).toEqual([
+      {
+        id: '0023_compute_job_operation',
+        checksum: 'c625e336996c7dd1eba64da8ccd306104ccd68cf219e60ee2c3889749f86b079'
+      },
+      {
+        id: '0024_compute_job_file_evidence',
+        checksum: '438500a5ce6a1069ecc353c8fa60549dacf6d2eef6a0f572571b7261ea3a88bb'
+      },
+      {
+        id: '0025_managed_file_version_foundation',
+        checksum: 'e6f5810debdccba77634ed6a1baeab72d6bb1ff34b56ae5766e01ff4489f33c1'
+      },
+      {
+        id: '0026_compute_job_remote_cleanup',
+        checksum: 'c9c0dff928daa4eafe5b8910c4202ddba83f740e92cb243a4fa0dc8e323cba7b'
+      },
+      {
+        id: '0027_project_session_defaults',
+        checksum: 'af7f3740a6032de71789e25567ee6605f961ee0dea3b89df2b47f9a589e738c7'
+      },
+      {
+        id: '0028_database_numeric_and_null_constraints',
+        checksum: '7ee2e3ec746080d5e1bedcddaea5ded1b080d8bcbc8ec59ed4139ff8c5e5de4a'
+      },
+      {
+        id: '0029_compute_host_execution_mode',
+        checksum: 'cb99c71c85d5632a42a06a9de0659f67874a9e347af5ca0aa41925d27146c49d'
+      },
+      {
+        id: '0030_literature_foundation',
+        checksum: '0f432ea09aec2d7edbd9834a4f2c38dd6bc4870cd4ff01d4ea4899b3e66dc5e2'
+      },
+      {
+        id: '0031_project_archive_revision',
+        checksum: '77d0476e02c6993e54772e2a17908b62a6998c540c56d826a691fe358ac1093a'
+      },
+      {
+        id: '0032_permission_approval_summary',
+        checksum: '84b4035c8bd97ac41a7d08e630b6af9205cff6012e1ae02e5e9dbaaf25979c66'
+      },
+      {
+        id: '0033_compute_job_harvest_retry',
+        checksum: 'd248c3aeb6db69b95e1fc5706ebc01146b841bd3e5c5c2c5900312d3ba9e40e6'
+      },
+      {
+        id: '0034_background_result_delivery',
+        checksum: '953cae3e1f08b2a8eb6df5a28cc953d9826d1233f724c7ca18c6275eb4afc89e'
+      },
+      {
+        id: '0035_literature_pdf_provenance',
+        checksum: '845bac28883bb211cd202633ddab969a8bc2c892b1cc57ab7b8a45c3aaf2c036'
+      },
+      {
+        id: '0036_content_verification_observation',
+        checksum: '79b45da6421bbbc2962de6106189c50ff19bef219a7310800a669ec1ebad64a4'
+      },
+      {
+        id: '0037_literature_inbox_integrity',
+        checksum: 'b491ca823e4c79564cef7cefeeb555d1534c7e5bb676bdd228158fc4c7d4ddca'
+      },
+      {
+        id: '0038_literature_search_text',
+        checksum: '00ae0d9f8f84e7334563a423f0aa9eef90ff33f7e24af91d30e6eb10aad4f1b1'
+      },
+      {
+        id: '0039_literature_metadata_commit_receipt',
+        checksum: '2d78a9270e8d861a9c8613106143888ea8a029878d5e553098c3729a42d95ffb'
+      },
+      {
+        id: '0040_literature_collection_revision',
+        checksum: 'ba19650afd09b7a52d317ad51361b0e68b4e105c6a55cdc88d0e9c04760e3bfa'
+      },
+      {
+        id: '0041_bookmarks',
+        checksum: '354ae9a44e2888b569c7d72af95f8f0f896ec2b9d0dc01c02c078e8904d2a755'
+      },
+      {
+        id: '0042_classification_usage',
+        checksum: '6a8af623d08c6763e58672354f4333114ec11cd0434eb7c39ad83b9ff7301460'
+      },
+      {
+        id: '0043_pdf_annotations',
+        checksum: 'e2a130e8e9c705e84b3137c824665cae2387a7cbdb0a116b3bd0ef379a4a787c'
+      },
+      {
+        id: '0044_literature_smart_collections',
+        checksum: '70145960069e95e1c7894bf18e5bbbd7d96bb51cf192d61c9f85688e0af2fdf3'
+      },
+      {
+        id: '0045_literature_smart_pause_run',
+        checksum: '04e286e7cfb90cf3cdb1045bb5f8191b7b4edee0fc272c4b042910314485de68'
+      },
+      {
+        id: '0046_journal_attributes',
+        checksum: '6faaa28accbf9297ba56586f0fa647adfca287a92d2bed7b08218323142d0992'
+      },
+      {
+        id: '0047_session_replay',
+        checksum: 'f76aff6bd97c42cabd744f87f0c37241259ffb1c45c5feef2a3643babcef2f91'
+      },
+      {
+        id: '0048_pdf_annotation_sharing',
+        checksum: '4d346933fd6779e0e7b15e1c51bb97043690230b40d29fb2d7c9dacc19f25e52'
+      },
+      {
+        id: '0049_pascalcase_table_names',
+        checksum: 'ed46c378adfcd3e7f0f0d434797a4e775121fa6fce021a4c89b19f2c383b91ad'
+      },
+      {
+        id: '0050_literature_translation',
+        checksum: 'ae3a17741c698765b69e4d651dffea6b46e3e06d5e7e6dce92aefa96a1d6337f'
+      },
+      {
+        id: '0051_literature_reading_status',
+        checksum: 'a32ab5f82ae8a11fe74860f5020f8f5e2b8747d19c3935773cfbf8c8f933fe0a'
+      },
+      {
+        id: '0052_literature_personal_note_search',
+        checksum: '0866849a77e3e3ddc3f084a89de6e57a8197519a365a3a2b4ae08cdf405e65b6'
+      },
+      {
+        id: '0053_literature_doi_identity',
+        checksum: '37c0bf2052799a6bdc2417d137a473b7d89f02a7826bf2dc253c3b6a376d7095'
+      },
+      {
+        id: '0054_slurm_job_reliability',
+        checksum: '1525c308d5403411490596cf7ad4e03a2fc9ae7ee43adf6d3622d0b17d97319b'
+      },
+      {
+        id: '0055_session_discussion_parent',
+        checksum: '8fc258c3f41f8ce14ad74a58cde8aa53c93bf312a251f6345174b5d06bb65cf1'
+      },
+      {
+        id: '0056_compute_kubernetes_workspace',
+        checksum: '658ff2adbd570b019249e119f3e5579e27c385ab247321311a383ff3739f5e7d'
+      },
+      {
+        id: '0057_project_optimization_prompt',
+        checksum: '226fb954f1b09aeab18527a4562a9a0f5551145edf5259e57513f73c8dbb150e'
+      }
+    ])
+    expect(() => assertApplicationMigrationLedger(MIGRATION_MANIFEST)).not.toThrow()
+    expect(() => assertApplicationMigrationLedger(MIGRATION_MANIFEST.slice(0, -1))).toThrow(
+      /expected application database migration ledger/
+    )
+  })
+
+  it('adds automatic-analysis state without reclassifying historical Compute Jobs', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'open-science-ledger-job-analysis-'))
+    const databasePath = join(root, 'open-science.db').replaceAll('\\', '/')
+    const client = new PrismaClient({
+      datasources: { db: { url: `file:${databasePath}?connection_limit=1` } }
+    })
+
+    try {
+      await createDatabaseAtReleasedManifest(client)
+      for (const [id, consumed] of [
+        ['legacy-pending', false],
+        ['legacy-consumed', true]
+      ] as const) {
+        // This fixture predates newer nullable fields; return only a historical column.
+        await client.computeJob.create({
+          data: {
+            id,
+            providerId: 'ssh:legacy',
+            shape: 'direct_ssh',
+            sessionId: 'legacy-session',
+            projectId: 'legacy-project',
+            status: 'success',
+            intent: id,
+            command: 'true',
+            commandHash: id,
+            notifiedAt: new Date('2026-01-01'),
+            ...(consumed ? { notificationConsumedAt: new Date('2026-01-02') } : {})
+          },
+          select: { id: true }
+        })
+      }
+      await rebuildComputeJobWithoutAnalysisConstraints(client, true)
+      await removeArchiveAndLiteratureSchema(client)
+      await client.$executeRawUnsafe(
+        `DELETE FROM "_open_science_migrations" WHERE "id" IN ('0020_compute_job_analysis_state', '0021_compute_job_analysis_constraints', '0022_memory_global_content_unique', '0023_compute_job_operation', '0024_compute_job_file_evidence', '0025_managed_file_version_foundation', '0026_compute_job_remote_cleanup', '0027_project_session_defaults', '0028_database_numeric_and_null_constraints', '0029_compute_host_execution_mode', '0030_literature_foundation', '0031_project_archive_revision', '0032_permission_approval_summary', '0033_compute_job_harvest_retry', '0034_background_result_delivery', '0035_literature_pdf_provenance', '0036_content_verification_observation', '0037_literature_inbox_integrity', '0038_literature_search_text', '0039_literature_metadata_commit_receipt', '0040_literature_collection_revision', '0041_bookmarks', '0042_classification_usage', '0043_pdf_annotations', '0044_literature_smart_collections', '0045_literature_smart_pause_run', '0046_journal_attributes', '0047_session_replay', '0048_pdf_annotation_sharing', '0050_literature_translation', '0053_literature_doi_identity')`
+      )
+
+      await migrateApplicationDatabase(client)
+
+      await expect(
+        client.computeJob.findUnique({ where: { id: 'legacy-pending' } })
+      ).resolves.toMatchObject({
+        analysisState: null,
+        analysisMessageId: null,
+        analysisUpdatedAt: null,
+        notificationConsumedAt: null
+      })
+      await expect(
+        client.computeJob.findUnique({ where: { id: 'legacy-consumed' } })
+      ).resolves.toMatchObject({
+        analysisState: null,
+        analysisMessageId: null,
+        analysisUpdatedAt: null,
+        notificationConsumedAt: expect.any(Date)
+      })
+    } finally {
+      await client.$disconnect()
+      await rm(root, { force: true, recursive: true })
+    }
+  })
+
+  it('blocks analysis constraints when a historical Compute Job has an invalid state', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'open-science-ledger-job-analysis-invalid-'))
+    const databasePath = join(root, 'open-science.db').replaceAll('\\', '/')
+    const client = new PrismaClient({
+      datasources: { db: { url: `file:${databasePath}?connection_limit=1` } }
+    })
+
+    try {
+      await createDatabaseAtReleasedManifest(client)
+      await rebuildComputeJobWithoutAnalysisConstraints(client, false)
+      await client.$executeRawUnsafe(
+        `DELETE FROM "_open_science_migrations" WHERE "id" IN ('0021_compute_job_analysis_constraints', '0022_memory_global_content_unique', '0023_compute_job_operation', '0024_compute_job_file_evidence', '0025_managed_file_version_foundation', '0026_compute_job_remote_cleanup', '0027_project_session_defaults', '0028_database_numeric_and_null_constraints', '0029_compute_host_execution_mode', '0030_literature_foundation', '0031_project_archive_revision', '0032_permission_approval_summary', '0033_compute_job_harvest_retry', '0034_background_result_delivery', '0035_literature_pdf_provenance', '0036_content_verification_observation', '0037_literature_inbox_integrity', '0038_literature_search_text', '0039_literature_metadata_commit_receipt', '0040_literature_collection_revision', '0041_bookmarks', '0042_classification_usage', '0043_pdf_annotations', '0044_literature_smart_collections', '0045_literature_smart_pause_run', '0046_journal_attributes', '0047_session_replay', '0048_pdf_annotation_sharing', '0050_literature_translation', '0053_literature_doi_identity')`
+      )
+      await client.$executeRawUnsafe(`INSERT INTO "ComputeJob" (
+        "id", "providerId", "shape", "sessionId", "projectId", "status", "intent",
+        "command", "commandHash", "analysisState", "analysisMessageId", "analysisUpdatedAt"
+      ) VALUES (
+        'invalid-analysis-state', 'ssh:legacy', 'direct_ssh', 'legacy-session', 'legacy-project',
+        'success', 'invalid analysis state', 'true', 'invalid-analysis-state', 'unknown',
+        'message-1', '2026-01-01T00:00:00.000Z'
+      )`)
+
+      await expect(migrateApplicationDatabase(client)).rejects.toMatchObject({
+        migrationId: '0021_compute_job_analysis_constraints'
+      })
+      await expect(
+        client.$queryRawUnsafe<Array<{ analysisState: string }>>(
+          `SELECT "analysisState" FROM "ComputeJob" WHERE "id" = 'invalid-analysis-state'`
+        )
+      ).resolves.toEqual([{ analysisState: 'unknown' }])
+    } finally {
+      await client.$disconnect()
+      await rm(root, { force: true, recursive: true })
+    }
+  })
+
+  it('blocks the global Memory index without deleting duplicate historical entries', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'open-science-ledger-memory-duplicate-'))
+    const databasePath = join(root, 'open-science.db').replaceAll('\\', '/')
+    const client = new PrismaClient({
+      datasources: { db: { url: `file:${databasePath}?connection_limit=1` } }
+    })
+
+    try {
+      await createDatabaseAtReleasedManifest(client)
+      await client.$executeRawUnsafe('DROP INDEX "MemoryEntry_global_contentKey_key"')
+      await client.$executeRawUnsafe(
+        `DELETE FROM "_open_science_migrations" WHERE "id" IN ('0022_memory_global_content_unique', '0023_compute_job_operation', '0024_compute_job_file_evidence', '0025_managed_file_version_foundation', '0026_compute_job_remote_cleanup', '0027_project_session_defaults', '0028_database_numeric_and_null_constraints', '0029_compute_host_execution_mode', '0030_literature_foundation', '0031_project_archive_revision', '0032_permission_approval_summary', '0033_compute_job_harvest_retry', '0034_background_result_delivery', '0035_literature_pdf_provenance', '0036_content_verification_observation', '0037_literature_inbox_integrity', '0038_literature_search_text', '0039_literature_metadata_commit_receipt', '0040_literature_collection_revision', '0041_bookmarks', '0042_classification_usage', '0043_pdf_annotations', '0044_literature_smart_collections', '0045_literature_smart_pause_run', '0046_journal_attributes', '0047_session_replay', '0048_pdf_annotation_sharing', '0050_literature_translation', '0053_literature_doi_identity')`
+      )
+      await client.memoryEntry.createMany({
+        data: [
+          {
+            id: 'duplicate-global-1',
+            categoryId: 'memory-category-about-you',
+            content: 'same global fact',
+            contentKey: 'same global fact',
+            origin: 'user'
+          },
+          {
+            id: 'duplicate-global-2',
+            categoryId: 'memory-category-about-you',
+            content: 'Same global fact',
+            contentKey: 'same global fact',
+            origin: 'user'
+          }
+        ]
+      })
+
+      await expect(migrateApplicationDatabase(client)).rejects.toMatchObject({
+        migrationId: '0022_memory_global_content_unique'
+      })
+      await expect(
+        client.memoryEntry.count({ where: { contentKey: 'same global fact', projectId: null } })
+      ).resolves.toBe(2)
+    } finally {
+      await client.$disconnect()
+      await rm(root, { force: true, recursive: true })
+    }
+  })
+
+  it('adds usage attribution columns without changing existing usage rows', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'open-science-ledger-usage-attribution-'))
+    const databasePath = join(root, 'open-science.db').replaceAll('\\', '/')
+    const client = new PrismaClient({
+      datasources: { db: { url: `file:${databasePath}?connection_limit=1` } }
+    })
+
+    try {
+      await createDatabaseAtReleasedManifest(
+        client,
+        MIGRATION_MANIFEST.filter(({ id }) => id < '0019_session_usage_attribution')
+      )
+      // Seed the historical columns directly: the generated client describes today's schema.
+      await client.$executeRawUnsafe(
+        `INSERT INTO "Project" ("id", "name", "updatedAt")
+         VALUES ('legacy-project', 'Legacy project', CURRENT_TIMESTAMP)`
+      )
+      await client.$executeRawUnsafe(
+        `INSERT INTO "Session" ("id", "number", "projectId", "title", "status", "presentedStatus", "createdAtMs", "updatedAtMs")
+         VALUES ('legacy-session', 1, 'legacy-project', 'Legacy session', 'idle', 'idle', 1, 2)`
+      )
+      await client.$executeRawUnsafe(
+        `INSERT INTO "SessionTurnUsage" ("sessionId", "messageId", "completedAtMs", "inputTokens", "cacheTokens", "outputTokens", "isRootFrame")
+         VALUES ('legacy-session', 'legacy-message', 2, 10, 3, 4, true)`
+      )
+      await client.$executeRawUnsafe(
+        `INSERT INTO "SessionModelCallUsage" ("sessionId", "messageId", "callId", "callIndex", "inputTokens", "cacheTokens", "outputTokens")
+         VALUES ('legacy-session', 'legacy-message', 'legacy-call', 0, 10, 3, 4)`
+      )
+      await client.$executeRawUnsafe(
+        `INSERT INTO "SessionAuxiliaryTurnUsage" ("sessionId", "eventId", "source", "frameworkId", "completedAtMs", "inputTokens", "cacheTokens", "outputTokens")
+         VALUES ('legacy-session', 'legacy-event', 'side-chat', 'claude-agent-sdk', 3, 5, 1, 2)`
+      )
+
+      await migrateApplicationDatabase(client)
+
+      await expect(
+        client.sessionTurnUsage.findUnique({
+          where: {
+            sessionId_messageId: { sessionId: 'legacy-session', messageId: 'legacy-message' }
+          }
+        })
+      ).resolves.toMatchObject({
+        frameworkId: null,
+        providerId: null,
+        model: null,
+        inputTokens: 10n,
+        outputTokens: 4n
+      })
+      await expect(
+        client.sessionModelCallUsage.findUnique({
+          where: { sessionId_callId: { sessionId: 'legacy-session', callId: 'legacy-call' } }
+        })
+      ).resolves.toMatchObject({ providerId: null, inputTokens: 10n, outputTokens: 4n })
+      await expect(
+        client.sessionAuxiliaryTurnUsage.findUnique({
+          where: { sessionId_eventId: { sessionId: 'legacy-session', eventId: 'legacy-event' } }
+        })
+      ).resolves.toMatchObject({
+        providerId: null,
+        frameworkId: 'claude-agent-sdk',
+        inputTokens: 5n,
+        outputTokens: 2n
+      })
+    } finally {
+      await client.$disconnect()
+      await rm(root, { force: true, recursive: true })
+    }
+  })
+
+  it('adds Review query indexes without changing existing Review or Finding rows', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'open-science-ledger-review-indexes-'))
+    const databasePath = join(root, 'open-science.db').replaceAll('\\', '/')
+    const client = new PrismaClient({
+      datasources: { db: { url: `file:${databasePath}?connection_limit=1` } }
+    })
+
+    try {
+      await createDatabaseAtReleasedManifest(
+        client,
+        MIGRATION_MANIFEST.filter(({ id }) => id < '0014_review_query_indexes')
+      )
+      const review = await client.review.create({
+        data: {
+          id: 'legacy-review',
+          projectId: 'legacy-project',
+          sessionId: 'legacy-session',
+          turnMessageId: 'legacy-turn'
+        }
+      })
+      const finding = await client.finding.create({
+        data: { id: 'legacy-finding', reviewId: review.id }
+      })
+      await migrateApplicationDatabase(client)
+
+      await expect(client.review.findUnique({ where: { id: review.id } })).resolves.toBeTruthy()
+      await expect(client.finding.findUnique({ where: { id: finding.id } })).resolves.toBeTruthy()
+      const indexes = await client.$queryRawUnsafe<Array<{ name: string }>>(
+        `SELECT "name" FROM "sqlite_schema"
+         WHERE "type" = 'index'
+           AND "name" IN ('Review_projectId_sessionId_createdAt_idx', 'Review_sessionId_idx', 'Finding_reviewId_idx')
+         ORDER BY "name"`
+      )
+      expect(indexes.map(({ name }) => name)).toEqual([
+        'Finding_reviewId_idx',
+        'Review_projectId_sessionId_createdAt_idx',
+        'Review_sessionId_idx'
+      ])
+    } finally {
+      await client.$disconnect()
+      await rm(root, { force: true, recursive: true })
+    }
+  })
+
+  it('accepts only an explicitly selected immutable released migration prefix', () => {
+    const releasedLedger = MIGRATION_MANIFEST.slice(0, -1)
+    expect(() =>
+      assertApplicationMigrationLedger(releasedLedger, releasedLedger.length)
+    ).not.toThrow()
+    expect(() => assertApplicationMigrationLedger(releasedLedger)).toThrow(
+      /expected application database migration ledger/
+    )
+    expect(() =>
+      assertApplicationMigrationLedger(
+        releasedLedger.map((entry, index) =>
+          index === releasedLedger.length - 1 ? { ...entry, checksum: '0'.repeat(64) } : entry
+        ),
+        releasedLedger.length
+      )
+    ).toThrow(/expected application database migration ledger/)
+    expect(() =>
+      assertApplicationMigrationLedger(MIGRATION_MANIFEST, releasedLedger.length)
+    ).toThrow(/expected application database migration ledger/)
+  })
+
+  it('applies the compute authentication persistence columns and named checks to a legacy database', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'open-science-ledger-auth-persistence-'))
+    await seedLegacyDatabase(root)
+    const databasePath = join(root, 'open-science.db').replaceAll('\\', '/')
+    const client = new PrismaClient({
+      datasources: { db: { url: `file:${databasePath}?connection_limit=1` } }
+    })
+
+    try {
+      await migrateApplicationDatabase(client)
+
+      const jobColumns = await client.$queryRawUnsafe<Array<{ name: string }>>(
+        `PRAGMA table_info('ComputeJob')`
+      )
+      const credentialColumns = await client.$queryRawUnsafe<Array<{ name: string; pk: bigint }>>(
+        `PRAGMA table_info('ComputeCredential')`
+      )
+      const operationColumns = await client.$queryRawUnsafe<
+        Array<{ name: string; notnull: bigint; dflt_value: string | null }>
+      >(`PRAGMA table_info('ComputeAuthOperation')`)
+      expect(jobColumns.map(({ name }) => name)).not.toContain('lastHarvestError')
+      expect(credentialColumns.map(({ name }) => name)).not.toContain('id')
+      expect(credentialColumns.find(({ name }) => name === 'computeHostId')).toMatchObject({
+        pk: 1n
+      })
+      expect(operationColumns.map(({ name }) => name)).toEqual(
+        expect.arrayContaining(['operationKind', 'requestFingerprint'])
+      )
+      expect(operationColumns.find(({ name }) => name === 'operationKind')).toMatchObject({
+        notnull: 1n,
+        dflt_value: null
+      })
+      expect(operationColumns.find(({ name }) => name === 'requestFingerprint')).toMatchObject({
+        notnull: 1n
+      })
+
+      const tableSchemas = await client.$queryRawUnsafe<Array<{ name: string; sql: string }>>(
+        `SELECT "name", "sql" FROM "sqlite_schema"
+         WHERE "type" = 'table' AND "name" IN ('ComputeHost', 'ComputeAuthOperation')`
+      )
+      const schemaByTable = new Map(tableSchemas.map(({ name, sql }) => [name, sql]))
+      expect(schemaByTable.get('ComputeHost')).toContain(
+        'CONSTRAINT "ComputeHost_authenticationMode_check"'
+      )
+      expect(schemaByTable.get('ComputeHost')).toContain(
+        'CONSTRAINT "ComputeHost_authenticationRevision_check"'
+      )
+      expect(schemaByTable.get('ComputeAuthOperation')).toContain(
+        'CONSTRAINT "ComputeAuthOperation_resultRevision_check"'
+      )
+      expect(schemaByTable.get('ComputeAuthOperation')).toContain(
+        'CONSTRAINT "ComputeAuthOperation_operationKind_check"'
+      )
+      expect(schemaByTable.get('ComputeAuthOperation')).not.toContain("'legacy'")
+    } finally {
+      await client.$disconnect()
+      await rm(root, { force: true, recursive: true })
+    }
+  })
+
+  it.each([0, 1.5, Number.NaN, MIGRATION_MANIFEST.length + 1])(
+    'rejects unsupported expected migration count %s',
+    (expectedMigrationCount) => {
+      expect(() =>
+        assertApplicationMigrationLedger(MIGRATION_MANIFEST, expectedMigrationCount)
+      ).toThrow(/migration count is outside the supported application ledger/)
+    }
+  )
+
+  it('reads SQLite evidence from only the current desktop launch backend log', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'open-science-desktop-sqlite-'))
+    const logs = join(root, 'logs')
+    const current = join(logs, 'desktop-backend-42-1791680000000.log')
+    try {
+      await mkdir(logs)
+      await writeFile(
+        join(logs, 'desktop-backend-41-1791670000000.log'),
+        '[main] database runtime verified: sqlite_version=3.40.0'
+      )
+      await expect(readDesktopSqliteVersion(root, 42)).rejects.toThrow(/backend log/)
+      await writeFile(current, 'Open-Science Web: ready\n')
+      await expect(readDesktopSqliteVersion(root, 42)).rejects.toThrow(/SQLite runtime version/)
+      await writeFile(
+        current,
+        JSON.stringify({ scope: 'main', msg: 'database runtime verified: sqlite_version=3.46.0' }) +
+          '\n'
+      )
+      await expect(readDesktopSqliteVersion(root, 42)).resolves.toBe('3.46.0')
+      await writeFile(join(logs, 'desktop-backend-42-1791680000001.log'), '')
+      await expect(readDesktopSqliteVersion(root, 42)).rejects.toThrow(/backend log/)
+    } finally {
+      await rm(root, { force: true, recursive: true })
+    }
+  })
+
+  it('reads structured SQLite evidence alongside raw stderr and CRLF text', () => {
+    const record = JSON.stringify({
+      scope: 'main',
+      msg: 'database runtime verified: sqlite_version=3.46.0'
+    })
+    expect(parsePackagedSqliteVersion(`Node warning\n{broken json\n${record}\n`)).toBe('3.46.0')
+    expect(
+      parsePackagedSqliteVersion('[main] database runtime verified: sqlite_version=3.46.0 \r\n')
+    ).toBe('3.46.0')
+  })
+
+  it.each([
+    JSON.stringify({ scope: 'other', msg: 'database runtime verified: sqlite_version=3.46.0' }),
+    JSON.stringify({
+      scope: 'other',
+      msg: '[main] database runtime verified: sqlite_version=3.46.0'
+    }),
+    JSON.stringify({ scope: 'main', msg: { sqliteVersion: '3.46.0' } }),
+    JSON.stringify({
+      scope: 'main',
+      msg: 'database runtime verified: sqlite_version=3.46.0-invalid'
+    }),
+    'null',
+    '{broken json',
+    '[other] database runtime verified: sqlite_version=3.46.0'
+  ])('rejects unrelated or invalid SQLite evidence: %s', (output) => {
+    expect(() => parsePackagedSqliteVersion(output)).toThrow(/SQLite runtime version/)
+  })
+
+  it('records the packaged SQLite compatibility floor and certified matrix', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'open-science-ledger-smoke-evidence-'))
+    const output = join(root, 'database-migration-certification.json')
+    try {
+      expect(
+        parsePackagedSqliteVersion(
+          '[main] database runtime verified: sqlite_version=3.46.0\nOpen-Science Web: ready'
+        )
+      ).toBe('3.46.0')
+
+      await writeDatabaseMigrationCertification({
+        output,
+        sqliteVersions: ['3.46.0', '3.46.0'],
+        checks: {
+          freshInstall: 'passed',
+          legacyAdoption: 'passed',
+          reopen: 'passed',
+          specialPath: 'passed'
+        }
+      })
+
+      await expect(JSON.parse(await readFile(output, 'utf8'))).toMatchObject({
+        schemaVersion: 1,
+        compatibilityFloor: {
+          migrationId: '0001_runtime_schema_baseline',
+          sqliteVersion: '3.46.0'
+        },
+        checks: { reopen: 'passed', specialPath: 'passed' }
+      })
+    } finally {
+      await rm(root, { force: true, recursive: true })
+    }
+  })
+
+  it('seeds a supported pre-ledger fixture without a migration ledger', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'open-science-ledger-smoke-fixture-'))
+    try {
+      await seedLegacyDatabase(root)
+      const databasePath = join(root, 'open-science.db').replaceAll('\\', '/')
+      const client = new PrismaClient({
+        datasources: { db: { url: `file:${databasePath}?connection_limit=1` } }
+      })
+      try {
+        await expect(client.$queryRawUnsafe('SELECT "id" FROM "Project"')).resolves.toHaveLength(1)
+        await expect(
+          client.$queryRawUnsafe(
+            `SELECT "name" FROM "sqlite_schema" WHERE "name" = '_open_science_migrations'`
+          )
+        ).resolves.toHaveLength(0)
+      } finally {
+        await client.$disconnect()
+      }
+    } finally {
+      await rm(root, { force: true, recursive: true })
+    }
+  })
+
+  it('rejects a legacy fixture without the migrated Agent Context default', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'open-science-ledger-smoke-agent-context-'))
+    try {
+      await seedLegacyDatabase(root)
+      const databasePath = join(root, 'open-science.db').replaceAll('\\', '/')
+      const client = new PrismaClient({
+        datasources: { db: { url: `file:${databasePath}?connection_limit=1` } }
+      })
+      try {
+        await client.$executeRawUnsafe(
+          `ALTER TABLE "Project" ADD COLUMN "agentContext" TEXT NOT NULL DEFAULT ''`
+        )
+        await client.$executeRawUnsafe(
+          `UPDATE "Project" SET "agentContext" = 'unexpected' WHERE "id" = 'package-smoke-legacy-project'`
+        )
+      } finally {
+        await client.$disconnect()
+      }
+
+      await expect(verifyLegacyProjectPreserved(root)).rejects.toThrow(
+        /preserve the legacy database fixture/
+      )
+    } finally {
+      await rm(root, { force: true, recursive: true })
+    }
+  })
+})

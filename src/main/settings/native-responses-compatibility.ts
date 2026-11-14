@@ -1,0 +1,1199 @@
+import {
+  prepareNativeResponsesRequest,
+  NativeResponsesRequestError,
+  type NativeResponsesProjection
+} from '@aipoch/providers/protocol'
+import { randomUUID } from 'node:crypto'
+import type { ServerResponse } from 'node:http'
+import {
+  observeProviderFailure,
+  type ProviderFailureObserver
+} from './provider-failure-observation'
+
+import { createLogger, diagnosticErrorFields } from '@aipoch/diagnostics/node'
+import type { SkillSelectorUsageObservation } from '../agent-framework'
+import {
+  normalizeChatCompletionsUsage,
+  type ResponsesNamespacedTool
+} from '@aipoch/providers/protocol'
+import {
+  consumeBoundedResponseBody,
+  DEFAULT_MAX_PROVIDER_RESPONSE_BYTES,
+  DEFAULT_MAX_PROVIDER_SSE_EVENT_BYTES,
+  DEFAULT_MAX_PROVIDER_SSE_LINE_BYTES,
+  readBoundedResponseBytes,
+  readBoundedResponseText,
+  ResponseBodyLimitError,
+  fetchProviderRequest
+} from '@aipoch/providers/transport'
+
+import {
+  DeterministicProviderErrorReplay,
+  isDeterministicProviderErrorStatus,
+  providerErrorClientStatus,
+  providerRequestFingerprint,
+  providerRequestHeadersFingerprint,
+  readBoundedProviderErrorBody
+} from './provider-error-replay'
+
+import {
+  writeProviderLoopbackJson as json,
+  ProviderLoopbackHttpHost,
+  ProviderLoopbackRequestError,
+  type ProviderLoopbackHttpRequest
+} from './provider-loopback-http-host'
+
+import type {
+  ResponsesConnection,
+  ResponsesModelTarget,
+  ResponsesSkillCandidate,
+  ResponsesSkillInput
+} from './responses-transport-contract'
+import {
+  boundedSkillSelectorCatalog,
+  renderSkillSelectorCatalog,
+  resolveSelectedSkills,
+  selectExplicitConnectorSkills
+} from './skill-selector-routing'
+
+// Responses payloads are intentionally open-ended across providers. Keep the compatibility boundary
+// permissive, then validate the fields this module rewrites before touching them.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type JsonObject = Record<string, any>
+
+type NativeResponsesCompatibilityTarget = {
+  onProviderFailure?: ProviderFailureObserver
+  baseUrl: string
+  key?: string
+  resolveKey?: (forceRefresh?: boolean) => Promise<string>
+  sanitizeRequest?: (body: JsonObject) => JsonObject
+  vendorId?: string
+  model?: string
+  reviewerScope?: {
+    namespacedTools: ResponsesNamespacedTool[]
+  }
+}
+
+type NativeResponsesCompatibilityOptions = {
+  maxResponseBytes?: number
+  maxSseEventBytes?: number
+  maxSseLineBytes?: number
+  responseHeaderTimeoutMs?: number
+  skillSelectorTimeoutMs?: number
+  streamIdleTimeoutMs?: number
+}
+
+type NativeFetch = typeof fetch
+
+type NativeResponsesStreamSummary = Readonly<{
+  terminalEventType: string
+  terminalStatus?: string
+  terminalOutputItemCount: number
+  terminalMessageCount: number
+  observedFunctionCallCount: number
+  observedArtifactFunctionCallCount: number
+}>
+
+const log = createLogger('native-responses-compatibility')
+const DEFAULT_RESPONSE_HEADER_TIMEOUT_MS = 2 * 60_000
+const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 5 * 60_000
+const MAX_REPLAY_ERROR_BODY_BYTES = 256 * 1024
+const responseLimit = (value: number | undefined, fallback: number): number =>
+  Math.max(1, Math.floor(value ?? fallback))
+const SAFE_NETWORK_ERROR_CODES = new Set([
+  'EAI_AGAIN',
+  'ECONNREFUSED',
+  'ECONNRESET',
+  'EHOSTUNREACH',
+  'ENETUNREACH',
+  'ESOCKETTIMEDOUT',
+  'ETIMEDOUT'
+])
+
+type ProviderErrorSnapshot = Readonly<{
+  body: Buffer
+  headers: Record<string, string>
+  status: number
+  upstreamStatus: number
+}>
+
+class NativeResponsesTimeoutError extends Error {
+  readonly code = 'ETIMEDOUT'
+
+  constructor(message: string) {
+    super(message)
+    this.name = 'TimeoutError'
+  }
+}
+
+const safeRead = (value: object, key: string): unknown => {
+  try {
+    return (value as Record<string, unknown>)[key]
+  } catch {
+    return undefined
+  }
+}
+
+const safeNetworkErrorCode = (error: unknown): string | undefined => {
+  if (typeof error !== 'object' || error === null) return undefined
+  const directCode = safeRead(error, 'code')
+  if (typeof directCode === 'string' && SAFE_NETWORK_ERROR_CODES.has(directCode)) return directCode
+  const cause = safeRead(error, 'cause')
+  if (typeof cause !== 'object' || cause === null) return undefined
+  const causeCode = safeRead(cause, 'code')
+  return typeof causeCode === 'string' && SAFE_NETWORK_ERROR_CODES.has(causeCode)
+    ? causeCode
+    : undefined
+}
+
+const upstreamResponseType = (contentType: string): 'event-stream' | 'json' | 'binary' => {
+  if (contentType.includes('text/event-stream')) return 'event-stream'
+  if (contentType.includes('application/json')) return 'json'
+  return 'binary'
+}
+
+const isObject = (value: unknown): value is JsonObject =>
+  typeof value === 'object' && value !== null && !Array.isArray(value)
+
+const containsText = (value: unknown, marker: string): boolean => {
+  if (typeof value === 'string') return value.includes(marker)
+  if (Array.isArray(value)) return value.some((item) => containsText(item, marker))
+  return isObject(value) && Object.values(value).some((item) => containsText(item, marker))
+}
+
+const ARTIFACT_INSTRUCTIONS_START = '<open_science_artifact_instructions>'
+const ARTIFACT_INSTRUCTIONS_END = '</open_science_artifact_instructions>'
+
+const promoteArtifactDeveloperInstructions = (body: JsonObject): JsonObject => {
+  if (
+    containsText(body.instructions, ARTIFACT_INSTRUCTIONS_START) ||
+    (body.instructions != null && typeof body.instructions !== 'string') ||
+    !Array.isArray(body.input)
+  ) {
+    return body
+  }
+
+  const index = body.input.findIndex(
+    (item) =>
+      isObject(item) &&
+      item.type === 'message' &&
+      item.role === 'developer' &&
+      typeof item.content === 'string' &&
+      item.content.includes(ARTIFACT_INSTRUCTIONS_START)
+  )
+  if (index < 0) return body
+
+  const item = body.input[index] as JsonObject
+  const content = item.content as string
+  const start = content.indexOf(ARTIFACT_INSTRUCTIONS_START)
+  const end = content.indexOf(ARTIFACT_INSTRUCTIONS_END, start)
+  if (end < 0) return body
+
+  const blockEnd = end + ARTIFACT_INSTRUCTIONS_END.length
+  const artifactInstructions = content.slice(start, blockEnd)
+  const remaining = `${content.slice(0, start)}${content.slice(blockEnd)}`.trim()
+  const input = body.input.flatMap((value, itemIndex) =>
+    itemIndex !== index ? [value] : remaining ? [{ ...item, content: remaining }] : []
+  )
+
+  return {
+    ...body,
+    instructions: [body.instructions, artifactInstructions]
+      .filter((value): value is string => typeof value === 'string' && value.length > 0)
+      .join('\n\n'),
+    input
+  }
+}
+
+const isArtifactTool = (value: unknown, aliases: NativeResponsesProjection): boolean => {
+  if (!isObject(value) || typeof value.name !== 'string') return false
+  const identity =
+    typeof value.namespace === 'string'
+      ? { namespace: value.namespace, name: value.name }
+      : aliases.resolveTool(value.name)
+  return (
+    identity?.namespace === 'mcp__open_science_artifacts' && identity.name === 'write_artifact_file'
+  )
+}
+
+const responsesUrl = (baseUrl: string): string =>
+  `${baseUrl
+    .trim()
+    .replace(/\/+$/, '')
+    .replace(/\/responses$/i, '')}/responses`
+
+const HOP_BY_HOP_HEADERS = new Set([
+  'connection',
+  'content-length',
+  'host',
+  'keep-alive',
+  'proxy-authenticate',
+  'proxy-authorization',
+  'te',
+  'trailer',
+  'transfer-encoding',
+  'upgrade'
+])
+
+const upstreamHeaders = (
+  request: ProviderLoopbackHttpRequest,
+  key: string | undefined
+): Record<string, string> => {
+  const headers: Record<string, string> = {}
+  for (const [name, value] of Object.entries(request.headers)) {
+    // Node fetch adds Fetch Metadata headers to the loopback request. Chromium owns these headers and
+    // rejects callers that pass them explicitly to Electron net.fetch with ERR_INVALID_ARGUMENT.
+    if (
+      HOP_BY_HOP_HEADERS.has(name) ||
+      // Fetch decodes upstream responses, so it must negotiate its own supported encodings.
+      name === 'accept-encoding' ||
+      name === 'authorization' ||
+      name.startsWith('sec-fetch-') ||
+      value === undefined
+    ) {
+      continue
+    }
+    headers[name] = Array.isArray(value) ? value.join(', ') : value
+  }
+  headers['content-type'] = 'application/json'
+  if (key) headers.authorization = `Bearer ${key}`
+  return headers
+}
+
+const copyResponseHeaders = (upstream: Response): Record<string, string> => {
+  const headers: Record<string, string> = {}
+  upstream.headers.forEach((value, name) => {
+    // Fetch decodes compressed bodies. Forwarding the original encoding after rewriting would make
+    // Codex try to decompress already-decoded bytes.
+    if (!HOP_BY_HOP_HEADERS.has(name) && name !== 'content-encoding') headers[name] = value
+  })
+  return headers
+}
+
+const streamSummaryObserver = (
+  aliases: NativeResponsesProjection
+): Readonly<{
+  observe: (value: unknown) => void
+  summary: () => NativeResponsesStreamSummary | undefined
+}> => {
+  const functionCallKeys = new Set<string>()
+  const artifactFunctionCallKeys = new Set<string>()
+  let terminal:
+    | Readonly<{
+        type: string
+        status?: string
+        output: unknown[]
+      }>
+    | undefined
+
+  const observeFunctionCall = (item: unknown, outputIndex?: unknown): void => {
+    if (!isObject(item) || (item.type !== 'function_call' && item.type !== 'custom_tool_call')) {
+      return
+    }
+    const key =
+      typeof item.call_id === 'string'
+        ? `call:${item.call_id}`
+        : typeof item.id === 'string'
+          ? `id:${item.id}`
+          : typeof outputIndex === 'number'
+            ? `index:${outputIndex}`
+            : `anonymous:${functionCallKeys.size}`
+    functionCallKeys.add(key)
+    if (isArtifactTool(item, aliases)) artifactFunctionCallKeys.add(key)
+  }
+
+  const observe = (value: unknown): void => {
+    if (!isObject(value)) return
+    if (
+      (value.type === 'response.output_item.added' || value.type === 'response.output_item.done') &&
+      isObject(value.item)
+    ) {
+      observeFunctionCall(value.item, value.output_index)
+    }
+    if (
+      (value.type !== 'response.completed' &&
+        value.type !== 'response.failed' &&
+        value.type !== 'response.incomplete') ||
+      !isObject(value.response)
+    ) {
+      return
+    }
+    const output = Array.isArray(value.response.output) ? value.response.output : []
+    output.forEach((item, index) => observeFunctionCall(item, index))
+    terminal = {
+      type: value.type,
+      ...(typeof value.response.status === 'string' ? { status: value.response.status } : {}),
+      output
+    }
+  }
+
+  return {
+    observe,
+    summary: () => {
+      if (!terminal) return undefined
+      return {
+        terminalEventType: terminal.type,
+        ...(terminal.status ? { terminalStatus: terminal.status } : {}),
+        terminalOutputItemCount: terminal.output.length,
+        terminalMessageCount: terminal.output.filter(
+          (item) => isObject(item) && item.type === 'message'
+        ).length,
+        observedFunctionCallCount: functionCallKeys.size,
+        observedArtifactFunctionCallCount: artifactFunctionCallKeys.size
+      }
+    }
+  }
+}
+
+// Responses streams can carry arguments but leave the completed item empty. Codex dispatches
+// that item, so recover only an unambiguous object from this response's matching argument events.
+// This state belongs to one stream, never to the proxy, Session, or persisted conversation.
+const streamedFunctionArguments = (
+  maxBytes: number
+): ((payload: unknown) => (() => void) | undefined) => {
+  type PendingCall = {
+    name: string
+    namespace: unknown
+    callId: string
+    outputIndex: number
+    delta: string
+    deltaBytes: number
+    done?: string
+    recovered?: string
+    finalized: boolean
+    invalid: boolean
+  }
+  const calls = new Map<string, PendingCall>()
+  const indexes = new Map<number, PendingCall>()
+  const callIds = new Map<string, PendingCall>()
+  let terminal = false
+
+  let repairs: Array<{ item: JsonObject; state: PendingCall; hadArguments: boolean }> = []
+  const finish = (item: unknown, outputIndex: unknown, terminalCopy = false): void => {
+    if (!isObject(item) || item.type !== 'function_call') return
+    const state = calls.get(item.id)
+    if (!state || state.invalid) return
+    if (
+      state.outputIndex !== outputIndex ||
+      state.callId !== item.call_id ||
+      state.name !== item.name ||
+      state.namespace !== item.namespace ||
+      (item.status !== undefined && item.status !== 'completed') ||
+      (state.finalized && !terminalCopy)
+    ) {
+      state.invalid = true
+      return
+    }
+    if (!state.finalized) {
+      state.finalized = true
+      const candidate = state.done ?? state.delta
+      if (item.arguments === '' || item.arguments === undefined) {
+        try {
+          if (isObject(JSON.parse(candidate))) state.recovered = candidate
+        } catch {
+          /* Incomplete arguments must still fail MCP validation. */
+        }
+      }
+      state.delta = ''
+      state.done = undefined
+    }
+    if (state.recovered !== undefined && (item.arguments === '' || item.arguments === undefined)) {
+      repairs.push({ item, state, hadArguments: Object.hasOwn(item, 'arguments') })
+      item.arguments = state.recovered
+    }
+  }
+
+  return (payload) => {
+    if (!isObject(payload) || terminal) return
+    repairs = []
+    const item = payload.item
+    if (
+      payload.type === 'response.output_item.added' &&
+      isObject(item) &&
+      item.type === 'function_call'
+    ) {
+      if (
+        typeof item.id !== 'string' ||
+        !item.id ||
+        typeof item.call_id !== 'string' ||
+        !item.call_id ||
+        typeof item.name !== 'string' ||
+        !Number.isSafeInteger(payload.output_index) ||
+        payload.output_index < 0
+      )
+        return
+      const previous = [
+        calls.get(item.id),
+        indexes.get(payload.output_index),
+        callIds.get(item.call_id)
+      ]
+      for (const state of previous) if (state) state.invalid = true
+      const state: PendingCall = {
+        name: item.name,
+        namespace: item.namespace,
+        callId: item.call_id,
+        outputIndex: payload.output_index,
+        delta: '',
+        deltaBytes: 0,
+        finalized: false,
+        invalid: previous.some(Boolean)
+      }
+      calls.set(item.id, state)
+      indexes.set(payload.output_index, state)
+      callIds.set(item.call_id, state)
+    } else if (
+      payload.type === 'response.function_call_arguments.delta' ||
+      payload.type === 'response.function_call_arguments.done'
+    ) {
+      const state = calls.get(payload.item_id)
+      const indexed = indexes.get(payload.output_index)
+      if (!state || state !== indexed) {
+        if (state) state.invalid = true
+        if (indexed) indexed.invalid = true
+        return
+      }
+      if (state.invalid || state.finalized) return
+      const done = payload.type === 'response.function_call_arguments.done'
+      const value = done ? payload.arguments : payload.delta
+      if (typeof value !== 'string') {
+        state.invalid = true
+        return
+      }
+      if (done) {
+        state.invalid =
+          Buffer.byteLength(value, 'utf8') > maxBytes ||
+          (state.done !== undefined && state.done !== value) ||
+          (state.delta !== '' && state.delta !== value)
+        if (!state.invalid) state.done = value
+      } else {
+        state.deltaBytes += Buffer.byteLength(value, 'utf8')
+        state.invalid = state.done !== undefined || state.deltaBytes > maxBytes
+        if (!state.invalid) state.delta += value
+      }
+    } else if (payload.type === 'response.output_item.done') {
+      finish(item, payload.output_index)
+    } else if (
+      payload.type === 'response.completed' ||
+      payload.type === 'response.failed' ||
+      payload.type === 'response.incomplete'
+    ) {
+      if (
+        payload.type === 'response.completed' &&
+        (payload.response?.status === undefined || payload.response.status === 'completed') &&
+        Array.isArray(payload.response?.output)
+      ) {
+        payload.response.output.forEach((item: unknown, index: number) => finish(item, index, true))
+      }
+      terminal = true
+      calls.clear()
+      indexes.clear()
+      callIds.clear()
+    }
+    if (repairs.length === 0) return
+    const applied = repairs
+    return () => {
+      for (const { item, state, hadArguments } of applied) {
+        if (hadArguments) item.arguments = ''
+        else delete item.arguments
+        state.recovered = undefined
+      }
+    }
+  }
+}
+
+const rewriteSseEvent = (
+  lines: readonly string[],
+  aliases: NativeResponsesProjection,
+  observe: (value: unknown) => void,
+  recoverArguments: (value: unknown) => (() => void) | undefined,
+  maxEventBytes: number,
+  maxLineBytes: number
+): string => {
+  const dataLines = lines.filter((line) => line.startsWith('data:'))
+  const data = dataLines
+    .map((line) =>
+      line
+        .replace(/\r?\n$/, '')
+        .slice(5)
+        .replace(/^ /, '')
+    )
+    .join('\n')
+  if (!data || data === '[DONE]') return lines.join('')
+  try {
+    const payload = JSON.parse(data) as unknown
+    observe(payload)
+    const undoRecovery = recoverArguments(payload)
+    const firstDataIndex = lines.findIndex((line) => line.startsWith('data:'))
+    const serialize = (): string => {
+      const restored = JSON.stringify(aliases.restore(payload))
+      return lines
+        .map((line, index) => {
+          if (!line.startsWith('data:')) return line
+          if (index !== firstDataIndex) return ''
+          return `data: ${restored}${line.match(/\r?\n$/)?.[0] ?? ''}`
+        })
+        .join('')
+    }
+    const rewritten = serialize()
+    // Recovery can expand a small completion event. Keep the existing per-event/line budgets;
+    // when expansion would exceed them, forward the original event without inventing arguments.
+    if (
+      undoRecovery &&
+      (Buffer.byteLength(rewritten, 'utf8') > maxEventBytes ||
+        rewritten.split('\n').some((line) => Buffer.byteLength(line, 'utf8') > maxLineBytes))
+    ) {
+      undoRecovery()
+      return serialize()
+    }
+    return rewritten
+  } catch {
+    return lines.join('')
+  }
+}
+
+const streamResponse = async (
+  upstream: Response,
+  response: ServerResponse,
+  aliases: NativeResponsesProjection,
+  onActivity: () => void,
+  limits: Readonly<{ responseBytes: number; eventBytes: number; lineBytes: number }>
+): Promise<NativeResponsesStreamSummary | undefined> => {
+  if (!upstream.body) throw new Error('native Responses upstream returned no body')
+  const decoder = new TextDecoder()
+  let buffered = ''
+  let bufferedBytes = 0
+  let eventBytes = 0
+  let pendingEvent: string[] = []
+  let headersWritten = false
+  let forwardedBytes = 0
+  const observer = streamSummaryObserver(aliases)
+  const recoverArguments = streamedFunctionArguments(
+    Math.min(limits.responseBytes, limits.eventBytes, limits.lineBytes)
+  )
+
+  const writeHeaders = (): void => {
+    if (headersWritten) return
+    response.writeHead(upstream.status, copyResponseHeaders(upstream))
+    headersWritten = true
+  }
+  const flushEvent = (): void => {
+    if (pendingEvent.length === 0) return
+    writeHeaders()
+    const rewritten = rewriteSseEvent(
+      pendingEvent,
+      aliases,
+      observer.observe,
+      recoverArguments,
+      limits.eventBytes,
+      limits.lineBytes
+    )
+    forwardedBytes += Buffer.byteLength(rewritten, 'utf8')
+    if (forwardedBytes > limits.responseBytes) {
+      throw new ResponseBodyLimitError(
+        'Native Responses forwarded SSE response',
+        limits.responseBytes
+      )
+    }
+    response.write(rewritten)
+    pendingEvent = []
+    eventBytes = 0
+  }
+  const consumeLine = (line: string, newline: boolean): void => {
+    const lineBytes = Buffer.byteLength(line, 'utf8')
+    if (lineBytes > limits.lineBytes) {
+      throw new ResponseBodyLimitError('Native Responses upstream SSE line', limits.lineBytes)
+    }
+    const boundary = line === '' || line === '\r'
+    if (!boundary) {
+      eventBytes += lineBytes + (newline ? 1 : 0)
+      if (eventBytes > limits.eventBytes) {
+        throw new ResponseBodyLimitError('Native Responses upstream SSE event', limits.eventBytes)
+      }
+    }
+    pendingEvent.push(line + (newline ? '\n' : ''))
+    if (boundary) flushEvent()
+  }
+
+  await consumeBoundedResponseBody(
+    upstream,
+    limits.responseBytes,
+    'Native Responses upstream SSE response',
+    (chunk) => {
+      onActivity()
+      buffered += decoder.decode(chunk, { stream: true })
+      const lines = buffered.split('\n')
+      if (lines.length === 1) {
+        bufferedBytes += chunk.byteLength
+        if (bufferedBytes > limits.lineBytes) {
+          throw new ResponseBodyLimitError('Native Responses upstream SSE line', limits.lineBytes)
+        }
+        return
+      }
+      buffered = lines.pop() ?? ''
+      bufferedBytes = Buffer.byteLength(buffered, 'utf8')
+      for (const line of lines) consumeLine(line, true)
+    }
+  )
+  buffered += decoder.decode()
+  if (buffered) consumeLine(buffered, false)
+  flushEvent()
+  writeHeaders()
+  response.end()
+  return observer.summary()
+}
+
+const namespaceToolDeclarations = (tools: ResponsesNamespacedTool[]): JsonObject[] => {
+  const byNamespace = new Map<string, JsonObject[]>()
+  for (const tool of tools) {
+    const children = byNamespace.get(tool.namespace) ?? []
+    children.push({
+      type: 'function',
+      name: tool.name,
+      ...(tool.description ? { description: tool.description } : {}),
+      parameters: tool.parameters,
+      ...(tool.strict === undefined ? {} : { strict: tool.strict })
+    })
+    byNamespace.set(tool.namespace, children)
+  }
+  return Array.from(byNamespace, ([name, children]) => ({
+    type: 'namespace',
+    name,
+    tools: children
+  }))
+}
+
+export class NativeResponsesCompatibilityProxy {
+  private readonly host: ProviderLoopbackHttpHost<ResponsesConnection>
+  private readonly reviewerSessionKeys = new Set<string>()
+  private readonly scopedReviewerSessionKeys = new Set<string>()
+  private readonly toolLessSessionKeys = new Set<string>()
+  private readonly scopedToolLessSessionKeys = new Set<string>()
+  private readonly hostMessageSessionScopes = new Map<string, ResponsesNamespacedTool[]>()
+  private readonly scopedHostMessageSessionKeys = new Set<string>()
+  private readonly strictHostMessageSessionKeys = new Set<string>()
+  private readonly deterministicErrors =
+    new DeterministicProviderErrorReplay<ProviderErrorSnapshot>()
+
+  constructor(
+    private target: NativeResponsesCompatibilityTarget,
+    private readonly fetchImpl: NativeFetch = fetch,
+    private readonly options: NativeResponsesCompatibilityOptions = {}
+  ) {
+    this.host = new ProviderLoopbackHttpHost({
+      diagnosticName: 'native-responses-compatibility',
+      credentialMode: 'bearer',
+      createConnection: (origin, token) => ({
+        baseUrl: origin + '/v1',
+        token,
+        kind: 'responses-compatibility'
+      }),
+      onUnauthorized: (response) =>
+        json(response, 401, {
+          error: { message: 'Invalid native Responses compatibility token' }
+        }),
+      onError: (error, response) => {
+        if (response.headersSent) {
+          response.destroy()
+          return
+        }
+        const requestError =
+          error instanceof ProviderLoopbackRequestError ||
+          error instanceof NativeResponsesRequestError
+        json(response, requestError ? 400 : 502, {
+          error: {
+            type: requestError ? 'invalid_request_error' : 'api_error',
+            message: 'Native Responses compatibility request failed'
+          }
+        })
+      },
+      handle: (request, response) => this.handle(request, response)
+    })
+  }
+
+  setTarget(target: NativeResponsesCompatibilityTarget): void {
+    const changed =
+      this.target.baseUrl !== target.baseUrl ||
+      this.target.model !== target.model ||
+      this.target.key !== target.key
+    this.target = target
+    if (changed) this.deterministicErrors.clear()
+  }
+
+  setModelTarget(target: ResponsesModelTarget): void {
+    this.setTarget({ ...this.target, model: target.model })
+  }
+
+  async selectSkills(
+    text: string,
+    catalog: ResponsesSkillCandidate[],
+    signal?: AbortSignal,
+    observeUsage?: (observation: SkillSelectorUsageObservation) => void
+  ): Promise<ResponsesSkillInput[]> {
+    if (!text.trim() || catalog.length === 0 || signal?.aborted) return []
+    const explicit = selectExplicitConnectorSkills(text, catalog)
+    if (explicit.length > 0) return explicit
+    const selectorCatalog = boundedSkillSelectorCatalog(catalog)
+    if (selectorCatalog.length === 0) return []
+    if (!this.target.model) return []
+
+    const timeout = new AbortController()
+    let timedOut = false
+    const abortFromCaller = (): void => timeout.abort(signal?.reason)
+    signal?.addEventListener('abort', abortFromCaller, { once: true })
+    const timer = setTimeout(() => {
+      timedOut = true
+      timeout.abort()
+    }, this.options.skillSelectorTimeoutMs ?? 15_000)
+    timer.unref?.()
+    try {
+      const resolvedKey = this.target.resolveKey ? await this.target.resolveKey() : this.target.key
+      const url = responsesUrl(this.target.baseUrl)
+      const response = await fetchProviderRequest(this.fetchImpl, url, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          ...(resolvedKey ? { authorization: `Bearer ${resolvedKey}` } : {})
+        },
+        body: JSON.stringify({
+          model: this.target.model,
+          stream: false,
+          instructions:
+            'Select only the Skills needed to execute the current user request. Do not perform the task. Call select_skills exactly once using only catalog names. Return an empty list when no Skill applies.\n\nSkill catalog:\n' +
+            renderSkillSelectorCatalog(selectorCatalog),
+          input: text,
+          tools: [
+            {
+              type: 'function',
+              name: 'select_skills',
+              description: 'Select zero to three applicable Skills from the provided catalog.',
+              parameters: {
+                type: 'object',
+                properties: {
+                  skill_names: {
+                    type: 'array',
+                    maxItems: 3,
+                    items: { type: 'string' }
+                  }
+                },
+                required: ['skill_names'],
+                additionalProperties: false
+              }
+            }
+          ],
+          tool_choice: { type: 'function', name: 'select_skills' },
+          parallel_tool_calls: false
+        }),
+        signal: timeout.signal
+      })
+      if (!response.ok) {
+        log.warn('native Responses Skill selection failed', {
+          model: this.target.model,
+          reason: 'upstream-http',
+          status: response.status
+        })
+        return []
+      }
+      const payload = JSON.parse(
+        await readBoundedResponseText(
+          response,
+          responseLimit(this.options.maxResponseBytes, DEFAULT_MAX_PROVIDER_RESPONSE_BYTES),
+          'Native Responses Skill selection response'
+        )
+      ) as JsonObject
+      const usage = normalizeChatCompletionsUsage(payload.usage)
+      if (usage) {
+        observeUsage?.({
+          usage,
+          ...(typeof payload.id === 'string' ? { sourceInvocationId: payload.id } : {})
+        })
+      }
+      const output = Array.isArray(payload.output) ? payload.output : []
+      const call = output.find(
+        (item: unknown) =>
+          isObject(item) && item.type === 'function_call' && item.name === 'select_skills'
+      )
+      if (!isObject(call) || typeof call.arguments !== 'string') return []
+      const argumentsValue = JSON.parse(call.arguments) as unknown
+      if (!isObject(argumentsValue) || !Array.isArray(argumentsValue.skill_names)) return []
+
+      const selected = resolveSelectedSkills(argumentsValue.skill_names, selectorCatalog)
+      log.info('native Responses Skill selection completed', {
+        model: this.target.model,
+        catalogCount: catalog.length,
+        selectedCount: selected.length
+      })
+      return selected
+    } catch {
+      log.warn('native Responses Skill selection failed', {
+        model: this.target.model,
+        reason: timedOut ? 'timeout' : signal?.aborted ? 'cancelled' : 'invalid-response'
+      })
+      return []
+    } finally {
+      clearTimeout(timer)
+      signal?.removeEventListener('abort', abortFromCaller)
+    }
+  }
+
+  async start(): Promise<ResponsesConnection> {
+    return this.host.start()
+  }
+
+  registerReviewerSession(promptCacheKey: string): void {
+    this.reviewerSessionKeys.add(promptCacheKey)
+    this.scopedReviewerSessionKeys.delete(promptCacheKey)
+  }
+
+  unregisterReviewerSession(promptCacheKey: string): boolean {
+    this.reviewerSessionKeys.delete(promptCacheKey)
+    return this.scopedReviewerSessionKeys.delete(promptCacheKey)
+  }
+
+  registerToolLessSession(promptCacheKey: string): void {
+    this.toolLessSessionKeys.add(promptCacheKey)
+    this.scopedToolLessSessionKeys.delete(promptCacheKey)
+  }
+
+  unregisterToolLessSession(promptCacheKey: string): boolean {
+    this.toolLessSessionKeys.delete(promptCacheKey)
+    return this.scopedToolLessSessionKeys.delete(promptCacheKey)
+  }
+
+  registerHostMessageSession(
+    promptCacheKey: string,
+    namespacedTools: ResponsesNamespacedTool[],
+    options?: Readonly<{ failClosedUnknownKeys?: boolean }>
+  ): void {
+    this.hostMessageSessionScopes.set(promptCacheKey, namespacedTools)
+    this.scopedHostMessageSessionKeys.delete(promptCacheKey)
+    if (options?.failClosedUnknownKeys) this.strictHostMessageSessionKeys.add(promptCacheKey)
+    else this.strictHostMessageSessionKeys.delete(promptCacheKey)
+  }
+
+  unregisterHostMessageSession(promptCacheKey: string): boolean {
+    this.hostMessageSessionScopes.delete(promptCacheKey)
+    this.strictHostMessageSessionKeys.delete(promptCacheKey)
+    return this.scopedHostMessageSessionKeys.delete(promptCacheKey)
+  }
+
+  async close(): Promise<void> {
+    this.deterministicErrors.clear()
+    this.reviewerSessionKeys.clear()
+    this.scopedReviewerSessionKeys.clear()
+    this.toolLessSessionKeys.clear()
+    this.scopedToolLessSessionKeys.clear()
+    this.hostMessageSessionScopes.clear()
+    this.scopedHostMessageSessionKeys.clear()
+    this.strictHostMessageSessionKeys.clear()
+    await this.host.close()
+  }
+
+  private async handle(
+    request: ProviderLoopbackHttpRequest,
+    response: ServerResponse
+  ): Promise<void> {
+    if (request.method !== 'POST' || request.path !== '/v1/responses') {
+      json(response, 404, { error: { message: 'Unknown native Responses compatibility route' } })
+      return
+    }
+
+    const target = this.target
+    const requestId = randomUUID()
+    const startedAt = Date.now()
+    const upstreamAbort = new AbortController()
+    let upstreamTimer: ReturnType<typeof setTimeout> | undefined
+    let timeoutError: NativeResponsesTimeoutError | undefined
+    const clearUpstreamTimeout = (): void => {
+      if (upstreamTimer) clearTimeout(upstreamTimer)
+      upstreamTimer = undefined
+    }
+    const armUpstreamTimeout = (timeoutMs: number, message: string): void => {
+      clearUpstreamTimeout()
+      upstreamTimer = setTimeout(() => {
+        timeoutError = new NativeResponsesTimeoutError(message)
+        upstreamAbort.abort(timeoutError)
+      }, timeoutMs)
+      upstreamTimer.unref?.()
+    }
+    const armStreamIdleTimeout = (): void =>
+      armUpstreamTimeout(
+        this.options.streamIdleTimeoutMs ?? DEFAULT_STREAM_IDLE_TIMEOUT_MS,
+        'Native Responses upstream stream became idle.'
+      )
+    let phase = 'read-request'
+
+    try {
+      const body = (await request.readJsonObject()) as JsonObject
+      const promptCacheKey =
+        typeof body.prompt_cache_key === 'string' ? body.prompt_cache_key : undefined
+      const reviewerScoped =
+        promptCacheKey !== undefined && this.reviewerSessionKeys.has(promptCacheKey)
+      const toolLessScoped =
+        promptCacheKey !== undefined && this.toolLessSessionKeys.has(promptCacheKey)
+      const hostMessageTools =
+        promptCacheKey === undefined ? undefined : this.hostMessageSessionScopes.get(promptCacheKey)
+      const hostMessageScoped = hostMessageTools !== undefined
+      const hostMessageBoundaryActive = this.strictHostMessageSessionKeys.size > 0
+      if (reviewerScoped) this.scopedReviewerSessionKeys.add(promptCacheKey)
+      if (toolLessScoped) this.scopedToolLessSessionKeys.add(promptCacheKey)
+      if (hostMessageScoped) this.scopedHostMessageSessionKeys.add(promptCacheKey!)
+      // Codex currently advertises built-in tools even when reviewer session metadata disables them.
+      // Replace the full declaration set at this boundary so reviewer turns can reach only their
+      // scope-bounded reviewer MCP, matching the Chat bridge's fail-closed contract.
+      const scopedBody =
+        reviewerScoped || toolLessScoped || hostMessageScoped || hostMessageBoundaryActive
+          ? {
+              ...body,
+              tools: namespaceToolDeclarations(
+                reviewerScoped
+                  ? (target.reviewerScope?.namespacedTools ?? [])
+                  : hostMessageScoped
+                    ? hostMessageTools
+                    : []
+              ),
+              tool_choice: 'auto'
+            }
+          : body
+      const routedBody = target.model ? { ...scopedBody, model: target.model } : scopedBody
+      const aliases = prepareNativeResponsesRequest(routedBody, target.vendorId)
+      const flattenedRequest = aliases.request
+      const compatibilityRequest =
+        Array.isArray(flattenedRequest.tools) &&
+        flattenedRequest.tools.some((tool: unknown) => isArtifactTool(tool, aliases))
+          ? promoteArtifactDeveloperInstructions(flattenedRequest)
+          : flattenedRequest
+      const upstreamRequest = target.sanitizeRequest
+        ? target.sanitizeRequest(compatibilityRequest)
+        : compatibilityRequest
+      const upstreamRequestBody = JSON.stringify(upstreamRequest)
+      const resolvedKey = target.resolveKey ? await target.resolveKey() : target.key
+      const headersToForward = upstreamHeaders(request, resolvedKey)
+      const replayKey = providerRequestFingerprint(
+        target.baseUrl,
+        providerRequestHeadersFingerprint(headersToForward),
+        upstreamRequestBody
+      )
+      const requestBytes = Buffer.byteLength(upstreamRequestBody, 'utf8')
+      // Derive the input size from the already-serialized body so a large multimodal input is not
+      // serialized a second time just for diagnostics. The subtracted 8/9 bytes are the JSON key and
+      // optional comma around the removed `input` field.
+      const { input: upstreamInput, ...upstreamRequestWithoutInput } = upstreamRequest
+      const inputBytes =
+        upstreamInput === undefined
+          ? 0
+          : Math.max(
+              0,
+              requestBytes -
+                Buffer.byteLength(JSON.stringify(upstreamRequestWithoutInput), 'utf8') -
+                (Object.keys(upstreamRequestWithoutInput).length > 0 ? 9 : 8)
+            )
+      const inputItems = Array.isArray(upstreamInput) ? upstreamInput : []
+      const developerItems = inputItems.filter(
+        (item) => isObject(item) && item.type === 'message' && item.role === 'developer'
+      )
+      const topLevelArtifactInstructionPresent = containsText(
+        upstreamRequest.instructions,
+        '<open_science_artifact_instructions>'
+      )
+      const developerArtifactInstructionPresent = developerItems.some((item) =>
+        containsText(item.content, '<open_science_artifact_instructions>')
+      )
+      log.info('native Responses compatibility request', {
+        requestId,
+        requestBytes,
+        inputBytes,
+        inputItemCount: Array.isArray(upstreamInput)
+          ? upstreamInput.length
+          : upstreamInput === undefined
+            ? 0
+            : 1,
+        instructionTextBytes:
+          typeof upstreamRequest.instructions === 'string'
+            ? Buffer.byteLength(upstreamRequest.instructions, 'utf8')
+            : 0,
+        toolDefinitionCount: Array.isArray(upstreamRequest.tools)
+          ? upstreamRequest.tools.length
+          : 0,
+        developerInstructionItemCount: developerItems.length,
+        topLevelArtifactInstructionPresent,
+        developerArtifactInstructionPresent,
+        artifactInstructionPresent:
+          topLevelArtifactInstructionPresent || developerArtifactInstructionPresent,
+        artifactToolPresent:
+          Array.isArray(upstreamRequest.tools) &&
+          upstreamRequest.tools.some((tool: unknown) => isArtifactTool(tool, aliases)),
+        functionCallOutputHistoryCount: inputItems.filter(
+          (item) => isObject(item) && item.type === 'function_call_output'
+        ).length,
+        promptCacheKeyPresent: promptCacheKey !== undefined,
+        namespaceToolCount: aliases.toolCount,
+        literatureToolPresent: Boolean(
+          aliases.resolveTool('mcp__open_science_literature__read_document')
+        ),
+        stream: body.stream === true,
+        reviewerScoped,
+        toolLessScoped
+      })
+      phase = 'upstream-fetch'
+      const replay = this.deterministicErrors.get(replayKey)
+      if (replay) {
+        phase = 'forward-response'
+        response.writeHead(replay.status, replay.headers)
+        response.end(replay.body)
+        log.info('native Responses compatibility request completed', {
+          requestId,
+          status: replay.upstreamStatus,
+          replayed: true,
+          durationMs: Math.max(0, Date.now() - startedAt)
+        })
+        return
+      }
+      armUpstreamTimeout(
+        this.options.responseHeaderTimeoutMs ?? DEFAULT_RESPONSE_HEADER_TIMEOUT_MS,
+        'Native Responses upstream did not return response headers in time.'
+      )
+      const providerRequestStartedAt = Date.now()
+      let upstream = await fetchProviderRequest(this.fetchImpl, responsesUrl(target.baseUrl), {
+        method: 'POST',
+        headers: headersToForward,
+        body: upstreamRequestBody,
+        signal: AbortSignal.any([request.signal, upstreamAbort.signal])
+      })
+      if (upstream.status === 401 && target.resolveKey) {
+        const refreshedKey = await target.resolveKey(true)
+        upstream = await fetchProviderRequest(this.fetchImpl, responsesUrl(target.baseUrl), {
+          method: 'POST',
+          headers: upstreamHeaders(request, refreshedKey),
+          body: upstreamRequestBody,
+          signal: AbortSignal.any([request.signal, upstreamAbort.signal])
+        })
+      }
+      clearUpstreamTimeout()
+      const contentType = upstream.headers.get('content-type') ?? ''
+      const responseType = upstreamResponseType(contentType)
+      log.info('native Responses compatibility upstream response', {
+        requestId,
+        status: upstream.status,
+        responseType,
+        durationMs: Math.max(0, Date.now() - startedAt)
+      })
+      phase = 'forward-response'
+      if (isDeterministicProviderErrorStatus(upstream.status)) {
+        const boundedBody = await readBoundedProviderErrorBody(upstream, {
+          signal: request.signal
+        })
+        await observeProviderFailure(
+          target.onProviderFailure,
+          {
+            model: upstreamRequest.model,
+            endpoint: 'responses',
+            startedAt: providerRequestStartedAt
+          },
+          upstream.status,
+          boundedBody.complete ? boundedBody.body.toString('utf8') : undefined
+        )
+        let rawBody = boundedBody.body
+        let bodyIsReplayable = boundedBody.complete
+        if (boundedBody.complete && responseType === 'json') {
+          try {
+            rawBody = Buffer.from(
+              JSON.stringify(aliases.restore(JSON.parse(boundedBody.body.toString('utf8'))))
+            )
+          } catch {
+            bodyIsReplayable = false
+          }
+        }
+        bodyIsReplayable &&= rawBody.byteLength <= MAX_REPLAY_ERROR_BODY_BYTES
+        const bodyToReplay = bodyIsReplayable
+          ? rawBody
+          : Buffer.from(
+              JSON.stringify({
+                error: {
+                  type: 'invalid_request_error',
+                  message: `Provider request failed with status ${upstream.status}`,
+                  status: upstream.status
+                }
+              })
+            )
+        const headers = {
+          ...copyResponseHeaders(upstream),
+          ...(bodyIsReplayable ? {} : { 'content-type': 'application/json' }),
+          'content-length': String(bodyToReplay.byteLength),
+          'x-open-science-upstream-status': String(upstream.status)
+        }
+        const snapshot = {
+          body: bodyToReplay,
+          headers,
+          status: providerErrorClientStatus(upstream.status),
+          upstreamStatus: upstream.status
+        }
+        this.deterministicErrors.remember(replayKey, upstream.status, snapshot)
+        response.writeHead(snapshot.status, snapshot.headers)
+        response.end(snapshot.body)
+      } else if (responseType === 'event-stream') {
+        armStreamIdleTimeout()
+        const summary = await streamResponse(upstream, response, aliases, armStreamIdleTimeout, {
+          responseBytes: responseLimit(
+            this.options.maxResponseBytes,
+            DEFAULT_MAX_PROVIDER_RESPONSE_BYTES
+          ),
+          lineBytes: responseLimit(
+            this.options.maxSseLineBytes,
+            DEFAULT_MAX_PROVIDER_SSE_LINE_BYTES
+          ),
+          eventBytes: responseLimit(
+            this.options.maxSseEventBytes,
+            DEFAULT_MAX_PROVIDER_SSE_EVENT_BYTES
+          )
+        })
+        log.info('native Responses compatibility stream completed', {
+          requestId,
+          ...(summary ?? { terminalEventType: 'missing' })
+        })
+      } else if (responseType === 'json') {
+        armStreamIdleTimeout()
+        const payload = aliases.restore(
+          JSON.parse(
+            await readBoundedResponseText(
+              upstream,
+              responseLimit(this.options.maxResponseBytes, DEFAULT_MAX_PROVIDER_RESPONSE_BYTES),
+              'Native Responses upstream JSON response',
+              armStreamIdleTimeout
+            )
+          )
+        )
+        response.writeHead(upstream.status, copyResponseHeaders(upstream))
+        response.end(JSON.stringify(payload))
+      } else {
+        const body = await readBoundedResponseBytes(
+          upstream,
+          responseLimit(this.options.maxResponseBytes, DEFAULT_MAX_PROVIDER_RESPONSE_BYTES),
+          'Native Responses upstream binary response'
+        )
+        response.writeHead(upstream.status, copyResponseHeaders(upstream))
+        response.end(body)
+      }
+      log.info('native Responses compatibility request completed', {
+        requestId,
+        status: upstream.status,
+        durationMs: Math.max(0, Date.now() - startedAt)
+      })
+    } catch (error) {
+      const failure = timeoutError ?? error
+      const errorCode = safeNetworkErrorCode(failure)
+      log.warn('native Responses compatibility request failed', {
+        requestId,
+        phase,
+        outcome: request.signal.aborted ? 'aborted' : 'error',
+        durationMs: Math.max(0, Date.now() - startedAt),
+        ...diagnosticErrorFields(failure),
+        ...(errorCode ? { errorCode } : {})
+      })
+      throw failure
+    } finally {
+      clearUpstreamTimeout()
+    }
+  }
+}
+
+export type { NativeResponsesCompatibilityOptions, NativeResponsesCompatibilityTarget }

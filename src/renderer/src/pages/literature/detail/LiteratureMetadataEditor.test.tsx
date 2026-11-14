@@ -1,0 +1,592 @@
+// @vitest-environment jsdom
+import { toCslItem } from '@aipoch/literature-citations/csl'
+import {
+  literatureItemInputSchema,
+  type LiteratureItemInput
+} from '@aipoch/literature-library/item'
+import { cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { LiteratureMetadataEditor } from './LiteratureMetadataEditor'
+import { emptyLiteratureItem } from '../imports/useLiteratureImport'
+
+afterEach(cleanup)
+
+describe('LiteratureMetadataEditor', () => {
+  it('allows identifier-only creation with a generated title', () => {
+    const onSave = vi.fn()
+    render(
+      <LiteratureMetadataEditor
+        item={{
+          ...emptyLiteratureItem(),
+          identifiers: [{ scheme: 'pmid', value: 'PMID: 41553823', isPrimary: true }]
+        }}
+        allowIdentifierOnly
+        saving={false}
+        onSave={onSave}
+        onCancel={vi.fn()}
+      />
+    )
+
+    const save = screen.getByRole('button', { name: 'Save' })
+    expect(save.matches(':disabled')).toBe(false)
+    fireEvent.click(save)
+    expect(onSave).toHaveBeenCalledWith(
+      expect.objectContaining({
+        title: 'PMID: 41553823',
+        identifiers: [{ scheme: 'pmid', value: 'PMID: 41553823', isPrimary: true }]
+      })
+    )
+  })
+
+  it('keeps identifier-only creation disabled for empty normalized identifiers', () => {
+    const onSave = vi.fn()
+    render(
+      <LiteratureMetadataEditor
+        item={{
+          ...emptyLiteratureItem(),
+          identifiers: [{ scheme: 'pmid', value: 'PMID:', isPrimary: true }]
+        }}
+        allowIdentifierOnly
+        saving={false}
+        onSave={onSave}
+        onCancel={vi.fn()}
+      />
+    )
+
+    expect(screen.getByRole('button', { name: 'Save' }).matches(':disabled')).toBe(true)
+    expect(onSave).not.toHaveBeenCalled()
+  })
+
+  it('locks every editable control while saving and retains the draft after failure', () => {
+    const item = literatureItemInputSchema.parse({
+      itemType: 'journalArticle',
+      title: 'Original',
+      typeFields: { volume: '1' },
+      creators: [{ nameMode: 'person', givenName: 'A', familyName: 'B', creatorType: 'author' }],
+      identifiers: [{ scheme: 'doi', value: '10.1234/example', isPrimary: true }]
+    })
+    const onSave = vi.fn()
+    const props = { item, onSave, onCancel: vi.fn() }
+    const { container, rerender } = render(<LiteratureMetadataEditor {...props} saving={false} />)
+    const draftTitle = 'A long reference title\nwith a reviewed subtitle'
+    expect(document.activeElement).toBe(screen.getByLabelText('Title'))
+    fireEvent.change(screen.getByLabelText('Title'), { target: { value: draftTitle } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+    expect(onSave).toHaveBeenCalledWith(expect.objectContaining({ title: draftTitle }))
+    rerender(<LiteratureMetadataEditor {...props} saving />)
+    const savingButton = screen.getByRole('button', { name: 'Saving…' })
+    expect(savingButton.getAttribute('aria-busy')).toBe('true')
+    expect(savingButton.querySelector('svg')?.getAttribute('aria-hidden')).toBe('true')
+    fireEvent.click(savingButton)
+    expect(onSave).toHaveBeenCalledOnce()
+    const controls = [...container.querySelectorAll('input, textarea, button')]
+    expect(controls.filter((control) => !control.matches(':disabled'))).toEqual([])
+    rerender(<LiteratureMetadataEditor {...props} saving={false} error="Save failed" />)
+    expect(screen.getByRole('button', { name: 'Save' }).getAttribute('aria-busy')).toBe('false')
+    expect((screen.getByLabelText('Title') as HTMLTextAreaElement).value).toBe(draftTitle)
+    expect(screen.getByRole('alert').textContent).toBe('Save failed')
+    expect(screen.getByRole('button', { name: /Add (creator|author)/ }).matches(':disabled')).toBe(
+      false
+    )
+    expect(screen.getByRole('combobox', { name: 'Reference type' }).matches(':disabled')).toBe(
+      false
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+    expect(props.onCancel).toHaveBeenCalledOnce()
+    expect(onSave).toHaveBeenCalledOnce()
+  })
+
+  it('keeps creators and identifiers ahead of automatically expanded publication details', () => {
+    render(
+      <LiteratureMetadataEditor
+        item={literatureItemInputSchema.parse({
+          itemType: 'journalArticle',
+          title: 'A reference to review',
+          typeFields: { volume: '42', issue: '3' },
+          creators: [
+            { nameMode: 'person', givenName: 'Ada', familyName: 'Lovelace', creatorType: 'author' }
+          ],
+          identifiers: [{ scheme: 'doi', value: '10.1234/example', isPrimary: true }]
+        })}
+        saving={false}
+        onSave={vi.fn()}
+        onCancel={vi.fn()}
+      />
+    )
+    const advanced = screen.getByRole('button', { name: 'Advanced settings' })
+    expect(advanced.getAttribute('aria-expanded')).toBe('true')
+    expect((screen.getByLabelText('Volume') as HTMLInputElement).value).toBe('42')
+    expect((screen.getByLabelText('Issue') as HTMLInputElement).value).toBe('3')
+    for (const control of [screen.getByLabelText('Family name'), screen.getByLabelText('DOI')]) {
+      expect(control.compareDocumentPosition(advanced) & Node.DOCUMENT_POSITION_FOLLOWING).toBe(
+        Node.DOCUMENT_POSITION_FOLLOWING
+      )
+    }
+  })
+
+  it('edits a long identifier while keeping preferences independent for each scheme', () => {
+    const doi = '10.1234/a-long-reference-identifier-that-needs-the-available-row-width'
+    const item = literatureItemInputSchema.parse({
+      itemType: 'preprint',
+      title: 'Reference identifiers',
+      identifiers: [
+        { scheme: 'doi', value: '10.1234/original', isPrimary: true },
+        { scheme: 'doi', value: doi, isPrimary: false },
+        { scheme: 'arxiv', value: '2401.12345', isPrimary: true }
+      ]
+    })
+    const onSave = vi.fn()
+    render(
+      <LiteratureMetadataEditor item={item} saving={false} onSave={onSave} onCancel={vi.fn()} />
+    )
+    fireEvent.click(screen.getAllByRole('radio', { name: 'Preferred for DOI' })[1])
+    fireEvent.change(screen.getAllByLabelText('DOI')[1], { target: { value: `${doi}-reviewed` } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+    expect(onSave).toHaveBeenCalledWith(
+      expect.objectContaining({
+        identifiers: [
+          { scheme: 'doi', value: '10.1234/original', isPrimary: false },
+          { scheme: 'doi', value: `${doi}-reviewed`, isPrimary: true },
+          { scheme: 'arxiv', value: '2401.12345', isPrimary: true }
+        ]
+      })
+    )
+  })
+
+  it('shows retry progress without resubmitting and restores the retry action after failure', () => {
+    const props = {
+      item: literatureItemInputSchema.parse({ itemType: 'journalArticle', title: 'Saved draft' }),
+      onSave: vi.fn(),
+      onRetry: vi.fn(),
+      onCancel: vi.fn()
+    }
+    const { rerender } = render(<LiteratureMetadataEditor {...props} saving={false} />)
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
+    expect(props.onRetry).toHaveBeenCalledOnce()
+    rerender(<LiteratureMetadataEditor {...props} saving />)
+    const retrying = screen.getByRole('button', { name: 'Retrying…' })
+    expect(retrying.getAttribute('aria-busy')).toBe('true')
+    expect(retrying.matches(':disabled')).toBe(true)
+    fireEvent.click(retrying)
+    expect(props.onRetry).toHaveBeenCalledOnce()
+    expect(props.onSave).not.toHaveBeenCalled()
+    rerender(<LiteratureMetadataEditor {...props} saving={false} error="Read failed" />)
+    expect(screen.getByRole('alert').textContent).toBe('Read failed')
+    expect(screen.getByRole('button', { name: 'Retry' }).matches(':disabled')).toBe(false)
+    expect(screen.queryByRole('button', { name: 'Retrying…' })).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
+    expect(props.onRetry).toHaveBeenCalledTimes(2)
+  })
+
+  it('does not report active saving for a locked recovery draft', () => {
+    render(
+      <LiteratureMetadataEditor
+        item={literatureItemInputSchema.parse({ itemType: 'journalArticle', title: 'Saved draft' })}
+        saving
+        busy={false}
+        onSave={vi.fn()}
+        onCancel={vi.fn()}
+      />
+    )
+    const save = screen.getByRole('button', { name: 'Save' })
+    expect(save.matches(':disabled')).toBe(true)
+    expect(save.getAttribute('aria-busy')).toBe('false')
+    expect(screen.queryByRole('button', { name: 'Saving…' })).toBeNull()
+    expect(screen.getByLabelText('Title').matches(':disabled')).toBe(true)
+  })
+})
+
+const editableItem = (): LiteratureItemInput =>
+  literatureItemInputSchema.parse({
+    itemType: 'book',
+    title: 'Manual metadata',
+    issuedYear: 2024,
+    issuedText: '2024-03-12',
+    shortTitle: 'Short',
+    language: 'fr',
+    rights: 'CC BY',
+    citationKey: 'manual2024',
+    accessedAt: Date.UTC(2026, 8, 8),
+    extra: 'Original provider notes',
+    typeFields: { custom: { nested: ['preserve'] } },
+    creators: [
+      { nameMode: 'person', givenName: 'Ada', familyName: 'Lovelace', creatorType: 'editor' },
+      { nameMode: 'organization', literalName: 'Research Council', creatorType: 'author' },
+      {
+        nameMode: 'person',
+        givenName: 'Other',
+        familyName: 'Contributor',
+        creatorType: 'illustrator'
+      }
+    ]
+  })
+
+it.each(['2024.9', '2e3', '10000', '-1'])(
+  'blocks invalid year text before submitting: %s',
+  (value) => {
+    const onSave = vi.fn()
+    render(
+      <LiteratureMetadataEditor
+        item={editableItem()}
+        saving={false}
+        onSave={onSave}
+        onCancel={vi.fn()}
+      />
+    )
+    const year = screen.getByLabelText('Year')
+    fireEvent.change(year, { target: { value } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+    expect(onSave).not.toHaveBeenCalled()
+    expect(year.getAttribute('aria-invalid')).toBe('true')
+    expect(screen.getByRole('alert').textContent).toMatch(/year|9999/i)
+  }
+)
+
+it('keeps publication filtering and citation dates consistent after editing the year', async () => {
+  const { mkdtemp, rm } = await import('node:fs/promises')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const { createProjectDbClient } = await import('../../../../../main/projects/prisma-client')
+  const { migrateApplicationDatabase } =
+    await import('../../../../../main/database/migration-service')
+  const { LiteratureCatalog } = await import('../../../../../main/literature/catalog')
+  const root = await mkdtemp(join(tmpdir(), 'literature-manual-date-'))
+  const client = createProjectDbClient(root)
+  try {
+    await migrateApplicationDatabase(client)
+    const catalog = new LiteratureCatalog(async () => client)
+    const receipt = await catalog.transact({ kind: 'create-item', item: editableItem() })
+    const original = (await catalog.get(receipt.id))!
+    const onSave = vi.fn()
+    render(
+      <LiteratureMetadataEditor
+        item={original.item}
+        saving={false}
+        onSave={onSave}
+        onCancel={vi.fn()}
+      />
+    )
+    fireEvent.change(screen.getByLabelText('Year'), { target: { value: '2025' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+    expect(onSave).toHaveBeenCalledOnce()
+    await catalog.transact({
+      kind: 'update-item',
+      itemId: original.id,
+      expectedMetadataRevision: original.metadataRevision,
+      item: onSave.mock.calls[0][0]
+    })
+    const saved = (await catalog.get(original.id))!
+    expect(saved.item.issuedYear).toBe(2025)
+    const currentYear = await catalog.search({
+      scope: 'library',
+      filter: { yearFrom: 2025, yearTo: 2025 }
+    })
+    const oldYear = await catalog.search({
+      scope: 'library',
+      filter: { yearFrom: 2024, yearTo: 2024 }
+    })
+    expect(currentYear.entries.map((entry) => ('id' in entry ? entry.id : undefined))).toEqual([
+      saved.id
+    ])
+    expect(oldYear.entries).toEqual([])
+    expect(toCslItem(saved.id, saved.item).issued?.['date-parts'][0][0]).toBe(saved.item.issuedYear)
+  } finally {
+    cleanup()
+    await client.$disconnect()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+it('shows existing creator roles and offers creator name modes', () => {
+  render(
+    <LiteratureMetadataEditor
+      item={editableItem()}
+      saving={false}
+      onSave={vi.fn()}
+      onCancel={vi.fn()}
+    />
+  )
+  expect(screen.queryAllByRole('combobox', { name: /role/i })).toHaveLength(3)
+  expect(screen.getByText('Editor')).not.toBeNull()
+  expect(screen.getByText(/illustrator/i)).not.toBeNull()
+  expect(screen.getAllByRole('combobox', { name: /name type|name mode/i })).toHaveLength(3)
+})
+
+it.each([
+  'Short title',
+  'Language',
+  'Rights',
+  'Date accessed',
+  'Citation key',
+  'Extra',
+  'Publication date'
+])('provides a manual metadata control for %s', (label) => {
+  render(
+    <LiteratureMetadataEditor
+      item={editableItem()}
+      saving={false}
+      onSave={vi.fn()}
+      onCancel={vi.fn()}
+    />
+  )
+  const advanced = screen.getByRole('button', { name: 'Advanced settings' })
+  if (advanced.getAttribute('aria-expanded') === 'false') fireEvent.click(advanced)
+  expect(screen.queryByLabelText(label)).not.toBeNull()
+})
+
+it('preserves stored roles, literal names, and unedited extended metadata', () => {
+  const item = editableItem()
+  const onSave = vi.fn()
+  render(<LiteratureMetadataEditor item={item} saving={false} onSave={onSave} onCancel={vi.fn()} />)
+  fireEvent.change(screen.getByLabelText('Title'), { target: { value: 'Edited title' } })
+  fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+  expect(onSave).toHaveBeenCalledWith({ ...item, title: 'Edited title' })
+  const csl = toCslItem('manual', onSave.mock.calls[0][0])
+  expect(csl.editor).toEqual([{ given: 'Ada', family: 'Lovelace' }])
+  expect(csl.author).toEqual([{ literal: 'Research Council' }])
+  expect(csl).toMatchObject({
+    language: 'fr',
+    'title-short': 'Short',
+    accessed: { 'date-parts': [[2026, 9, 8]] }
+  })
+})
+
+const mountEditor = (overrides: Partial<LiteratureItemInput> = {}): ReturnType<typeof vi.fn> => {
+  const onSave = vi.fn()
+  render(
+    <LiteratureMetadataEditor
+      item={{ ...editableItem(), ...overrides }}
+      saving={false}
+      onSave={onSave}
+      onCancel={vi.fn()}
+    />
+  )
+  return onSave
+}
+const change = (label: string, value: string): void => {
+  fireEvent.change(screen.getByLabelText(label), { target: { value } })
+}
+const save = (): void => {
+  fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+}
+const advanced = (): void => {
+  const button = screen.getByRole('button', { name: 'Advanced settings' })
+  if (button.getAttribute('aria-expanded') === 'false') fireEvent.click(button)
+}
+const choose = (trigger: HTMLElement, value: string): void => {
+  fireEvent.keyDown(trigger, { key: 'Enter' })
+  fireEvent.click(screen.getByRole('option', { name: value }))
+}
+
+it.each(['', '0', '9999'])('accepts an unknown or boundary year: %s', (year) => {
+  const onSave = mountEditor({ issuedText: '', issuedYear: undefined })
+  change('Year', year)
+  save()
+  expect(onSave).toHaveBeenCalledOnce()
+  expect(literatureItemInputSchema.parse(onSave.mock.calls[0][0]).issuedYear).toBe(
+    year ? Number(year) : undefined
+  )
+})
+
+it.each(['Year', 'Publication date'])(
+  'clears both publication values when clearing %s',
+  (field) => {
+    const onSave = mountEditor()
+    change(field, '')
+    save()
+    expect(onSave).toHaveBeenCalledWith(
+      expect.objectContaining({ issuedYear: undefined, issuedText: '' })
+    )
+  }
+)
+
+it('requires correction of a leap day after changing to a non-leap year', () => {
+  const onSave = mountEditor({ issuedText: '2024-02-29' })
+  change('Year', '2025')
+  save()
+  expect(onSave).not.toHaveBeenCalled()
+  expect(document.activeElement).toBe(screen.getByLabelText('Publication date'))
+  change('Publication date', '2025-02-28')
+  save()
+  expect(onSave).toHaveBeenCalledWith(
+    expect.objectContaining({ issuedText: '2025-02-28', issuedYear: 2025 })
+  )
+})
+
+it.each(['2025', '2025-04', '2025-04-30'])(
+  'derives the year from a publication date: %s',
+  (date) => {
+    const onSave = mountEditor()
+    change('Publication date', date)
+    save()
+    expect(onSave).toHaveBeenCalledWith(
+      expect.objectContaining({ issuedText: date, issuedYear: 2025 })
+    )
+  }
+)
+
+it.each(['2025-02-29', '2024-13', '2025-04-31', '2025junk'])(
+  'rejects a malformed publication date: %s',
+  (date) => {
+    const onSave = mountEditor()
+    change('Publication date', date)
+    save()
+    expect(onSave).not.toHaveBeenCalled()
+    expect(screen.getByLabelText('Publication date').getAttribute('aria-invalid')).toBe('true')
+  }
+)
+
+it.each(['Spring 2024', '2023-03-12'])('preserves an untouched legacy date: %s', (issuedText) => {
+  const onSave = mountEditor({ issuedText })
+  change('Title', 'Unrelated edit')
+  save()
+  expect(onSave).toHaveBeenCalledWith(expect.objectContaining({ issuedText, issuedYear: 2024 }))
+})
+
+it('requires an explicit decision before replacing opaque historical date text', () => {
+  const onSave = mountEditor({ issuedText: 'Spring 2024' })
+  change('Year', '2025')
+  save()
+  expect(onSave).not.toHaveBeenCalled()
+  expect((screen.getByLabelText('Publication date') as HTMLInputElement).value).toBe('Spring 2024')
+  change('Publication date', '2025')
+  save()
+  expect(onSave).toHaveBeenCalledWith(
+    expect.objectContaining({ issuedText: '2025', issuedYear: 2025 })
+  )
+})
+
+it('edits extended metadata and projects the selected accessed day in UTC', () => {
+  const onSave = mountEditor()
+  advanced()
+  change('Short title', 'New short title')
+  change('Language', 'de')
+  change('Rights', 'CC0')
+  change('Citation key', 'newKey')
+  change('Extra', 'New extra\nSecond line')
+  change('Date accessed', '2026-09-09')
+  save()
+  const item = literatureItemInputSchema.parse(onSave.mock.calls[0][0])
+  expect(item).toMatchObject({
+    shortTitle: 'New short title',
+    language: 'de',
+    rights: 'CC0',
+    citationKey: 'newKey',
+    extra: 'New extra\nSecond line',
+    accessedAt: Date.UTC(2026, 8, 9),
+    typeFields: { custom: { nested: ['preserve'] } }
+  })
+  expect(toCslItem('manual', item).accessed).toEqual({ 'date-parts': [[2026, 9, 9]] })
+})
+
+it('retains an untouched access timestamp and permits clearing it', () => {
+  const accessedAt = Date.UTC(2026, 8, 8, 23, 45)
+  const onSave = mountEditor({ accessedAt })
+  save()
+  expect(onSave.mock.calls[0][0].accessedAt).toBe(accessedAt)
+  advanced()
+  change('Date accessed', '')
+  save()
+  expect(onSave.mock.calls[1][0].accessedAt).toBeUndefined()
+})
+
+it('blocks access dates outside the existing timestamp contract', () => {
+  const onSave = mountEditor()
+  advanced()
+  change('Date accessed', '1969-12-31')
+  save()
+  expect(onSave).not.toHaveBeenCalled()
+  expect(document.activeElement).toBe(screen.getByLabelText('Date accessed'))
+})
+
+it('creates editors and organization translators while restoring inactive names', () => {
+  const onSave = mountEditor({ creators: [] })
+  fireEvent.click(screen.getByRole('button', { name: /Add (creator|author)/ }))
+  choose(screen.getByRole('combobox', { name: 'Creator role' }), 'Editor')
+  change('Given name', 'Ada')
+  change('Family name', 'Lovelace')
+  choose(screen.getByRole('combobox', { name: 'Name type' }), 'Organization')
+  change('Organization', 'Research Council')
+  choose(screen.getByRole('combobox', { name: 'Name type' }), 'Person')
+  expect((screen.getByLabelText('Given name') as HTMLInputElement).value).toBe('Ada')
+  save()
+  expect(toCslItem('manual', onSave.mock.calls[0][0]).editor).toEqual([
+    { given: 'Ada', family: 'Lovelace' }
+  ])
+  choose(screen.getByRole('combobox', { name: 'Name type' }), 'Organization')
+  expect((screen.getByLabelText('Organization') as HTMLInputElement).value).toBe('Research Council')
+  choose(screen.getByRole('combobox', { name: 'Creator role' }), 'Translator')
+  save()
+  const saved = literatureItemInputSchema.parse(onSave.mock.calls[1][0])
+  expect(saved.creators).toEqual([
+    { nameMode: 'organization', literalName: 'Research Council', creatorType: 'translator' }
+  ])
+  expect(toCslItem('manual', saved).translator).toEqual([{ literal: 'Research Council' }])
+})
+
+it('keeps creator order and inactive names attached to the correct row after deletion', () => {
+  const onSave = mountEditor()
+  choose(screen.getAllByRole('combobox', { name: 'Name type' })[1], 'Person')
+  fireEvent.change(screen.getAllByLabelText('Given name')[1], { target: { value: 'Remember me' } })
+  fireEvent.click(screen.getAllByRole('button', { name: /Remove (creator|author)/ })[0])
+  choose(screen.getAllByRole('combobox', { name: 'Name type' })[0], 'Organization')
+  expect((screen.getByLabelText('Organization') as HTMLInputElement).value).toBe('Research Council')
+  save()
+  expect(onSave.mock.calls[0][0].creators).toEqual(editableItem().creators.slice(1))
+})
+
+it('renders an arbitrary stored role without treating it as an object property', () => {
+  const onSave = mountEditor({
+    creators: [{ nameMode: 'organization', literalName: 'Archive', creatorType: 'constructor' }]
+  })
+  expect(screen.getByRole('combobox', { name: 'Creator role' }).textContent).toContain(
+    'constructor'
+  )
+  save()
+  expect(onSave.mock.calls[0][0].creators[0].creatorType).toBe('constructor')
+})
+
+it('does not treat an incomplete native access-date input as an intentional clear', () => {
+  const onSave = mountEditor()
+  advanced()
+  const input = screen.getByLabelText('Date accessed') as HTMLInputElement
+  fireEvent.change(input, { target: { value: '' } })
+  // jsdom cannot type into native date segments; Chromium exposes partial input as badInput
+  // with an empty value. Keep the probe at that public browser validity boundary.
+  Object.defineProperty(input, 'validity', { configurable: true, value: { badInput: true } })
+  save()
+  expect(onSave).not.toHaveBeenCalled()
+  expect(document.activeElement).toBe(input)
+})
+
+it('allows original seasonal date text with an independently optional searchable year', () => {
+  const onSave = mountEditor()
+  fireEvent.click(screen.getByRole('checkbox', { name: 'Use original date text' }))
+  change('Publication date', 'Winter 2024–2025?')
+  change('Year', '')
+  save()
+  expect(onSave).toHaveBeenCalledWith(
+    expect.objectContaining({ issuedText: 'Winter 2024–2025?', issuedYear: undefined })
+  )
+})
+
+it('tracks edited and reverted input without treating disclosure as a data change', () => {
+  const item = literatureItemInputSchema.parse({ itemType: 'journalArticle', title: 'Original' })
+  const onDirtyChange = vi.fn()
+  render(
+    <LiteratureMetadataEditor
+      item={item}
+      saving={false}
+      onSave={vi.fn()}
+      onCancel={vi.fn()}
+      onDirtyChange={onDirtyChange}
+    />
+  )
+  expect(onDirtyChange).toHaveBeenLastCalledWith(false)
+  fireEvent.click(screen.getByRole('button', { name: 'Advanced settings' }))
+  expect(onDirtyChange).toHaveBeenLastCalledWith(false)
+  fireEvent.change(screen.getByLabelText('Title'), { target: { value: 'Draft' } })
+  expect(onDirtyChange).toHaveBeenLastCalledWith(true)
+  fireEvent.change(screen.getByLabelText('Title'), { target: { value: 'Original' } })
+  expect(onDirtyChange).toHaveBeenLastCalledWith(false)
+})

@@ -1,0 +1,997 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+
+import { LiteratureReferenceResolver } from '../src/reference-resolver.js'
+
+const pubmedResponse = `PMID- 35486828
+TI  - A PubMed paper.
+AB  - The complete abstract from PubMed.
+FAU - Example, Alice
+DP  - 2022 Apr
+JT  - Example Journal
+PB  - Example Press
+
+PMID- 21458665
+TI  - Mapping cancer origins.
+AB  - Cancer comprises a bewildering assortment of diseases.
+FAU - Gilbertson, Richard J
+DP  - 2011 Apr 1
+JT  - Cell
+LID - 10.1016/j.cell.2011.03.019 [doi]
+`
+
+it('rejects metadata for a shortened PMID instead of returning another paper', async () => {
+  const fetchFn = vi.fn<typeof fetch>(async (input) =>
+    new URL(String(input)).hostname === 'eutils.ncbi.nlm.nih.gov'
+      ? new Response(
+          'PMID- 3548682\nTI  - Designing computer programs: two student projects.\nAB  - A different paper with a shorter identifier.\n'
+        )
+      : new Response('', { status: 404 })
+  )
+  await expect(new LiteratureReferenceResolver(fetchFn).lookup('pmid:35486828')).rejects.toThrow()
+  expect(new URL(String(fetchFn.mock.calls[0][0])).searchParams.get('id')).toBe('35486828')
+  expect(fetchFn).toHaveBeenCalledTimes(2)
+  expect(new URL(String(fetchFn.mock.calls[1][0])).searchParams.get('query')).toBe(
+    'EXT_ID:35486828 AND SRC:MED'
+  )
+})
+
+describe('LiteratureReferenceResolver', () => {
+  it('resolves the reported Springer PDF DOI into a complete unsaved reference', async () => {
+    const fetchFn = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          message: {
+            DOI: '10.1007/s11914-026-00956-3',
+            type: 'journal-article',
+            title: ['Metabolism in Tumour-Induced Bone Disease'],
+            abstract: '<jats:p>Bone cells adapt to tumour metabolism.</jats:p>',
+            'container-title': ['Current Osteoporosis Reports'],
+            published: { 'date-parts': [[2026, 2, 16]] },
+            volume: '24',
+            issue: '1',
+            'article-number': '8',
+            author: [
+              { given: 'Renee T.', family: 'Ormsby' },
+              { given: 'Claire M.', family: 'Edwards' }
+            ]
+          }
+        })
+      )
+    )
+    const [result] = await new LiteratureReferenceResolver(fetchFn).resolve([
+      'doi:10.1007/s11914-026-00956-3'
+    ])
+    expect(result.item).toMatchObject({
+      title: 'Metabolism in Tumour-Induced Bone Disease',
+      abstract: 'Bone cells adapt to tumour metabolism.',
+      containerTitle: 'Current Osteoporosis Reports',
+      issuedYear: 2026,
+      issuedText: '2026-02-16',
+      typeFields: { volume: '24', issue: '1', pages: '8' },
+      creators: [
+        expect.objectContaining({ familyName: 'Ormsby' }),
+        expect.objectContaining({ familyName: 'Edwards' })
+      ]
+    })
+    expect(fetchFn).toHaveBeenCalledExactlyOnceWith(
+      'https://api.crossref.org/works/10.1007%2Fs11914-026-00956-3',
+      expect.objectContaining({ signal: expect.any(AbortSignal) })
+    )
+  })
+
+  it('resolves a compact mixed identifier batch and preserves input order', async () => {
+    const fetchFn = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input)
+      if (url.includes('efetch.fcgi')) return new Response(pubmedResponse)
+      return new Response(
+        JSON.stringify({
+          message: {
+            DOI: '10.1000/example',
+            type: 'journal-article',
+            title: ['A Crossref paper'],
+            'container-title': ['Crossref Journal'],
+            issued: { 'date-parts': [[2024, 2, 3]] },
+            author: [{ given: 'Bob', family: 'Example' }]
+          }
+        })
+      )
+    })
+    const resolver = new LiteratureReferenceResolver(fetchFn as typeof fetch)
+
+    const result = await resolver.resolve(['pmid:35486828', 'doi:10.1000/EXAMPLE', 'pmid:21458665'])
+
+    expect(result.map(({ item }) => item.title)).toEqual([
+      'A PubMed paper.',
+      'A Crossref paper',
+      'Mapping cancer origins.'
+    ])
+    expect(result[0]?.item.abstract).toBe('The complete abstract from PubMed.')
+    expect(result[0]?.item.typeFields.publisher).toBe('Example Press')
+    expect(result[1]?.item.identifiers).toContainEqual({
+      scheme: 'doi',
+      value: '10.1000/example',
+      isPrimary: true
+    })
+    expect(fetchFn).toHaveBeenCalledTimes(3)
+    expect(String(fetchFn.mock.calls[0]?.[0])).toContain('id=35486828%2C21458665')
+  })
+
+  it('fetches normalized identifiers once while preserving input positions', async () => {
+    const fetchFn = vi.fn(async () => new Response(pubmedResponse))
+    const resolver = new LiteratureReferenceResolver(fetchFn as typeof fetch)
+
+    const result = await resolver.resolve(['PMID:35486828', 'pmid:35486828'])
+
+    expect(result).toHaveLength(2)
+    expect(result[0]).toEqual(result[1])
+    expect(fetchFn).toHaveBeenCalledTimes(1)
+  })
+
+  it('rejects unsupported, invalid, and unresolved identifiers explicitly', async () => {
+    const resolver = new LiteratureReferenceResolver(
+      vi.fn(async () => new Response(pubmedResponse)) as typeof fetch
+    )
+
+    await expect(resolver.resolve(['isbn:9780123456789'])).rejects.toThrow('UNSUPPORTED_REFERENCE')
+    await expect(resolver.resolve(['pmid:not-a-number'])).rejects.toThrow('INVALID_PMID')
+    await expect(resolver.resolve(['pmid:999'])).rejects.toThrow('REFERENCE_NOT_FOUND')
+  })
+})
+
+it.each(['doi:10.1234/cancelled', 'pmid:12345'])(
+  'aborts metadata fetch for %s',
+  async (reference) => {
+    const controller = new AbortController()
+    let fetchSignal: AbortSignal | undefined
+    let finish!: (response: Response) => void
+    let markStarted!: () => void
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve
+    })
+    const fetchFn = vi.fn<typeof fetch>().mockImplementation((_url, options) => {
+      fetchSignal = options?.signal ?? undefined
+      return new Promise((resolve, reject) => {
+        finish = resolve
+        markStarted()
+        fetchSignal!.addEventListener('abort', () => reject(fetchSignal!.reason), { once: true })
+      })
+    })
+    const reason = new Error('Stopped lookup')
+    const outcome = new LiteratureReferenceResolver(fetchFn)
+      .resolve([reference], controller.signal)
+      .catch((error: unknown) => error)
+    await started
+    controller.abort(reason)
+    try {
+      expect(fetchSignal?.aborted).toBe(true)
+    } finally {
+      finish(new Response(''))
+      await outcome
+    }
+    expect(await outcome).toBe(reason)
+  }
+)
+
+it('falls back from a Crossref 404 to the matching DataCite DOI', async () => {
+  const fetchFn = vi.fn<typeof fetch>(async (url) =>
+    new URL(String(url)).hostname === 'api.crossref.org'
+      ? new Response('', { status: 404 })
+      : Response.json({
+          data: {
+            attributes: {
+              doi: '10.1234/dataset',
+              titles: [{ title: 'Measured data' }],
+              types: { resourceTypeGeneral: 'Dataset' },
+              publicationYear: 2024,
+              publisher: { name: 'Archive' },
+              descriptions: [
+                { descriptionType: 'Abstract', description: 'Observed values from the experiment.' }
+              ],
+              creators: [{ name: 'Example Consortium', nameType: 'Organizational' }]
+            }
+          }
+        })
+  )
+  const [result] = await new LiteratureReferenceResolver(fetchFn).resolve(['doi:10.1234/dataset'])
+  expect(result.item).toMatchObject({
+    itemType: 'dataset',
+    title: 'Measured data',
+    abstract: 'Observed values from the experiment.',
+    typeFields: { publisher: 'Archive' }
+  })
+  expect(result.source.provider).toBe('datacite')
+  expect(fetchFn).toHaveBeenCalledTimes(2)
+})
+
+it.each(['10.1234/other', undefined])(
+  'does not accept an unmatched Europe PMC DOI: %s',
+  async (doi) => {
+    const fetchFn = vi.fn<typeof fetch>(async (url) =>
+      new URL(String(url)).hostname === 'api.crossref.org'
+        ? Response.json({ message: { DOI: '10.1234/requested', title: ['Requested paper'] } })
+        : Response.json({
+            resultList: {
+              result: [
+                {
+                  id: '123',
+                  source: 'MED',
+                  doi,
+                  title: 'Other paper',
+                  abstractText: 'Wrong evidence.'
+                }
+              ]
+            }
+          })
+    )
+    const result = await new LiteratureReferenceResolver(fetchFn).lookup('doi:10.1234/requested')
+    expect(result.item.abstract).toBe('')
+    expect(result.sources).toHaveLength(1)
+  }
+)
+
+it('does not select one of multiple exact DOI matches arbitrarily', async () => {
+  const fetchFn = vi.fn<typeof fetch>(async (url) =>
+    new URL(String(url)).hostname === 'api.crossref.org'
+      ? Response.json({ message: { DOI: '10.1234/requested', title: ['Requested paper'] } })
+      : Response.json({
+          resultList: {
+            result: ['123', '456'].map((id) => ({
+              id,
+              source: 'MED',
+              doi: '10.1234/requested',
+              title: 'A candidate',
+              abstractText: 'Ambiguous evidence.'
+            }))
+          }
+        })
+  )
+  expect(
+    (await new LiteratureReferenceResolver(fetchFn).lookup('doi:10.1234/requested')).item.abstract
+  ).toBe('')
+})
+
+it('keeps supplemental source attribution in the Agent discovery receipt', async () => {
+  const fetchFn = vi.fn<typeof fetch>(async (url) =>
+    new URL(String(url)).hostname === 'api.crossref.org'
+      ? Response.json({ message: { DOI: '10.1234/requested', title: ['Requested paper'] } })
+      : Response.json({
+          resultList: {
+            result: [
+              {
+                id: '123',
+                source: 'MED',
+                doi: '10.1234/requested',
+                title: 'Requested paper',
+                abstractText: 'Verified evidence.'
+              }
+            ]
+          }
+        })
+  )
+  const [result] = await new LiteratureReferenceResolver(fetchFn).resolve(['doi:10.1234/requested'])
+  expect(result.item.abstract).toBe('Verified evidence.')
+  expect(result.source.rawMetadata.supplementalSources).toEqual([
+    expect.objectContaining({ provider: 'europe-pmc', externalId: '123' })
+  ])
+})
+
+it('escapes DOI suffixes as a single Europe PMC query literal', async () => {
+  const fetchFn = vi.fn<typeof fetch>(async (url) =>
+    new URL(String(url)).hostname === 'api.crossref.org'
+      ? Response.json({ message: { DOI: '10.1234/a"OR*', title: ['Paper'] } })
+      : Response.json({ resultList: { result: [] } })
+  )
+  await new LiteratureReferenceResolver(fetchFn).lookup('doi:10.1234/a"OR*')
+  expect(new URL(String(fetchFn.mock.calls[1][0])).searchParams.get('query')).toBe(
+    'DOI:"10.1234/a\\"or*"'
+  )
+})
+
+it('preserves a registration-agency rate limit when Crossref and Europe PMC have no record', async () => {
+  const fetchFn = vi.fn<typeof fetch>(async (url) =>
+    new URL(String(url)).hostname === 'api.datacite.org'
+      ? new Response('', { status: 429 })
+      : new URL(String(url)).hostname === 'api.crossref.org'
+        ? new Response('', { status: 404 })
+        : Response.json({ resultList: { result: [] } })
+  )
+  await expect(
+    new LiteratureReferenceResolver(fetchFn).resolve(['doi:10.1234/dataset'])
+  ).rejects.toThrow('429')
+})
+
+it.each([{ title: [] }, { title: ['   '] }])(
+  'recovers titleless Crossref records with an abstract via Europe PMC (%j)',
+  async ({ title }) => {
+    const fetchFn = vi.fn<typeof fetch>(async (url) =>
+      new URL(String(url)).hostname === 'api.crossref.org'
+        ? Response.json({
+            message: { DOI: '10.1234/requested', title, abstract: 'Original abstract.' }
+          })
+        : Response.json({
+            resultList: {
+              result: [
+                {
+                  id: '123',
+                  source: 'MED',
+                  doi: '10.1234/requested',
+                  title: 'Recovered title',
+                  abstractText: 'Supplemental abstract.'
+                }
+              ]
+            }
+          })
+    )
+    const [result] = await new LiteratureReferenceResolver(fetchFn).resolve([
+      'doi:10.1234/requested'
+    ])
+    expect(result.item).toMatchObject({ title: 'Recovered title', abstract: 'Original abstract.' })
+    expect(fetchFn).toHaveBeenCalledTimes(2)
+  }
+)
+
+it('keeps titleless metadata available for enrichment but rejects incomplete Agent discoveries', async () => {
+  const fetchFn = vi.fn<typeof fetch>(async (url) =>
+    new URL(String(url)).hostname === 'api.crossref.org'
+      ? Response.json({ message: { DOI: '10.1234/requested', abstract: 'Useful abstract.' } })
+      : Response.json({ resultList: { result: [] } })
+  )
+  const resolver = new LiteratureReferenceResolver(fetchFn)
+  expect((await resolver.lookup('doi:10.1234/requested')).item).toMatchObject({
+    title: '',
+    abstract: 'Useful abstract.'
+  })
+  await expect(resolver.resolve(['doi:10.1234/requested'])).rejects.toThrow(
+    'REFERENCE_NOT_FOUND: No title'
+  )
+})
+
+it('starts distinct DOI lookups concurrently and preserves order and duplicate receipts', async () => {
+  const controller = new AbortController()
+  const pending = new Map<string, (response: Response) => void>()
+  const fetchFn = vi.fn<typeof fetch>(
+    (url, options) =>
+      new Promise<Response>((resolve, reject) => {
+        const signal = options!.signal!
+        signal.addEventListener('abort', () => reject(signal.reason), { once: true })
+        const doi = decodeURIComponent(new URL(String(url)).pathname.slice('/works/'.length))
+        pending.set(doi, resolve)
+      })
+  )
+  const references = ['doi:10.1234/first', 'doi:10.1234/second', 'doi:10.1234/FIRST']
+  const outcome = new LiteratureReferenceResolver(fetchFn).resolve(references, controller.signal)
+  try {
+    expect([...pending.keys()]).toEqual(['10.1234/first', '10.1234/second'])
+    for (const doi of ['10.1234/second', '10.1234/first']) {
+      pending.get(doi)!(
+        Response.json({ message: { DOI: doi, title: [doi], abstract: 'Complete abstract.' } })
+      )
+    }
+    const result = await outcome
+    expect(result.map(({ item }) => item.title)).toEqual([
+      '10.1234/first',
+      '10.1234/second',
+      '10.1234/first'
+    ])
+    expect(result[0]).toBe(result[2])
+    expect(fetchFn).toHaveBeenCalledTimes(2)
+  } finally {
+    controller.abort()
+    await outcome.catch(() => undefined)
+  }
+})
+
+it('propagates cancellation to every concurrent DOI lookup without starting fallback requests', async () => {
+  const controller = new AbortController()
+  const signals: AbortSignal[] = []
+  const fetchFn = vi.fn<typeof fetch>(
+    (_url, options) =>
+      new Promise<Response>((_resolve, reject) => {
+        const signal = options!.signal!
+        signals.push(signal)
+        signal.addEventListener('abort', () => reject(signal.reason), { once: true })
+      })
+  )
+  const outcome = new LiteratureReferenceResolver(fetchFn)
+    .resolve(['doi:10.1234/first', 'doi:10.1234/second'], controller.signal)
+    .catch((error: unknown) => error)
+  const reason = new Error('Cancel all lookups')
+  controller.abort(reason)
+  expect(await outcome).toBe(reason)
+  expect(signals).toHaveLength(2)
+  expect(signals.every((signal) => signal.aborted)).toBe(true)
+  expect(fetchFn).toHaveBeenCalledTimes(2)
+})
+
+it.each([2 * 1024 * 1024 + 256, 8 * 1024 * 1024])(
+  'accepts a valid PubMed batch response of %i bytes',
+  async (bytes) => {
+    const originalAbstract = 'The complete abstract from PubMed.'
+    const abstract = 'a'.repeat(bytes - Buffer.byteLength(pubmedResponse) + originalAbstract.length)
+    const body = pubmedResponse.replace(originalAbstract, abstract)
+    const fetchFn = vi.fn<typeof fetch>(async () => new Response(body))
+    const result = await new LiteratureReferenceResolver(fetchFn).resolve([
+      'pmid:35486828',
+      'pmid:21458665'
+    ])
+    expect(Buffer.byteLength(body)).toBe(bytes)
+    expect(result.map(({ item }) => item.title)).toEqual([
+      'A PubMed paper.',
+      'Mapping cancer origins.'
+    ])
+    expect(result[0].item.abstract).toBe(abstract)
+    expect(fetchFn).toHaveBeenCalledTimes(1)
+  }
+)
+
+it('rejects a PubMed response above 8 MiB before parsing', async () => {
+  const parseReferences = vi.fn()
+  const fetchFn = vi.fn<typeof fetch>(async (url) =>
+    new URL(String(url)).pathname.endsWith('/efetch.fcgi')
+      ? new Response('a'.repeat(8 * 1024 * 1024 + 1))
+      : new Response('', { status: 404 })
+  )
+  await expect(
+    new LiteratureReferenceResolver(fetchFn, { parseReferences }).lookup('pmid:35486828')
+  ).rejects.toThrow('Metadata response is too large.')
+  expect(parseReferences).not.toHaveBeenCalled()
+})
+
+describe('arXiv reference lookup', () => {
+  let Resolver: typeof LiteratureReferenceResolver
+  beforeEach(async () => {
+    vi.resetModules()
+    vi.useFakeTimers()
+    // Import the resolver with the same abortable promise timer as the fake monotonic clock.
+    vi.doMock('node:timers/promises', () => ({
+      setTimeout: (ms: number, value: unknown, { signal }: { signal?: AbortSignal }) =>
+        new Promise((resolve, reject) => {
+          signal?.throwIfAborted()
+          const cancel = (): void => {
+            clearTimeout(timer)
+            reject(signal?.reason)
+          }
+          const timer = setTimeout(() => {
+            signal?.removeEventListener('abort', cancel)
+            resolve(value)
+          }, ms)
+          signal?.addEventListener('abort', cancel, { once: true })
+        })
+    }))
+    Resolver = (await import('../src/reference-resolver.js')).LiteratureReferenceResolver
+  })
+  afterEach(() => {
+    vi.doUnmock('node:timers/promises')
+    vi.useRealTimers()
+  })
+  const feed = (
+    id = '2401.12345v2',
+    title = 'A paper &amp; its findings'
+  ): string => `<?xml version="1.0"?>
+    <feed xmlns="http://www.w3.org/2005/Atom"><title>Query results</title><entry>
+    <id>http://arxiv.org/abs/${id}</id><title>${title}</title>
+    <summary>A complete abstract.</summary><published>2024-01-23T12:00:00Z</published>
+    <author><name>Alice Example</name></author><author><name>Bob Researcher</name></author>
+    </entry></feed>`
+  it('resolves arXiv metadata with exact identity and provenance, without DOI provider calls', async () => {
+    const fetchFn = vi.fn<typeof fetch>().mockResolvedValue(new Response(feed()))
+    const [result] = await new Resolver(fetchFn).resolve(['arxiv:2401.12345'])
+    expect(result.item).toMatchObject({
+      itemType: 'preprint',
+      title: 'A paper & its findings',
+      abstract: 'A complete abstract.',
+      issuedYear: 2024,
+      issuedText: '2024-01-23',
+      url: 'https://arxiv.org/abs/2401.12345',
+      identifiers: [{ scheme: 'arxiv', value: '2401.12345', isPrimary: true }],
+      creators: [
+        expect.objectContaining({ familyName: 'Alice Example' }),
+        expect.objectContaining({ familyName: 'Bob Researcher' })
+      ]
+    })
+    expect(result.source).toMatchObject({ provider: 'arxiv', externalId: '2401.12345' })
+    expect(fetchFn).toHaveBeenCalledExactlyOnceWith(
+      'https://export.arxiv.org/api/query?id_list=2401.12345&max_results=1',
+      expect.objectContaining({ signal: expect.any(AbortSignal) })
+    )
+  })
+  it.each([
+    feed('2401.99999'),
+    feed('2401.12345', ''),
+    '<feed xmlns="http://www.w3.org/2005/Atom"/>',
+    '<feed>'
+  ])('rejects missing, mismatched or invalid metadata', async (xml) => {
+    const fetchFn = vi.fn<typeof fetch>().mockResolvedValue(new Response(xml))
+    await expect(new Resolver(fetchFn).resolve(['arxiv:2401.12345'])).rejects.toThrow()
+  })
+  it.each([
+    [
+      'duplicate identities',
+      feed().replace('</entry>', '<id>http://arxiv.org/abs/2401.99999</id></entry>')
+    ],
+    [
+      'duplicate DOI fields',
+      feed().replace(
+        '</entry>',
+        '<arxiv:doi xmlns:arxiv="http://arxiv.org/schemas/atom">10.1234/one</arxiv:doi><arxiv:doi xmlns:arxiv="http://arxiv.org/schemas/atom">10.1234/two</arxiv:doi></entry>'
+      )
+    ],
+    ['a DTD on an otherwise valid response', feed().replace('<feed ', '<!DOCTYPE feed><feed ')],
+    [
+      'excessive XML nesting',
+      feed().replace('</entry>', '<nested>'.repeat(20) + '</nested>'.repeat(20) + '</entry>')
+    ],
+    [
+      'a foreign Atom namespace',
+      feed().replace('http://www.w3.org/2005/Atom', 'https://example.test/atom')
+    ]
+  ])('rejects %s before using metadata', async (_case, xml) => {
+    await expect(
+      new Resolver(vi.fn<typeof fetch>().mockResolvedValue(new Response(xml))).lookup(
+        'arxiv:2401.12345'
+      )
+    ).rejects.toThrow()
+  })
+  it('bounds arXiv response bytes before parsing', async () => {
+    const xml = feed().replace('</feed>', '<!--' + 'x'.repeat(2 * 1024 * 1024) + '--></feed>')
+    await expect(
+      new Resolver(vi.fn<typeof fetch>().mockResolvedValue(new Response(xml))).lookup(
+        'arxiv:2401.12345'
+      )
+    ).rejects.toThrow('Metadata response is too large.')
+  })
+  it('does not accept an identity hidden by a nested closing element', async () => {
+    const xml = feed().replace('2401.12345v2</id>', '2401.12345v2<id/>wrong</id>')
+    await expect(
+      new Resolver(vi.fn<typeof fetch>().mockResolvedValue(new Response(xml))).lookup(
+        'arxiv:2401.12345'
+      )
+    ).rejects.toThrow()
+  })
+  it('preserves the complete title when a nested element reuses the field name', async () => {
+    const xml = feed().replace('A paper &amp; its findings', 'A <title>nested</title> title')
+    const result = await new Resolver(
+      vi.fn<typeof fetch>().mockResolvedValue(new Response(xml))
+    ).lookup('arxiv:2401.12345')
+    expect(result.item.title).toBe('A nested title')
+  })
+  it.each([
+    ['10.1234/PAPER', '10.1234/paper'],
+    ['10.1234/Á', '10.1234/Á'],
+    ['10.1234/á', '10.1234/á'],
+    ['10.1234/foo(bar)', '10.1234/foo(bar)']
+  ])('retains the exact published DOI identity for %s', async (rawDoi, expectedDoi) => {
+    const xml = feed().replace(
+      '</entry>',
+      `<arxiv:doi xmlns:arxiv="http://arxiv.org/schemas/atom">${rawDoi}</arxiv:doi></entry>`
+    )
+    const result = await new Resolver(
+      vi.fn<typeof fetch>().mockResolvedValue(new Response(xml))
+    ).lookup('arxiv:2401.12345')
+    expect(result.item.identifiers).toContainEqual({
+      scheme: 'doi',
+      value: expectedDoi,
+      isPrimary: false
+    })
+  })
+  it('omits a malformed secondary DOI while retaining its provenance', async () => {
+    const xml = feed().replace(
+      '</entry>',
+      '<arxiv:doi xmlns:arxiv="http://arxiv.org/schemas/atom">10.1234/has space</arxiv:doi></entry>'
+    )
+    const result = await new Resolver(
+      vi.fn<typeof fetch>().mockResolvedValue(new Response(xml))
+    ).lookup('arxiv:2401.12345')
+    expect(result.item.identifiers).toEqual([
+      { scheme: 'arxiv', value: '2401.12345', isPrimary: true }
+    ])
+    expect(result.source.rawMetadata).toMatchObject({ 'arxiv:doi': ['10.1234/has space'] })
+  })
+  it('does not fetch malformed identifiers', async () => {
+    const fetchFn = vi.fn<typeof fetch>()
+    await expect(new Resolver(fetchFn).resolve(['arxiv:invalid'])).rejects.toThrow('INVALID_ARXIV')
+    expect(fetchFn).not.toHaveBeenCalled()
+  })
+  it('propagates cancellation and provider errors', async () => {
+    const fetchFn = vi.fn<typeof fetch>().mockResolvedValue(new Response('', { status: 429 }))
+    await expect(new Resolver(fetchFn).lookup('arxiv:2401.12345')).rejects.toThrow()
+    const controller = new AbortController()
+    controller.abort()
+    await expect(
+      new Resolver(fetchFn).lookup('arxiv:2401.12345', controller.signal)
+    ).rejects.toThrow()
+    expect(fetchFn).toHaveBeenCalledTimes(1)
+  })
+  it('shares arXiv admission across resolver instances and spaces request starts by three seconds', async () => {
+    const starts: number[] = []
+    const fetchFn = vi.fn<typeof fetch>(async (url) => {
+      starts.push(performance.now())
+      return new Response(feed(new URL(String(url)).searchParams.get('id_list')!))
+    })
+    await new Resolver(fetchFn).lookup('arxiv:2401.12345')
+    vi.setSystemTime(new Date('2000-01-01T00:00:00Z'))
+    const second = new Resolver(fetchFn).lookup('arxiv:2401.12346')
+    await vi.advanceTimersByTimeAsync(2999)
+    expect(fetchFn).toHaveBeenCalledTimes(1)
+    await vi.advanceTimersByTimeAsync(1)
+    await second
+    expect(starts).toEqual([0, 3000])
+  })
+
+  it('keeps one arXiv connection until the previous response body is consumed', async () => {
+    let body!: ReadableStreamDefaultController<Uint8Array>
+    const firstFetch = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            body = controller
+          }
+        })
+      )
+    )
+    const secondFetch = vi.fn<typeof fetch>().mockResolvedValue(new Response(feed('2401.12346')))
+    const first = new Resolver(firstFetch).lookup('arxiv:2401.12345')
+    await vi.advanceTimersByTimeAsync(0)
+    const second = new Resolver(secondFetch).lookup('arxiv:2401.12346')
+    try {
+      await vi.advanceTimersByTimeAsync(6000)
+      expect(secondFetch).not.toHaveBeenCalled()
+    } finally {
+      body.enqueue(new TextEncoder().encode(feed('2401.12345')))
+      body.close()
+      await first
+      await second
+    }
+    expect(secondFetch).toHaveBeenCalledTimes(1)
+  })
+  it.each([2 * 1024 * 1024, 2 * 1024 * 1024 + 1])(
+    'bounds a chunked arXiv body at exactly 2 MiB: %i bytes',
+    async (bytes) => {
+      const limit = 2 * 1024 * 1024
+      const encoded = new TextEncoder().encode(feed('2401.12345').padEnd(bytes, ' '))
+      let offset = 0
+      const cancel = vi.fn()
+      const body = new ReadableStream<Uint8Array>(
+        {
+          pull(controller) {
+            if (offset === encoded.length) {
+              controller.close()
+              return
+            }
+            const end = Math.min(offset + 64 * 1024, encoded.length)
+            controller.enqueue(encoded.subarray(offset, end))
+            offset = end
+          },
+          cancel
+        },
+        { highWaterMark: 0 }
+      )
+      const fetchFn = vi
+        .fn<typeof fetch>()
+        .mockResolvedValueOnce(new Response(body))
+        .mockResolvedValueOnce(new Response(feed('2401.12346')))
+      const resolver = new Resolver(fetchFn)
+      const first = resolver.lookup('arxiv:2401.12345')
+      if (bytes === limit) {
+        expect((await first).item.title).toBe('A paper & its findings')
+        expect(cancel).not.toHaveBeenCalled()
+        return
+      }
+      await expect(first).rejects.toThrow('Metadata response is too large.')
+      expect(cancel).toHaveBeenCalledOnce()
+      let next: unknown
+      void resolver.lookup('arxiv:2401.12346').then(
+        (result) => {
+          next = { result }
+        },
+        (error) => {
+          next = { error }
+        }
+      )
+      await vi.advanceTimersByTimeAsync(3000)
+      expect(next).toMatchObject({ result: { item: { title: 'A paper & its findings' } } })
+      expect(fetchFn).toHaveBeenCalledTimes(2)
+    }
+  )
+
+  it('releases arXiv admission after cancellation during body consumption', async () => {
+    const reading = vi.fn()
+    const fetchFn = vi
+      .fn<typeof fetch>()
+      .mockImplementationOnce(async (_input, init) => {
+        const body = new ReadableStream<Uint8Array>(
+          {
+            start(controller) {
+              // Model Fetch aborting a body after its headers have already arrived.
+              init!.signal!.addEventListener(
+                'abort',
+                () => controller.error(init!.signal!.reason),
+                { once: true }
+              )
+            },
+            pull: reading
+          },
+          { highWaterMark: 0 }
+        )
+        return new Response(body)
+      })
+      .mockResolvedValueOnce(new Response(feed('2401.12346')))
+    const resolver = new Resolver(fetchFn)
+    const controller = new AbortController()
+    const reason = new Error('Stopped body consumption')
+    const first = resolver.lookup('arxiv:2401.12345', controller.signal).catch((error) => error)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(reading).toHaveBeenCalledOnce()
+    controller.abort(reason)
+    expect(await first).toBe(reason)
+    let next: unknown
+    void resolver.lookup('arxiv:2401.12346').then(
+      (result) => {
+        next = { result }
+      },
+      (error) => {
+        next = { error }
+      }
+    )
+    await vi.advanceTimersByTimeAsync(3000)
+    expect(next).toMatchObject({ result: { item: { title: 'A paper & its findings' } } })
+    expect(fetchFn).toHaveBeenCalledTimes(2)
+  })
+
+  it('continues arXiv admission after a rejected request without retrying it automatically', async () => {
+    const fetchFn = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(new Response('', { status: 429 }))
+      .mockResolvedValueOnce(new Response(feed('2401.12346')))
+    const resolver = new Resolver(fetchFn)
+    await expect(resolver.lookup('arxiv:2401.12345')).rejects.toThrow()
+    let outcome: unknown
+    void resolver.lookup('arxiv:2401.12346').then(
+      (result) => {
+        outcome = { result }
+      },
+      (error: unknown) => {
+        outcome = { error }
+      }
+    )
+    await vi.advanceTimersByTimeAsync(3000)
+    expect(outcome).toMatchObject({ result: { item: { title: 'A paper & its findings' } } })
+    expect(fetchFn).toHaveBeenCalledTimes(2)
+  })
+
+  it('cancels arXiv admission while queued behind a response without consuming another slot', async () => {
+    let body!: ReadableStreamDefaultController<Uint8Array>
+    const starts: number[] = []
+    const fetchFn = vi.fn<typeof fetch>(async (url) => {
+      starts.push(performance.now())
+      if (starts.length === 1)
+        return new Response(
+          new ReadableStream({
+            start(controller) {
+              body = controller
+            }
+          })
+        )
+      return new Response(feed(new URL(String(url)).searchParams.get('id_list')!))
+    })
+    const resolver = new Resolver(fetchFn)
+    const first = resolver.lookup('arxiv:2401.12345')
+    await vi.advanceTimersByTimeAsync(0)
+    const controller = new AbortController()
+    const reason = new Error('Cancelled queued lookup')
+    let cancelled: unknown
+    const second = resolver.lookup('arxiv:2401.12346', controller.signal).catch((error) => {
+      cancelled = error
+    })
+    try {
+      await vi.advanceTimersByTimeAsync(6000)
+      controller.abort(reason)
+      await vi.advanceTimersByTimeAsync(0)
+      expect(cancelled).toBe(reason)
+      expect(fetchFn).toHaveBeenCalledTimes(1)
+    } finally {
+      body.enqueue(new TextEncoder().encode(feed('2401.12345')))
+      body.close()
+      await first
+      await second
+    }
+    const thirdController = new AbortController()
+    const third = resolver.lookup('arxiv:2401.12347', thirdController.signal).catch(() => undefined)
+    try {
+      await vi.advanceTimersByTimeAsync(0)
+      expect(starts).toEqual([0, 6000])
+    } finally {
+      thirdController.abort()
+      await third
+    }
+  })
+
+  it('cancels arXiv admission during its interval wait without sending a request', async () => {
+    const starts: number[] = []
+    const fetchFn = vi.fn<typeof fetch>(async (url) => {
+      starts.push(performance.now())
+      return new Response(feed(new URL(String(url)).searchParams.get('id_list')!))
+    })
+    const resolver = new Resolver(fetchFn)
+    await resolver.lookup('arxiv:2401.12345')
+    const controller = new AbortController()
+    const reason = new Error('Cancelled interval wait')
+    const second = resolver.lookup('arxiv:2401.12346', controller.signal).catch((error) => error)
+    await vi.advanceTimersByTimeAsync(1000)
+    controller.abort(reason)
+    expect(await second).toBe(reason)
+    const third = resolver.lookup('arxiv:2401.12347')
+    await vi.advanceTimersByTimeAsync(2000)
+    await third
+    expect(starts).toEqual([0, 3000])
+  })
+})
+
+it('resolves PMCID by exact identity and retains DOI and PMID', async () => {
+  const fetchFn = vi.fn<typeof fetch>().mockResolvedValue(
+    new Response(
+      JSON.stringify({
+        resultList: {
+          result: [
+            {
+              id: '35486828',
+              source: 'MED',
+              pmcid: 'PMC12345',
+              doi: '10.1234/paper',
+              title: 'PMC paper'
+            }
+          ]
+        }
+      })
+    )
+  )
+  const result = await new LiteratureReferenceResolver(fetchFn).lookup('pmcid:PMC12345')
+  expect(new URL(String(fetchFn.mock.calls[0][0])).searchParams.get('query')).toBe('PMCID:PMC12345')
+  expect(result.item.identifiers).toEqual(
+    expect.arrayContaining([
+      { scheme: 'pmcid', value: 'PMC12345', isPrimary: true },
+      { scheme: 'pmid', value: '35486828', isPrimary: false },
+      { scheme: 'doi', value: '10.1234/paper', isPrimary: false }
+    ])
+  )
+})
+
+it('rejects metadata for a different PMCID', async () => {
+  const fetchFn = vi.fn<typeof fetch>().mockResolvedValue(
+    new Response(
+      JSON.stringify({
+        resultList: {
+          result: [
+            {
+              id: '35486828',
+              source: 'MED',
+              pmcid: 'PMC99999',
+              title: 'Different paper'
+            }
+          ]
+        }
+      })
+    )
+  )
+  await expect(new LiteratureReferenceResolver(fetchFn).lookup('pmcid:PMC12345')).rejects.toThrow()
+})
+
+it.each([undefined, ''])(
+  'does not invent a DOI when Crossref omits its identity: %s',
+  async (doi) => {
+    const fetchFn = vi.fn<typeof fetch>(async (url) =>
+      new URL(String(url)).hostname === 'api.crossref.org'
+        ? Response.json({
+            message: { DOI: doi, title: ['Unverified paper'], abstract: 'Unverified evidence.' }
+          })
+        : Response.json({ resultList: { result: [] } })
+    )
+    await expect(
+      new LiteratureReferenceResolver(fetchFn).lookup('doi:10.1234/requested')
+    ).rejects.toThrow()
+  }
+)
+
+it('uses independently identified fallback metadata after an unidentified Crossref response', async () => {
+  const fetchFn = vi.fn<typeof fetch>(async (url) =>
+    new URL(String(url)).hostname === 'api.crossref.org'
+      ? Response.json({ message: { title: ['Unverified title'], abstract: 'Do not merge this.' } })
+      : Response.json({
+          resultList: {
+            result: [
+              {
+                id: '123',
+                source: 'MED',
+                doi: '10.1234/requested',
+                title: 'Verified title',
+                abstractText: 'Verified evidence.'
+              }
+            ]
+          }
+        })
+  )
+  const result = await new LiteratureReferenceResolver(fetchFn).lookup('doi:10.1234/requested')
+  expect(result.item).toMatchObject({ title: 'Verified title', abstract: 'Verified evidence.' })
+  expect(result.sources.map(({ provider }) => provider)).toEqual(['europe-pmc'])
+})
+
+describe('provider request budgets', () => {
+  let Resolver: typeof LiteratureReferenceResolver
+  beforeEach(async () => {
+    vi.resetModules()
+    vi.useFakeTimers()
+    Resolver = (await import('../src/reference-resolver.js')).LiteratureReferenceResolver
+  })
+  afterEach(() => vi.useRealTimers())
+
+  it('keeps four PubMed starts outside a single second across instances and transports', async () => {
+    const starts: number[] = []
+    const transports = Array.from({ length: 4 }, () =>
+      vi.fn<typeof fetch>(async () => {
+        starts.push(performance.now())
+        return new Response(pubmedResponse)
+      })
+    )
+    await new Resolver(transports[0]).lookup('pmid:35486828')
+    for (let index = 1; index < transports.length; index += 1) {
+      const pending = new Resolver(transports[index]).lookup('pmid:35486828')
+      try {
+        await vi.advanceTimersByTimeAsync(333)
+        expect(starts).toHaveLength(index)
+      } finally {
+        // Complete the admitted call even when the no-delay counterfactual fails.
+        await vi.advanceTimersByTimeAsync(1)
+        await pending
+      }
+    }
+    expect(starts).toEqual([0, 334, 668, 1002])
+  })
+
+  it('cancels PubMed before admission without fetching or reserving a slot', async () => {
+    const starts: number[] = []
+    const fetchFn = vi.fn<typeof fetch>(async () => {
+      starts.push(performance.now())
+      return new Response(pubmedResponse)
+    })
+    const controller = new AbortController()
+    const reason = new Error('Cancelled before admission')
+    const pending = new Resolver(fetchFn)
+      .lookup('pmid:35486828', controller.signal)
+      .catch((error: unknown) => error)
+    controller.abort(reason)
+    expect(await pending).toBe(reason)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(fetchFn).not.toHaveBeenCalled()
+    await new Resolver(fetchFn).lookup('pmid:35486828')
+    expect(starts).toEqual([0])
+  })
+
+  it('keeps PubMed and arXiv budgets independent', async () => {
+    const starts: { host: string; time: number }[] = []
+    const fetchFn = vi.fn<typeof fetch>(async (input) => {
+      const host = new URL(String(input)).hostname
+      starts.push({ host, time: performance.now() })
+      return new Response(
+        host === 'export.arxiv.org'
+          ? '<feed xmlns="http://www.w3.org/2005/Atom"><entry><id>https://arxiv.org/abs/2401.12345</id><title>A preprint</title></entry></feed>'
+          : pubmedResponse
+      )
+    })
+    await new Resolver(fetchFn).lookup('arxiv:2401.12345')
+    let result: unknown
+    const pending = new Resolver(fetchFn).lookup('pmid:35486828').then((value) => {
+      result = value
+    })
+    try {
+      await vi.advanceTimersByTimeAsync(0)
+      expect(result).toMatchObject({ item: { title: 'A PubMed paper.' } })
+      expect(starts).toEqual([
+        { host: 'export.arxiv.org', time: 0 },
+        { host: 'eutils.ncbi.nlm.nih.gov', time: 0 }
+      ])
+    } finally {
+      await vi.advanceTimersByTimeAsync(3000)
+      await pending
+    }
+  })
+})

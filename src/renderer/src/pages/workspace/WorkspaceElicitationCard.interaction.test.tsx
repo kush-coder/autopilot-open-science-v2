@@ -1,0 +1,2284 @@
+// @vitest-environment jsdom
+import { act, useState } from 'react'
+import { i18next } from '../../i18n'
+import { createRoot, type Root } from 'react-dom/client'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+
+import { validateElicitationAnswers } from '../../../../main/acp/elicitation-owner'
+import type { ElicitationField, PendingElicitationRequest } from '../../../../shared/elicitation'
+
+import { WorkspaceElicitationCard, WorkspaceElicitationRecovery } from './WorkspaceElicitationCard'
+
+import {
+  useSessionStore,
+  createInitialSessionState,
+  type ToolActivity
+} from '@/stores/session-store'
+
+;(globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true
+
+let container: HTMLDivElement
+let root: Root
+
+const setTextControlValue = (
+  control: HTMLInputElement | HTMLTextAreaElement,
+  value: string
+): void => {
+  const prototype =
+    control instanceof HTMLTextAreaElement
+      ? HTMLTextAreaElement.prototype
+      : HTMLInputElement.prototype
+  const setter = Object.getOwnPropertyDescriptor(prototype, 'value')?.set
+  setter?.call(control, value)
+  control.dispatchEvent(new Event('input', { bubbles: true }))
+}
+
+const openSkipMenu = async (): Promise<HTMLElement> => {
+  const trigger = container.querySelector<HTMLButtonElement>('[aria-label="More skip options"]')
+  expect(trigger).not.toBeNull()
+  await act(async () => {
+    trigger!.focus()
+    trigger!.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }))
+  })
+  const item = document.querySelector<HTMLElement>('[role="menuitem"]')
+  expect(item).not.toBeNull()
+  return item!
+}
+
+const fields = [
+  {
+    id: 'question_0',
+    label: 'Skill type',
+    kind: 'single-select' as const,
+    options: [
+      {
+        value: 'multi-omics',
+        label: 'Multi-omics integration',
+        description:
+          'Combine transcriptomics, proteomics, and genomics across platforms with differential analysis, enrichment, interaction networks, quality control, and publication-ready visualization.'
+      },
+      { value: 'clinical', label: 'Clinical statistics' },
+      { value: 'screening', label: 'High-throughput screening' },
+      { value: 'single-cell', label: 'Single-cell omics' }
+    ]
+  },
+  {
+    id: 'question_0_custom',
+    label: 'Other',
+    description: 'Type your own answer instead of choosing an option above (optional).',
+    kind: 'text' as const
+  }
+]
+
+const activity: ToolActivity = {
+  id: 'tool-ask-1',
+  kind: 'tool',
+  title: 'AskUserQuestion',
+  status: 'in_progress',
+  eventIds: [],
+  sortIndex: 1,
+  createdAt: 1,
+  updatedAt: 1,
+  elicitation: {
+    message: 'What kind of skill are you trying to create?',
+    fields,
+    state: 'pending'
+  }
+}
+
+const request = {
+  requestId: 'elicitation-1',
+  sessionId: 'session-1',
+  toolCallId: activity.id,
+  message: activity.elicitation?.message ?? '',
+  fields
+}
+
+const multiQuestionFields = [
+  {
+    ...fields[0],
+    label: 'Skill scope',
+    description: 'What should this skill primarily cover?'
+  },
+  fields[1],
+  {
+    id: 'question_1',
+    label: 'Language',
+    description: 'Which language should the skill use?',
+    kind: 'single-select' as const,
+    options: [
+      { value: 'chinese', label: 'Chinese' },
+      { value: 'english', label: 'English' }
+    ]
+  },
+  {
+    id: 'question_1_custom',
+    label: 'Other',
+    kind: 'text' as const
+  }
+]
+
+const multiQuestionRequest = {
+  ...request,
+  fields: multiQuestionFields,
+  message: 'Please answer the following questions.'
+}
+
+const maximumQuestionFields = Array.from({ length: 8 }, (_, index) => [
+  {
+    ...fields[0],
+    id: `question_${index}`,
+    label: `Question ${index + 1}`,
+    description: `Prompt ${index + 1}`
+  },
+  {
+    ...fields[1],
+    id: `question_${index}_custom`
+  }
+]).flat()
+
+const mixedChoiceFields = [
+  { ...multiQuestionFields[0], kind: 'multi-select' as const },
+  ...multiQuestionFields.slice(1)
+]
+
+beforeEach(() => {
+  container = document.createElement('div')
+  document.body.appendChild(container)
+  root = createRoot(container)
+})
+
+afterEach(() => {
+  act(() => root.unmount())
+  container.remove()
+})
+
+describe('WorkspaceElicitationCard choice question', () => {
+  it.each(['answered', 'declined'] as const)(
+    'shows progress for a saved %s decision while its continuation is pending',
+    async (state) => {
+      const durableRequest = {
+        ...request,
+        durable: { kind: 'agent-user-choice' as const, requestId: request.requestId }
+      }
+      await act(async () =>
+        root.render(
+          <WorkspaceElicitationCard
+            elicitation={{
+              ...activity.elicitation!,
+              state,
+              durable: durableRequest.durable,
+              continuationPending: true
+            }}
+            request={durableRequest}
+            onRespond={vi.fn()}
+            embedded
+          />
+        )
+      )
+      expect(
+        container.querySelector('[data-testid="elicitation-continuation-progress"]')
+      ).not.toBeNull()
+      expect(container.textContent).toContain('Resuming session')
+      expect(container.querySelector('form')).toBeNull()
+      expect(container.querySelector('[data-testid="elicitation-recovery"]')).toBeNull()
+      expect(container.querySelector('button')).toBeNull()
+    }
+  )
+
+  it('keeps the transcript answer visible while its continuation is pending', async () => {
+    await act(async () =>
+      root.render(
+        <WorkspaceElicitationCard
+          elicitation={{
+            ...activity.elicitation!,
+            state: 'answered',
+            answers: [{ fieldId: 'question_0', value: 'clinical' }],
+            continuationPending: true
+          }}
+          request={request}
+        />
+      )
+    )
+    expect(container.textContent).toContain('Clinical statistics')
+    expect(container.querySelector('[data-testid="elicitation-continuation-progress"]')).toBeNull()
+  })
+
+  it('uses the whole pending count as an entry and keeps read-only records complete', async () => {
+    const onReveal = vi.fn()
+    const elicitation = {
+      ...activity.elicitation!,
+      fields: multiQuestionFields
+    }
+    await act(async () => {
+      root.render(
+        <WorkspaceElicitationCard
+          elicitation={elicitation}
+          request={multiQuestionRequest}
+          variant="pending-placeholder"
+          onReveal={onReveal}
+        />
+      )
+    })
+    const entry = container.querySelector<HTMLButtonElement>('button')!
+    expect(entry.textContent).toBe('2 questions awaiting your answer')
+    expect(container.querySelector('h3')).toBeNull()
+    expect(container.querySelector('form')).toBeNull()
+    await act(async () => entry.click())
+    expect(onReveal).toHaveBeenCalledOnce()
+
+    await act(async () => {
+      root.render(
+        <WorkspaceElicitationCard
+          elicitation={elicitation}
+          variant="pending-placeholder"
+          readOnly
+        />
+      )
+    })
+    expect(container.textContent).toContain('No submitted answer recorded.')
+    expect(container.textContent).toContain('Which language should the skill use?')
+  })
+
+  it('preserves the current question and unsubmitted input through collapse and inline reveal', async () => {
+    const onRespond = vi.fn().mockResolvedValue(undefined)
+    const Harness = (): React.JSX.Element => {
+      const [collapsed, setCollapsed] = useState(false)
+      const [focusRequestId, setFocusRequestId] = useState(0)
+      return (
+        <>
+          <button
+            onClick={() => {
+              setCollapsed(false)
+              setFocusRequestId((current) => current + 1)
+            }}
+          >
+            Reveal
+          </button>
+          <WorkspaceElicitationCard
+            elicitation={{ ...activity.elicitation!, fields: multiQuestionFields }}
+            request={multiQuestionRequest}
+            embedded
+            collapsed={collapsed}
+            onCollapsedChange={setCollapsed}
+            focusRequestId={focusRequestId}
+            onRespond={onRespond}
+          />
+        </>
+      )
+    }
+    await act(async () => root.render(<Harness />))
+    await act(async () => {
+      container
+        .querySelector<HTMLButtonElement>('[data-testid="elicitation-option-clinical"]')!
+        .click()
+    })
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('[aria-label="Next question"]')!.click()
+    })
+    const textarea = container.querySelector<HTMLTextAreaElement>('textarea')!
+    await act(async () => setTextControlValue(textarea, 'Use English and include examples'))
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('[aria-label="Collapse question panel"]')!.click()
+    })
+    expect(container.querySelector('form')?.hidden).toBe(true)
+    expect(
+      container.querySelector('[data-testid="elicitation-question-title"]')?.getAttribute('hidden')
+    ).toBe('')
+    expect(
+      container.querySelector('[data-testid="elicitation-question-progress"]')?.textContent
+    ).toBe('2 of 2')
+    expect(onRespond).not.toHaveBeenCalled()
+    await act(async () => {
+      Array.from(container.querySelectorAll('button'))
+        .find((button) => button.textContent === 'Reveal')!
+        .click()
+    })
+    expect(container.querySelector('form')?.hidden).toBe(false)
+    expect(container.querySelector('textarea')).toBe(textarea)
+    expect(textarea.value).toBe('Use English and include examples')
+    expect(document.activeElement).toBe(textarea)
+    await act(async () => {
+      Array.from(container.querySelectorAll('button'))
+        .find((button) => button.textContent === 'Finish')!
+        .click()
+    })
+    expect(onRespond).toHaveBeenCalledWith({
+      requestId: request.requestId,
+      action: 'accept',
+      answers: [
+        { fieldId: 'question_0', value: 'clinical' },
+        {
+          fieldId: 'question_1_custom',
+          status: 'answered',
+          value: 'Use English and include examples'
+        }
+      ]
+    })
+  })
+
+  it('keeps an uncommitted durable answer editable after validation rejects it', async () => {
+    const durableRequest = {
+      ...request,
+      durable: { kind: 'agent-user-choice' as const, requestId: request.requestId }
+    }
+    const onRespond = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('Invalid structured input response'))
+      .mockResolvedValue(undefined)
+    await act(async () =>
+      root.render(
+        <WorkspaceElicitationCard
+          elicitation={{ ...activity.elicitation!, durable: durableRequest.durable }}
+          request={durableRequest}
+          onRespond={onRespond}
+          embedded
+        />
+      )
+    )
+    const finish = (): HTMLButtonElement | undefined =>
+      [...container.querySelectorAll('button')].find((button) => button.textContent === 'Finish')
+    await act(async () =>
+      container
+        .querySelector<HTMLButtonElement>('[data-testid="elicitation-option-clinical"]')!
+        .click()
+    )
+    await act(async () => finish()!.click())
+    expect(onRespond).toHaveBeenCalledOnce()
+    expect(container.querySelector('form')).not.toBeNull()
+    expect(container.querySelector('[data-testid="elicitation-recovery"]')).toBeNull()
+    expect(container.querySelector('[role="alert"]')?.textContent).toBe(
+      'Invalid structured input response'
+    )
+    await act(async () =>
+      container
+        .querySelector<HTMLButtonElement>('[data-testid="elicitation-option-screening"]')!
+        .click()
+    )
+    await act(async () => finish()!.click())
+    expect(onRespond).toHaveBeenLastCalledWith({
+      requestId: request.requestId,
+      request: durableRequest,
+      action: 'accept',
+      answers: [{ fieldId: 'question_0', value: 'screening' }]
+    })
+  })
+
+  it('does not infer committed recovery from a rejected Skip error message', async () => {
+    const durableRequest = {
+      ...request,
+      durable: { kind: 'agent-user-choice' as const, requestId: request.requestId }
+    }
+    const onRespond = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('The bound specialist is unavailable.'))
+      .mockResolvedValue(undefined)
+    await act(async () =>
+      root.render(
+        <WorkspaceElicitationCard
+          elicitation={{ ...activity.elicitation!, durable: durableRequest.durable }}
+          request={durableRequest}
+          onRespond={onRespond}
+          embedded
+        />
+      )
+    )
+    await act(async () =>
+      [...container.querySelectorAll('button')]
+        .find((button) => button.textContent === 'Skip')!
+        .click()
+    )
+    expect(container.querySelector('[data-testid="elicitation-recovery"]')).toBeNull()
+    expect(container.querySelector('form')).not.toBeNull()
+    expect(container.querySelector('[role="alert"]')?.textContent).toBe(
+      'The bound specialist is unavailable.'
+    )
+    expect(container.textContent).not.toContain('Retry continuation')
+    await act(async () =>
+      [...container.querySelectorAll('button')]
+        .find((button) => button.textContent === 'Skip')!
+        .click()
+    )
+    expect(onRespond).toHaveBeenLastCalledWith({
+      requestId: request.requestId,
+      request: durableRequest,
+      action: 'accept',
+      answers: [{ fieldId: 'question_0', status: 'skipped' }]
+    })
+  })
+
+  it.each(['answered', 'declined'] as const)(
+    'retries a saved %s decision without reopening its options',
+    async (state) => {
+      const durableRequest = {
+        ...request,
+        durable: { kind: 'agent-user-choice' as const, requestId: request.requestId }
+      }
+      const answers =
+        state === 'answered' ? [{ fieldId: 'question_0', value: 'clinical' }] : undefined
+      const onRespond = vi.fn().mockRejectedValue(new Error('Still unavailable'))
+      await act(async () =>
+        root.render(
+          <WorkspaceElicitationRecovery
+            elicitation={{
+              ...activity.elicitation!,
+              state,
+              answers,
+              continuationRecovery: { error: 'Temporarily unavailable', retryable: true }
+            }}
+            request={durableRequest}
+            onRespond={onRespond}
+          />
+        )
+      )
+      await act(async () =>
+        [...container.querySelectorAll('button')]
+          .find((button) => button.textContent === 'Retry continuation')!
+          .click()
+      )
+      expect(onRespond).toHaveBeenLastCalledWith({
+        requestId: request.requestId,
+        request: durableRequest,
+        action: state === 'answered' ? 'accept' : 'decline',
+        answers,
+        retryContinuation: true
+      })
+      expect(container.querySelector('form')).toBeNull()
+      expect(container.textContent).toContain('Still unavailable')
+      expect(container.textContent).not.toContain('Retry continuation')
+      expect(container.textContent).toContain('End this wait')
+    }
+  )
+
+  it('records a skipped question in the draft and submits it alongside a selected answer', async () => {
+    const onRespond = vi.fn().mockResolvedValue(undefined)
+    const onDraftChange = vi.fn()
+    await act(async () => {
+      root.render(
+        <WorkspaceElicitationCard
+          elicitation={{
+            message: multiQuestionRequest.message,
+            fields: mixedChoiceFields,
+            state: 'pending'
+          }}
+          request={{ ...multiQuestionRequest, fields: mixedChoiceFields }}
+          onRespond={onRespond}
+          onDraftChange={onDraftChange}
+        />
+      )
+    })
+    const button = (name: string): HTMLButtonElement | undefined =>
+      Array.from(container.querySelectorAll('button')).find(
+        (item) => item.textContent?.trim() === name
+      )
+    await act(async () =>
+      container
+        .querySelector<HTMLButtonElement>('[data-testid="elicitation-option-clinical"]')
+        ?.click()
+    )
+    expect(button('Skip')).toBeDefined()
+    expect(button('Skip')?.getAttribute('data-variant')).toBe('secondary')
+    await act(async () => button('Skip')?.click())
+    expect(onRespond).not.toHaveBeenCalled()
+    expect(onDraftChange).toHaveBeenLastCalledWith([{ fieldId: 'question_0', status: 'skipped' }])
+    expect(container.textContent).toContain('Which language should the skill use?')
+    await act(async () =>
+      container
+        .querySelector<HTMLButtonElement>('[data-testid="elicitation-option-chinese"]')
+        ?.click()
+    )
+    await act(async () => button('Finish')?.click())
+    const response = onRespond.mock.calls[0]?.[0]
+    expect(response).toEqual({
+      requestId: request.requestId,
+      action: 'accept',
+      answers: [
+        { fieldId: 'question_0', status: 'skipped' },
+        { fieldId: 'question_1', value: 'chinese' }
+      ]
+    })
+    expect(
+      validateElicitationAnswers(
+        { ...multiQuestionRequest, fields: mixedChoiceFields },
+        response.answers
+      )
+    ).toEqual(response.answers)
+  })
+
+  it('finishes a skipped last question and lets a restored skip be replaced with a choice', async () => {
+    const onRespond = vi.fn().mockResolvedValue(undefined)
+    await act(async () =>
+      root.render(
+        <WorkspaceElicitationCard
+          elicitation={{
+            message: multiQuestionRequest.message,
+            fields: multiQuestionFields,
+            state: 'pending',
+            draftAnswers: [{ fieldId: 'question_0_custom', value: 'User skipped' }]
+          }}
+          request={multiQuestionRequest}
+          onRespond={onRespond}
+        />
+      )
+    )
+    const button = (name: string): HTMLButtonElement | undefined =>
+      Array.from(container.querySelectorAll('button')).find(
+        (item) => item.textContent?.trim() === name
+      )
+    await act(async () => button('Back')?.click())
+    expect(container.querySelector('textarea')?.value).toBe('')
+    expect(container.textContent).toContain('User skipped')
+    await act(async () =>
+      container
+        .querySelector<HTMLButtonElement>('[data-testid="elicitation-option-clinical"]')
+        ?.click()
+    )
+    await act(async () => button('Next')?.click())
+    expect(button('Skip')).toBeDefined()
+    await act(async () => button('Skip')?.click())
+    expect(onRespond).toHaveBeenCalledWith({
+      requestId: request.requestId,
+      action: 'accept',
+      answers: [
+        { fieldId: 'question_0', value: 'clinical' },
+        { fieldId: 'question_1', status: 'skipped' }
+      ]
+    })
+  })
+
+  it.each(['legacy', 'structured'] as const)(
+    'translates %s skipped history without selecting an answer',
+    async (format) => {
+      await act(async () => {
+        await i18next.changeLanguage('zh-Hans')
+      })
+      try {
+        await act(async () =>
+          root.render(
+            <WorkspaceElicitationCard
+              elicitation={{
+                message: request.message,
+                fields,
+                state: 'answered',
+                answers: [
+                  format === 'legacy'
+                    ? { fieldId: 'question_0_custom', value: 'User skipped' }
+                    : { fieldId: 'question_0', status: 'skipped' }
+                ]
+              }}
+            />
+          )
+        )
+        const answer = container.querySelector<HTMLButtonElement>(
+          '[data-testid="elicitation-answer-row"]'
+        )!
+        expect(answer.textContent).toBe('用户跳过')
+        await act(async () => answer.click())
+        expect(container.querySelector('[data-selected="true"]')).toBeNull()
+        expect(container.textContent).not.toContain('User skipped')
+      } finally {
+        await act(async () => {
+          await i18next.changeLanguage('en')
+        })
+      }
+    }
+  )
+
+  it.each(
+    (['answered', 'pending'] as const).flatMap((state) =>
+      [true, false].map((withRequest) => ({ state, withRequest }))
+    )
+  )(
+    'localizes the system answer in $state records with request=$withRequest',
+    async ({ state, withRequest }) => {
+      const answers = [
+        { fieldId: 'question_0_custom', status: 'answered' as const, value: 'Let the agent decide' }
+      ]
+      await act(async () => i18next.changeLanguage('zh-Hans'))
+      try {
+        await act(async () =>
+          root.render(
+            <WorkspaceElicitationCard
+              readOnly
+              request={withRequest ? request : undefined}
+              elicitation={{
+                message: request.message,
+                fields,
+                state,
+                ...(state === 'answered' ? { answers } : { draftAnswers: answers })
+              }}
+            />
+          )
+        )
+        const record = container.querySelector(
+          state === 'answered'
+            ? '[data-testid="elicitation-answer-row"]'
+            : '[data-testid="elicitation-recorded-pending"]'
+        )!
+        expect(record.textContent).toContain('让智能体决定')
+        expect(record.textContent).not.toContain('Let the agent decide')
+        await act(async () => i18next.changeLanguage('en'))
+        expect(record.textContent).toContain('Let the agent decide')
+        expect(answers[0].value).toBe('Let the agent decide')
+      } finally {
+        await act(async () => i18next.changeLanguage('en'))
+      }
+    }
+  )
+
+  it('reviews saved questions and selected options without a pending request', async () => {
+    await act(async () =>
+      root.render(
+        <WorkspaceElicitationCard
+          elicitation={{
+            message: multiQuestionRequest.message,
+            fields: mixedChoiceFields,
+            state: 'answered',
+            answers: [
+              { fieldId: 'question_0', value: ['multi-omics', 'clinical'] },
+              { fieldId: 'question_1', value: 'chinese' }
+            ]
+          }}
+        />
+      )
+    )
+    expect(Array.from(container.querySelectorAll('h3'), (title) => title.textContent)).toEqual([
+      'What should this skill primarily cover?',
+      'Which language should the skill use?'
+    ])
+    expect(
+      Array.from(
+        container.querySelectorAll('[data-testid="choice-kind-chip"]'),
+        (chip) => chip.textContent
+      )
+    ).toEqual(['Multi select', 'Single select'])
+
+    const rows = container.querySelectorAll<HTMLButtonElement>(
+      '[data-testid="elicitation-answer-row"]'
+    )
+    await act(async () => rows[0].click())
+    await act(async () => rows[1].click())
+    expect(container.querySelectorAll('[data-testid="elicitation-choice-review"]')).toHaveLength(2)
+    expect(
+      Array.from(container.querySelectorAll('[data-selected="true"]'), (option) =>
+        option.getAttribute('data-testid')
+      )
+    ).toEqual([
+      'elicitation-option-multi-omics',
+      'elicitation-option-clinical',
+      'elicitation-option-chinese'
+    ])
+    expect(container.querySelector('form')).toBeNull()
+  })
+
+  it('preserves ordinary answer text even when it matches the system answer', async () => {
+    const textFields: ElicitationField[] = [{ id: 'notes', label: 'Notes', kind: 'text' }]
+    await act(async () => i18next.changeLanguage('zh-Hans'))
+    try {
+      await act(async () =>
+        root.render(
+          <WorkspaceElicitationCard
+            request={{ ...request, fields: textFields }}
+            elicitation={{
+              message: request.message,
+              fields: textFields,
+              state: 'answered',
+              answers: [{ fieldId: 'notes', value: 'Let the agent decide' }]
+            }}
+          />
+        )
+      )
+      expect(container.querySelector('[data-testid="elicitation-answer-row"]')?.textContent).toBe(
+        'Let the agent decide'
+      )
+    } finally {
+      await act(async () => i18next.changeLanguage('en'))
+    }
+  })
+
+  it('labels every recorded choice in pending replay without labelling custom text fields', async () => {
+    await act(async () =>
+      root.render(
+        <WorkspaceElicitationCard
+          readOnly
+          request={{ ...multiQuestionRequest, fields: mixedChoiceFields }}
+          elicitation={{
+            message: multiQuestionRequest.message,
+            fields: mixedChoiceFields,
+            state: 'pending'
+          }}
+        />
+      )
+    )
+    const replay = container.querySelector('[data-testid="elicitation-recorded-pending"]')!
+    expect(
+      Array.from(replay.querySelectorAll('[data-testid="choice-kind-chip"]')).map(
+        (chip) => chip.textContent
+      )
+    ).toEqual(['Multi select', 'Single select'])
+  })
+
+  it.each([
+    ['single-select', 'Single select', 'single-cell'],
+    ['multi-select', 'Multi select', ['multi-omics', 'single-cell']]
+  ] as const)(
+    'labels %s from the field kind and submits matching selections',
+    async (kind, label, value) => {
+      const onRespond = vi.fn().mockResolvedValue(undefined)
+      const choiceFields: ElicitationField[] = [{ ...fields[0], kind }, fields[1]]
+      await act(async () =>
+        root.render(
+          <WorkspaceElicitationCard
+            request={{ ...request, fields: choiceFields }}
+            elicitation={{ message: 'Which outputs?', fields: choiceFields, state: 'pending' }}
+            onRespond={onRespond}
+          />
+        )
+      )
+      expect(container.querySelector('[data-testid="choice-kind-chip"]')?.textContent).toBe(label)
+      for (const option of ['multi-omics', 'single-cell']) {
+        await act(async () =>
+          container
+            .querySelector<HTMLButtonElement>(`[data-testid="elicitation-option-${option}"]`)!
+            .click()
+        )
+      }
+      const finish = Array.from(container.querySelectorAll('button')).find(
+        (button) => button.textContent?.trim() === 'Finish'
+      )!
+      await act(async () => finish.click())
+      expect(onRespond).toHaveBeenCalledWith(
+        expect.objectContaining({ answers: [{ fieldId: 'question_0', value }] })
+      )
+    }
+  )
+
+  it('labels each recorded question independently, including custom answers and expanded review', async () => {
+    await act(async () =>
+      root.render(
+        <WorkspaceElicitationCard
+          readOnly
+          request={{ ...multiQuestionRequest, fields: mixedChoiceFields }}
+          elicitation={{
+            message: multiQuestionRequest.message,
+            fields: mixedChoiceFields,
+            state: 'answered',
+            answers: [
+              { fieldId: 'question_0_custom', status: 'answered', value: 'Let the agent decide' },
+              { fieldId: 'question_1', value: 'english' }
+            ]
+          }}
+        />
+      )
+    )
+    const rows = Array.from(
+      container.querySelectorAll<HTMLButtonElement>('[data-testid="elicitation-answer-row"]')
+    )
+    expect(
+      rows.map(
+        (row) => row.parentElement?.querySelector('[data-testid="choice-kind-chip"]')?.textContent
+      )
+    ).toEqual(['Multi select', 'Single select'])
+    expect(container.querySelector('svg.lucide-circle-question-mark')).toBeNull()
+    await act(async () => rows[1].click())
+    const review = container.querySelector(
+      '[data-testid="elicitation-choice-review"]'
+    )!.parentElement!
+    expect(review.querySelector('[data-testid="choice-kind-chip"]')).toBeNull()
+    expect(review.querySelector('h3')).toBeNull()
+    expect(
+      review
+        .querySelector('[data-testid="elicitation-option-english"]')
+        ?.getAttribute('data-selected')
+    ).toBe('true')
+  })
+
+  it.each(['declined', 'cancelled'] as const)(
+    'preserves each question type in %s records',
+    async (state) => {
+      await act(async () =>
+        root.render(
+          <WorkspaceElicitationCard
+            request={{ ...multiQuestionRequest, fields: mixedChoiceFields }}
+            elicitation={{
+              message: multiQuestionRequest.message,
+              fields: mixedChoiceFields,
+              state
+            }}
+          />
+        )
+      )
+      const rows = Array.from(container.querySelectorAll('[data-testid="elicitation-answer-row"]'))
+      expect(
+        rows.map(
+          (row) => row.parentElement?.querySelector('[data-testid="choice-kind-chip"]')?.textContent
+        )
+      ).toEqual(['Multi select', 'Single select'])
+    }
+  )
+
+  it('keeps 16 options in choice mode and submits all checked values in option order', async () => {
+    const onRespond = vi.fn().mockResolvedValue(undefined)
+    const options = Array.from({ length: 16 }, (_, i) => ({
+      value: `option-${i}`,
+      label: `Option ${i + 1}`
+    }))
+    const expandedFields: ElicitationField[] = [
+      { ...fields[0], kind: 'multi-select', options },
+      fields[1]
+    ]
+    const expandedRequest = { ...request, fields: expandedFields }
+    await act(async () =>
+      root.render(
+        <WorkspaceElicitationCard
+          request={expandedRequest}
+          elicitation={{
+            message: request.message,
+            fields: expandedFields,
+            state: 'pending',
+            draftAnswers: [{ fieldId: 'question_0', value: ['option-0'] }]
+          }}
+          onRespond={onRespond}
+        />
+      )
+    )
+    expect(container.querySelectorAll('[data-elicitation-option-row]')).toHaveLength(16)
+    const click = async (value: string): Promise<void> => {
+      await act(async () =>
+        container
+          .querySelector<HTMLButtonElement>(`[data-testid="elicitation-option-${value}"]`)!
+          .click()
+      )
+    }
+    await click('option-15')
+    await click('option-1')
+    await click('option-0')
+    expect(container.textContent).toContain('2 selected')
+    const finish = Array.from(container.querySelectorAll('button')).find(
+      (button) => button.textContent?.trim() === 'Finish'
+    )!
+    await act(async () => finish.click())
+    expect(onRespond).toHaveBeenCalledWith(
+      expect.objectContaining({
+        answers: [{ fieldId: 'question_0', value: ['option-1', 'option-15'] }]
+      })
+    )
+  })
+
+  it('presents a provider-native multi-select question as one step instead of a whole form', async () => {
+    const onRespond = vi.fn().mockResolvedValue(undefined)
+    const mixedRequest = { ...multiQuestionRequest, fields: mixedChoiceFields }
+
+    await act(async () => {
+      root.render(
+        <WorkspaceElicitationCard
+          elicitation={{
+            message: mixedRequest.message,
+            fields: mixedChoiceFields,
+            state: 'pending'
+          }}
+          request={mixedRequest}
+          onRespond={onRespond}
+        />
+      )
+    })
+
+    expect(container.querySelector('[data-testid="elicitation-choice-mode"]')).not.toBeNull()
+    expect(container.querySelector('h3')?.textContent).toBe(
+      'What should this skill primarily cover?'
+    )
+    expect(container.querySelector('[data-testid="choice-kind-chip"]')?.textContent).toBe(
+      'Multi select'
+    )
+    expect(
+      container.querySelector('[data-testid="elicitation-question-progress"]')?.textContent
+    ).toBe('1 of 2')
+    expect(
+      container
+        .querySelector('[data-testid="elicitation-question-progress"]')
+        ?.getAttribute('aria-label')
+    ).toBe('Question 1 of 2')
+    expect(
+      Array.from(
+        container.querySelectorAll('[data-testid="elicitation-question-progress-segment"]')
+      ).map((segment) => segment.getAttribute('data-state'))
+    ).toEqual(['current', 'upcoming'])
+    expect(container.textContent).not.toContain('Which language should the skill use?')
+
+    await act(async () => {
+      container
+        .querySelector<HTMLButtonElement>('[data-testid="elicitation-option-multi-omics"]')
+        ?.click()
+    })
+    expect(container.querySelector('h3')?.textContent).toBe(
+      'What should this skill primarily cover?'
+    )
+
+    const nextButton = Array.from(container.querySelectorAll('button')).find(
+      (button) => button.textContent?.trim() === 'Next'
+    )
+    expect(nextButton?.disabled).toBe(false)
+    expect(nextButton?.querySelector('svg.lucide-chevron-right')).not.toBeNull()
+    await act(async () => nextButton?.click())
+
+    expect(container.querySelector('h3')?.textContent).toBe('Which language should the skill use?')
+    expect(container.querySelector('[data-testid="choice-kind-chip"]')?.textContent).toBe(
+      'Single select'
+    )
+    expect(onRespond).not.toHaveBeenCalled()
+  })
+
+  it('counts each checked option of a multi-select question in the selected tally', async () => {
+    const mixedRequest = { ...multiQuestionRequest, fields: mixedChoiceFields }
+
+    await act(async () => {
+      root.render(
+        <WorkspaceElicitationCard
+          elicitation={{
+            message: mixedRequest.message,
+            fields: mixedChoiceFields,
+            state: 'pending'
+          }}
+          request={mixedRequest}
+        />
+      )
+    })
+
+    expect(container.textContent).toContain('0 selected')
+
+    await act(async () => {
+      container
+        .querySelector<HTMLButtonElement>('[data-testid="elicitation-option-multi-omics"]')
+        ?.click()
+    })
+    expect(container.textContent).toContain('1 selected')
+
+    await act(async () => {
+      container
+        .querySelector<HTMLButtonElement>('[data-testid="elicitation-option-clinical"]')
+        ?.click()
+    })
+    expect(container.textContent).toContain('2 selected')
+
+    await act(async () => {
+      container
+        .querySelector<HTMLButtonElement>('[data-testid="elicitation-option-clinical"]')
+        ?.click()
+    })
+    expect(container.textContent).toContain('1 selected')
+  })
+
+  it('counts only the current question selection in the footer tally', async () => {
+    const onDraftChange = vi.fn()
+
+    await act(async () => {
+      root.render(
+        <WorkspaceElicitationCard
+          elicitation={{
+            message: multiQuestionRequest.message,
+            fields: multiQuestionFields,
+            state: 'pending'
+          }}
+          request={multiQuestionRequest}
+          onDraftChange={onDraftChange}
+        />
+      )
+    })
+
+    expect(container.textContent).toContain('0 selected')
+
+    await act(async () => {
+      container
+        .querySelector<HTMLButtonElement>('[data-testid="elicitation-option-multi-omics"]')
+        ?.click()
+    })
+    expect(container.textContent).toContain('1 selected')
+
+    const next = Array.from(container.querySelectorAll('button')).find(
+      (button) => button.textContent?.trim() === 'Next'
+    )
+    await act(async () => next?.click())
+
+    // The first question's answer must not leak into the second question's tally.
+    expect(container.querySelector('h3')?.textContent).toBe('Which language should the skill use?')
+    expect(container.textContent).toContain('0 selected')
+
+    await act(async () => {
+      container
+        .querySelector<HTMLButtonElement>('[data-testid="elicitation-option-chinese"]')
+        ?.click()
+    })
+    expect(container.textContent).toContain('1 selected')
+  })
+
+  it('presents multiple choice questions one at a time and finishes only after the last answer', async () => {
+    const onRespond = vi.fn().mockResolvedValue(undefined)
+    const onDraftChange = vi.fn()
+
+    await act(async () => {
+      root.render(
+        <WorkspaceElicitationCard
+          elicitation={{
+            message: multiQuestionRequest.message,
+            fields: multiQuestionFields,
+            state: 'pending'
+          }}
+          request={multiQuestionRequest}
+          onRespond={onRespond}
+          onDraftChange={onDraftChange}
+        />
+      )
+    })
+
+    expect(container.querySelector('h3')?.textContent).toBe(
+      'What should this skill primarily cover?'
+    )
+    expect(
+      container.querySelector('[data-testid="elicitation-question-progress"]')?.textContent
+    ).toBe('1 of 2')
+    expect(container.textContent).not.toContain('Which language should the skill use?')
+
+    await act(async () => {
+      container
+        .querySelector<HTMLButtonElement>('[data-testid="elicitation-option-multi-omics"]')
+        ?.click()
+    })
+
+    expect(onRespond).not.toHaveBeenCalled()
+    expect(onDraftChange).not.toHaveBeenCalled()
+    expect(container.querySelector('h3')?.textContent).toBe(
+      'What should this skill primarily cover?'
+    )
+
+    const advance = Array.from(container.querySelectorAll('button')).find(
+      (button) => button.textContent?.trim() === 'Next'
+    )
+    expect(advance?.disabled).toBe(false)
+    expect(advance?.querySelector('svg.lucide-chevron-right')).not.toBeNull()
+    await act(async () => advance?.click())
+
+    expect(onDraftChange).toHaveBeenCalledOnce()
+    expect(onDraftChange).toHaveBeenLastCalledWith([
+      { fieldId: 'question_0', value: 'multi-omics' }
+    ])
+    expect(container.querySelector('h3')?.textContent).toBe('Which language should the skill use?')
+    expect(
+      container.querySelector('[data-testid="elicitation-question-progress"]')?.textContent
+    ).toBe('2 of 2')
+    expect(
+      container
+        .querySelector('[data-testid="elicitation-question-progress"]')
+        ?.getAttribute('aria-label')
+    ).toBe('Question 2 of 2')
+    expect(
+      Array.from(
+        container.querySelectorAll('[data-testid="elicitation-question-progress-segment"]')
+      ).map((segment) => segment.getAttribute('data-state'))
+    ).toEqual(['done', 'current'])
+    expect(container.textContent).not.toContain('Finish')
+
+    await act(async () => {
+      container
+        .querySelector<HTMLButtonElement>('[data-testid="elicitation-option-chinese"]')
+        ?.click()
+    })
+
+    expect(onRespond).not.toHaveBeenCalled()
+    expect(onDraftChange).toHaveBeenCalledOnce()
+    expect(onDraftChange).toHaveBeenLastCalledWith([
+      { fieldId: 'question_0', value: 'multi-omics' }
+    ])
+    const finish = Array.from(container.querySelectorAll('button')).find(
+      (button) => button.textContent?.trim() === 'Finish'
+    )
+    expect(finish?.disabled).toBe(false)
+
+    const back = container.querySelector<HTMLButtonElement>('[aria-label="Previous question"]')
+    expect(back?.textContent).toContain('Back')
+    expect(back?.querySelector('svg.lucide-chevron-left')).not.toBeNull()
+    expect(back?.parentElement).toBe(finish?.parentElement)
+    await act(async () => {
+      back?.click()
+    })
+    expect(
+      container.querySelector('[data-testid="elicitation-question-progress"]')?.textContent
+    ).toBe('1 of 2')
+    expect(
+      container
+        .querySelector('[data-testid="elicitation-option-multi-omics"]')
+        ?.getAttribute('data-selected')
+    ).toBe('true')
+
+    const next = Array.from(container.querySelectorAll('button')).find(
+      (button) => button.textContent?.trim() === 'Next'
+    )
+    expect(next?.querySelector('svg.lucide-chevron-right')).not.toBeNull()
+    await act(async () => next?.click())
+    expect(onDraftChange).toHaveBeenCalledTimes(2)
+    expect(onDraftChange).toHaveBeenLastCalledWith([
+      { fieldId: 'question_0', value: 'multi-omics' }
+    ])
+    expect(
+      container.querySelector('[data-testid="elicitation-question-progress"]')?.textContent
+    ).toBe('2 of 2')
+
+    const restoredFinish = Array.from(container.querySelectorAll('button')).find(
+      (button) => button.textContent?.trim() === 'Finish'
+    )
+    await act(async () => restoredFinish?.click())
+
+    expect(onRespond).toHaveBeenCalledWith({
+      requestId: request.requestId,
+      action: 'accept',
+      answers: [
+        { fieldId: 'question_0', value: 'multi-omics' },
+        { fieldId: 'question_1', value: 'chinese' }
+      ]
+    })
+  })
+
+  it('keeps progress segments width-bounded at the maximum accepted question count', async () => {
+    await act(async () => {
+      root.render(
+        <WorkspaceElicitationCard
+          elicitation={{
+            message: multiQuestionRequest.message,
+            fields: maximumQuestionFields,
+            state: 'pending'
+          }}
+          request={{ ...multiQuestionRequest, fields: maximumQuestionFields }}
+        />
+      )
+    })
+
+    const segments = Array.from(
+      container.querySelectorAll('[data-testid="elicitation-question-progress-segment"]')
+    )
+    expect(segments).toHaveLength(8)
+    expect(segments[0]?.parentElement?.classList.contains('sm:w-16')).toBe(true)
+    expect(segments.every((segment) => segment.classList.contains('flex-1'))).toBe(true)
+    expect(
+      container.querySelector('[data-testid="elicitation-question-progress"]')?.textContent
+    ).toBe('1 of 8')
+  })
+
+  it('resumes a pending multi-question choice at the first unanswered step', async () => {
+    await act(async () => {
+      root.render(
+        <WorkspaceElicitationCard
+          elicitation={{
+            message: multiQuestionRequest.message,
+            fields: multiQuestionFields,
+            state: 'pending',
+            draftAnswers: [{ fieldId: 'question_0', value: 'clinical' }]
+          }}
+          request={multiQuestionRequest}
+        />
+      )
+    })
+
+    expect(container.querySelector('h3')?.textContent).toBe('Which language should the skill use?')
+    expect(
+      container.querySelector('[data-testid="elicitation-question-progress"]')?.textContent
+    ).toBe('2 of 2')
+    // The tally reflects the question on screen, not the restored draft of the previous one.
+    expect(container.textContent).toContain('0 selected')
+  })
+
+  it('expands each answered question accordion-style to reveal its original content', async () => {
+    const onRespond = vi.fn().mockResolvedValue(undefined)
+    const durableRequest = {
+      ...multiQuestionRequest,
+      durable: {
+        kind: 'agent-user-choice' as const,
+        requestId: multiQuestionRequest.requestId,
+        promptMessageId: 'prompt-1'
+      }
+    }
+
+    await act(async () => {
+      root.render(
+        <WorkspaceElicitationCard
+          elicitation={{
+            message: multiQuestionRequest.message,
+            fields: multiQuestionFields,
+            state: 'answered',
+            durable: durableRequest.durable,
+            answers: [
+              { fieldId: 'question_0', value: 'multi-omics' },
+              { fieldId: 'question_1', value: 'chinese' }
+            ]
+          }}
+          request={durableRequest}
+          onRespond={onRespond}
+        />
+      )
+    })
+
+    const rows = Array.from(
+      container.querySelectorAll<HTMLButtonElement>('[data-testid="elicitation-answer-row"]')
+    )
+    expect(rows).toHaveLength(2)
+    expect(container.querySelectorAll('[data-testid="elicitation-question-record"]')).toHaveLength(
+      2
+    )
+    expect(rows[0]?.querySelector('h3')).toBeNull()
+    expect(rows[0]?.textContent).not.toContain('What should this skill primarily cover?')
+    expect(rows[0]?.getAttribute('aria-expanded')).toBe('false')
+    expect(rows[1]?.getAttribute('aria-expanded')).toBe('false')
+    expect(container.querySelector('[data-testid="elicitation-choice-review"]')).toBeNull()
+
+    // Expanding the first question reveals only its own original content in place.
+    await act(async () => rows[0]?.click())
+    expect(rows[0]?.getAttribute('aria-expanded')).toBe('true')
+    expect(container.querySelectorAll('[data-testid="elicitation-choice-review"]')).toHaveLength(1)
+    // The expanded content sits on a translucent white panel — a different material from the
+    // gray summary rows so the two read apart at a glance.
+    const reviewWrap = container.querySelector(
+      '[data-testid="elicitation-choice-review"]'
+    )?.parentElement
+    expect(reviewWrap?.className).toContain('bg-bg-000/60')
+    expect(reviewWrap?.className).toContain('rounded-')
+    expect(reviewWrap?.className).not.toContain('border-l-2')
+    // Expanded rows match the compact scale of the summary list rows above — no separators.
+    const expandedOption = container.querySelector('[data-testid="elicitation-option-multi-omics"]')
+    const expandedBadge = expandedOption?.querySelector('span')
+    expect(expandedBadge?.className).toContain('size-5')
+    expect(expandedOption?.classList.contains('border-b')).toBe(false)
+    expect(expandedOption?.getAttribute('data-selected')).toBe('true')
+    // The second question stays a collapsed list row — its options are not rendered.
+    expect(container.querySelector('[data-testid="elicitation-option-chinese"]')).toBeNull()
+    expect(container.textContent).toContain('What should this skill primarily cover?')
+    expect(container.textContent).toContain('Which language should the skill use?')
+    // The custom-input row only appears when the recorded answer was a custom input.
+    expect(container.querySelector('[data-testid="elicitation-custom-answer-review"]')).toBeNull()
+    expect(container.querySelector('textarea')).toBeNull()
+    expect(container.textContent).not.toContain('Skip')
+    expect(container.textContent).not.toContain('Submit')
+    expect(onRespond).not.toHaveBeenCalled()
+
+    // Expanding the second question stacks below the first, accordion-style.
+    await act(async () => rows[1]?.click())
+    expect(rows[1]?.getAttribute('aria-expanded')).toBe('true')
+    expect(container.querySelectorAll('[data-testid="elicitation-choice-review"]')).toHaveLength(2)
+    expect(
+      Array.from(container.querySelectorAll('h3')).map((heading) => heading.textContent)
+    ).toEqual(['What should this skill primarily cover?', 'Which language should the skill use?'])
+    expect(container.querySelector('[data-testid="elicitation-choice-review"] h3')).toBeNull()
+    expect(container.textContent).toContain('Which language should the skill use?')
+    expect(
+      container
+        .querySelector('[data-testid="elicitation-option-chinese"]')
+        ?.getAttribute('data-selected')
+    ).toBe('true')
+
+    // Collapsing the first question leaves the second one open.
+    await act(async () => rows[0]?.click())
+    expect(rows[0]?.getAttribute('aria-expanded')).toBe('false')
+    expect(container.querySelectorAll('[data-testid="elicitation-choice-review"]')).toHaveLength(1)
+    expect(container.querySelector('[data-testid="elicitation-option-multi-omics"]')).toBeNull()
+    expect(container.querySelector('[data-testid="elicitation-option-chinese"]')).not.toBeNull()
+    expect(onRespond).not.toHaveBeenCalled()
+  })
+
+  it('styles skipped choice cards like the summary and expands each question for review', async () => {
+    await act(async () => {
+      root.render(
+        <WorkspaceElicitationCard
+          elicitation={{
+            message: multiQuestionRequest.message,
+            fields: multiQuestionFields,
+            state: 'declined'
+          }}
+          request={multiQuestionRequest}
+        />
+      )
+    })
+
+    const card = container.querySelector('[data-testid="elicitation-card"]')
+    expect(card?.className).toContain('bg-bg-200')
+    expect(card?.className).not.toContain('border-border-200')
+
+    const summary = container.querySelector('[data-testid="elicitation-answer-summary"]')
+    expect(summary?.querySelector('[data-testid="choice-kind-chip"]')?.textContent).toBe(
+      'Single select'
+    )
+    expect(summary?.textContent).toContain('What should this skill primarily cover?')
+    expect(summary?.textContent).not.toContain('2 questions')
+    expect(
+      Array.from(summary!.querySelectorAll('h3')).map((heading) => heading.textContent)
+    ).toEqual(['What should this skill primarily cover?', 'Which language should the skill use?'])
+    expect(summary?.querySelectorAll('h3')).toHaveLength(2)
+
+    const rows = Array.from(
+      container.querySelectorAll<HTMLButtonElement>('[data-testid="elicitation-answer-row"]')
+    )
+    expect(rows).toHaveLength(2)
+    expect(container.querySelectorAll('[data-testid="elicitation-question-record"]')).toHaveLength(
+      2
+    )
+    expect(rows[0]?.querySelector('h3')).toBeNull()
+    expect(rows[0]?.textContent).not.toContain('What should this skill primarily cover?')
+    expect(rows[0]?.getAttribute('aria-expanded')).toBe('false')
+    expect(rows[0]?.textContent).not.toContain('Skill scope')
+    expect(container.querySelector('[data-testid="elicitation-choice-review"]')).toBeNull()
+
+    // Clicking a row reveals that question's original content with nothing selected.
+    await act(async () => rows[0]?.click())
+    expect(rows[0]?.getAttribute('aria-expanded')).toBe('true')
+    expect(container.querySelector('[data-testid="elicitation-choice-review"]')).not.toBeNull()
+    expect(
+      container
+        .querySelector('[data-testid="elicitation-option-multi-omics"]')
+        ?.getAttribute('data-selected')
+    ).toBe('false')
+    expect(container.querySelector('[data-testid="elicitation-custom-answer-review"]')).toBeNull()
+
+    await act(async () => rows[0]?.click())
+    expect(container.querySelector('[data-testid="elicitation-choice-review"]')).toBeNull()
+  })
+
+  it.each(['all', 'current'] as const)(
+    'disables both skip buttons while submitting %s after opening the menu',
+    async (action) => {
+      let finish!: () => void
+      const onRespond = vi.fn(
+        () =>
+          new Promise<void>((resolve) => {
+            finish = resolve
+          })
+      )
+      await act(async () =>
+        root.render(
+          <WorkspaceElicitationCard
+            elicitation={{
+              message: request.message,
+              fields,
+              state: 'pending'
+            }}
+            request={request}
+            onRespond={onRespond}
+          />
+        )
+      )
+      const skip = Array.from(container.querySelectorAll('button')).find(
+        (button) => button.textContent?.trim() === 'Skip'
+      )!
+      expect(skip.getAttribute('data-variant')).toBe('secondary')
+      expect(document.querySelector('[role="menuitem"]')).toBeNull()
+      expect(container.textContent).not.toContain('Skip all')
+      const skipAll = await openSkipMenu()
+      expect(onRespond).not.toHaveBeenCalled()
+      expect(skipAll.textContent).toBe('Skip all')
+      expect(skipAll.className).toContain('status-warning')
+      await act(async () => (action === 'all' ? skipAll.click() : skip.click()))
+      expect(onRespond).toHaveBeenCalledExactlyOnceWith({
+        requestId: request.requestId,
+        ...(action === 'all'
+          ? { action: 'decline' }
+          : { action: 'accept', answers: [{ fieldId: 'question_0', status: 'skipped' }] })
+      })
+      expect(skip.disabled).toBe(true)
+      expect(
+        container.querySelector<HTMLButtonElement>('[aria-label="More skip options"]')?.disabled
+      ).toBe(true)
+      await act(async () => finish())
+      expect(skip.disabled).toBe(false)
+      expect(
+        container.querySelector<HTMLButtonElement>('[aria-label="More skip options"]')?.disabled
+      ).toBe(false)
+    }
+  )
+
+  it('renders the answered summary as a compact checklist with a question-type chip', async () => {
+    const mixedRequest = { ...multiQuestionRequest, fields: mixedChoiceFields }
+
+    await act(async () => {
+      root.render(
+        <WorkspaceElicitationCard
+          elicitation={{
+            message: mixedRequest.message,
+            fields: mixedChoiceFields,
+            state: 'answered',
+            answers: [
+              { fieldId: 'question_0', value: ['multi-omics', 'clinical'] },
+              { fieldId: 'question_1', value: 'chinese' }
+            ]
+          }}
+          request={mixedRequest}
+        />
+      )
+    })
+
+    const card = container.querySelector('[data-testid="elicitation-card"]')
+    expect(card?.className).toContain('bg-bg-200')
+    expect(card?.className).not.toContain('border-border-200')
+
+    // Each independent question has one persistent title and its own type.
+    const summary = container.querySelector('[data-testid="elicitation-answer-summary"]')
+    expect(summary?.querySelector('[data-testid="choice-kind-chip"]')?.textContent).toBe(
+      'Multi select'
+    )
+    expect(summary?.textContent).toContain('What should this skill primarily cover?')
+    expect(summary?.textContent).not.toContain('2 questions')
+    expect(
+      Array.from(summary!.querySelectorAll('h3')).map((heading) => heading.textContent)
+    ).toEqual(['What should this skill primarily cover?', 'Which language should the skill use?'])
+    expect(summary?.textContent).not.toContain('Please answer the following questions.')
+    // No separator lines between summary rows.
+    expect(summary?.children[0]?.className).not.toContain('divide-y')
+
+    const rows = Array.from(container.querySelectorAll('[data-testid="elicitation-answer-row"]'))
+    expect(rows).toHaveLength(2)
+    expect(rows[0]?.querySelector('svg.lucide-chevron-down')).not.toBeNull()
+    expect(rows[0]?.querySelector('svg.lucide-check')).not.toBeNull()
+    expect(rows[0]?.textContent).not.toContain('Skill scope')
+    expect(rows[0]?.textContent).toContain('Multi-omics integration, Clinical statistics')
+    expect(rows[1]?.textContent).toContain('Chinese')
+  })
+
+  it('keeps answered free-text answers as plain text on the summary', async () => {
+    await act(async () => {
+      root.render(
+        <WorkspaceElicitationCard
+          elicitation={{
+            message: activity.elicitation?.message ?? '',
+            fields,
+            state: 'answered',
+            answers: [
+              {
+                fieldId: 'question_0_custom',
+                status: 'answered',
+                value: 'A literature review skill'
+              }
+            ]
+          }}
+          request={request}
+        />
+      )
+    })
+
+    expect(container.querySelector('[data-testid="elicitation-answer-row"]')).not.toBeNull()
+    expect(
+      container.querySelector('[data-testid="elicitation-answer-summary"]')?.textContent
+    ).toContain('A literature review skill')
+  })
+
+  it('labels custom and agent-decide answer rows with the question label instead of Other', async () => {
+    await act(async () => {
+      root.render(
+        <WorkspaceElicitationCard
+          elicitation={{
+            message: multiQuestionRequest.message,
+            fields: multiQuestionFields,
+            state: 'answered',
+            answers: [
+              { fieldId: 'question_0_custom', value: 'Use our private sources' },
+              { fieldId: 'question_1_custom', value: 'Let the agent decide' }
+            ]
+          }}
+          request={multiQuestionRequest}
+        />
+      )
+    })
+
+    const rows = Array.from(container.querySelectorAll('[data-testid="elicitation-answer-row"]'))
+    expect(rows).toHaveLength(2)
+    // Custom answers stay under their owning question, never a generic Other heading.
+    expect(rows[0]?.textContent).not.toContain('Skill scope')
+    expect(rows[0]?.textContent).not.toContain('Other')
+    expect(rows[0]?.textContent).toContain('Use our private sources')
+    expect(rows[0]?.parentElement?.querySelector('h3')?.textContent).toBe(
+      'What should this skill primarily cover?'
+    )
+    expect(rows[1]?.parentElement?.querySelector('h3')?.textContent).toBe(
+      'Which language should the skill use?'
+    )
+    expect(rows[1]?.textContent).not.toContain('Other')
+  })
+
+  it('marks a preset choice as selected before enabling Finish', async () => {
+    const onRespond = vi.fn().mockResolvedValue(undefined)
+
+    await act(async () => {
+      root.render(
+        <WorkspaceElicitationCard
+          elicitation={activity.elicitation!}
+          request={request}
+          onRespond={onRespond}
+        />
+      )
+    })
+
+    const firstChoice = container.querySelector<HTMLButtonElement>(
+      '[data-testid="elicitation-option-multi-omics"]'
+    )
+    expect(firstChoice?.className).toContain('hover:bg-bg-200')
+    expect(firstChoice?.className).toContain('cursor-pointer')
+    expect(firstChoice?.getAttribute('aria-pressed')).toBe('false')
+    expect(container.textContent).not.toContain('Finish')
+
+    await act(async () => firstChoice?.click())
+
+    expect(firstChoice?.getAttribute('aria-pressed')).toBe('true')
+    expect(firstChoice?.getAttribute('data-selected')).toBe('true')
+    expect(firstChoice?.className).toContain('bg-bg-200')
+    expect(firstChoice?.querySelector('svg.lucide-check')).not.toBeNull()
+    expect(onRespond).not.toHaveBeenCalled()
+
+    const finish = Array.from(container.querySelectorAll('button')).find(
+      (button) => button.textContent?.trim() === 'Finish'
+    )
+    expect(finish).toBeDefined()
+    await act(async () => finish?.click())
+
+    expect(onRespond).toHaveBeenCalledWith({
+      requestId: request.requestId,
+      action: 'accept',
+      answers: [{ fieldId: 'question_0', value: 'multi-omics' }]
+    })
+  })
+
+  it('renders a compact decision list without truncating option details', async () => {
+    const onRespond = vi.fn().mockResolvedValue(undefined)
+
+    await act(async () => {
+      root.render(
+        <WorkspaceElicitationCard
+          elicitation={activity.elicitation!}
+          request={request}
+          onRespond={onRespond}
+        />
+      )
+    })
+
+    expect(container.querySelector('[data-testid="elicitation-choice-mode"]')).not.toBeNull()
+    const card = container.querySelector('[data-testid="elicitation-card"]')
+    expect(card?.className).toContain('shadow-sm')
+    expect(card?.className).not.toContain('shadow-card-opaque')
+    expect(card?.className).toContain('border-border-200')
+    expect(card?.className).toContain('p-3')
+    expect(card?.className).toContain('sm:p-4')
+    expect(card?.querySelector('h3')?.className).toContain('min-w-0')
+    expect(container.querySelector('textarea[aria-label="Type your own answer"]')).not.toBeNull()
+    const longDescription = container.querySelector(
+      '[data-testid="elicitation-option-description"]'
+    )
+    expect(container.querySelector('h3')?.className).toContain('break-words')
+    expect(longDescription?.className).toContain('whitespace-pre-wrap')
+    expect(longDescription?.className).not.toContain('line-clamp-2')
+    expect(container.textContent).not.toContain('Continue')
+
+    const firstChoice = container.querySelector<HTMLButtonElement>(
+      '[data-testid="elicitation-option-multi-omics"]'
+    )
+    expect(firstChoice).not.toBeNull()
+    expect(firstChoice?.className).toContain('focus-visible:ring-2')
+    // Compact option rows: size-6 badges, 13px text, tight padding.
+    expect(firstChoice?.className).toContain('py-1.5')
+    expect(firstChoice?.className).not.toContain('py-3')
+    expect(firstChoice?.querySelector('span')?.className).toContain('size-6')
+    expect(firstChoice?.textContent).toContain('Multi-omics integration')
+    const optionLabel = firstChoice?.querySelectorAll('span')[1]?.firstElementChild
+    expect(optionLabel?.className).toContain('text-[13px]')
+    await act(async () => firstChoice?.click())
+
+    expect(firstChoice?.getAttribute('data-selected')).toBe('true')
+    expect(onRespond).not.toHaveBeenCalled()
+  })
+
+  it('renders choice options as rounded items instead of square-edged separators', async () => {
+    await act(async () => {
+      root.render(
+        <WorkspaceElicitationCard elicitation={activity.elicitation!} request={request} />
+      )
+    })
+
+    const options = Array.from(
+      container.querySelectorAll<HTMLButtonElement>('[data-elicitation-option-row="true"]')
+    )
+    expect(options.length).toBeGreaterThan(0)
+    for (const option of options) {
+      expect(option.className).toContain('rounded-xl')
+      expect(option.classList.contains('border')).toBe(false)
+      expect(option.classList.contains('border-b')).toBe(false)
+      // Unselected options sit directly on the card; only the badge marks them.
+      expect(option.className).toContain('bg-bg-000')
+      // Hover swaps the background instead of raising a shadow.
+      expect(option.className).toContain('hover:bg-bg-200')
+      expect(option.className).not.toContain('hover:shadow-card')
+    }
+    // The "Let the agent decide" row is an option too and must share the rounded look.
+    const agentDecides = Array.from(
+      container.querySelectorAll<HTMLButtonElement>('button[aria-pressed]')
+    ).find((button) => !button.hasAttribute('data-elicitation-option-row'))
+    expect(agentDecides?.className).toContain('rounded-xl')
+    expect(agentDecides?.classList.contains('border')).toBe(false)
+    expect(agentDecides?.className).toContain('bg-bg-000')
+    expect(agentDecides?.className).toContain('hover:bg-bg-200')
+    expect(agentDecides?.className).not.toContain('hover:shadow-card')
+
+    await act(async () => options[0]?.click())
+    // Selected items carry only the brand tint — no outline; hover deepens the tint.
+    expect(options[0]?.className).toContain('bg-primary/10')
+    expect(options[0]?.className).toContain('hover:bg-primary/15')
+    expect(options[0]?.classList.contains('border')).toBe(false)
+    expect(options[0]?.className).not.toContain('bg-bg-000')
+  })
+
+  it('lets the bottom composer own the single card shadow', async () => {
+    await act(async () => {
+      root.render(
+        <WorkspaceElicitationCard elicitation={activity.elicitation!} request={request} embedded />
+      )
+    })
+
+    expect(container.querySelector('[data-testid="elicitation-card"]')?.className).not.toContain(
+      'shadow-sm'
+    )
+  })
+
+  it('accepts a compact custom answer or lets the agent decide', async () => {
+    const onRespond = vi.fn().mockResolvedValue(undefined)
+
+    await act(async () => {
+      root.render(
+        <WorkspaceElicitationCard
+          elicitation={activity.elicitation!}
+          request={request}
+          onRespond={onRespond}
+        />
+      )
+    })
+
+    const customInput = container.querySelector<HTMLTextAreaElement>(
+      '[aria-label="Type your own answer"]'
+    )
+    expect(customInput).not.toBeNull()
+    if (customInput) {
+      Object.defineProperty(customInput, 'scrollHeight', { configurable: true, value: 96 })
+    }
+    await act(async () => {
+      if (!customInput) return
+      setTextControlValue(customInput, 'A literature review skill')
+    })
+    expect(customInput?.style.height).toBe('96px')
+    expect(customInput?.className).toContain('focus-visible:ring-0')
+    // Tighter gap between the input text and its underline.
+    expect(customInput?.className).toContain('pb-0.5')
+    expect(customInput?.className).not.toContain('py-1.5')
+    // The 36px min-height padded the gap below a single line — keep the box snug.
+    expect(customInput?.className).toContain('min-h-7')
+    expect(customInput?.closest('div')?.className).toContain('items-start')
+    expect(customInput?.closest('div')?.className).toContain('gap-2')
+    expect(customInput?.closest('div')?.firstElementChild?.className).toContain('mt-0.5')
+    expect(container.querySelector('svg.lucide-bot')).not.toBeNull()
+    const finishCustomAnswer = Array.from(
+      customInput?.closest('form')?.querySelectorAll('button') ?? []
+    ).find((button) => button.textContent?.trim() === 'Finish')
+    expect(finishCustomAnswer).toBeDefined()
+    await act(async () => finishCustomAnswer?.click())
+
+    expect(onRespond).toHaveBeenCalledWith({
+      requestId: request.requestId,
+      action: 'accept',
+      answers: [
+        { fieldId: 'question_0_custom', status: 'answered', value: 'A literature review skill' }
+      ]
+    })
+
+    onRespond.mockClear()
+    const agentDecides = Array.from(container.querySelectorAll('button')).find(
+      (button) => button.textContent?.trim() === 'Let the agent decide'
+    )
+    expect(agentDecides?.className).toContain('hover:bg-bg-200')
+    expect(agentDecides?.className).toContain('cursor-pointer')
+    // Single-line row: icon and label center-aligned, not top-aligned.
+    expect(agentDecides?.className).toContain('items-center')
+    expect(agentDecides?.firstElementChild?.className).not.toContain('mt-px')
+    // The label column stretches like the option rows' flex-1 content column.
+    expect(agentDecides?.lastElementChild?.className).toContain('flex-1')
+    await act(async () => agentDecides?.click())
+    expect(agentDecides?.getAttribute('aria-pressed')).toBe('true')
+    expect(customInput?.value).toBe('')
+    expect(onRespond).not.toHaveBeenCalled()
+    const finishAgentDecision = Array.from(container.querySelectorAll('button')).find(
+      (button) => button.textContent?.trim() === 'Finish'
+    )
+    await act(async () => finishAgentDecision?.click())
+    expect(onRespond).toHaveBeenCalledWith({
+      requestId: request.requestId,
+      action: 'accept',
+      answers: [{ fieldId: 'question_0_custom', status: 'answered', value: 'Let the agent decide' }]
+    })
+
+    onRespond.mockClear()
+    const skip = await openSkipMenu()
+    await act(async () => skip?.click())
+    expect(onRespond).toHaveBeenCalledWith({
+      requestId: request.requestId,
+      action: 'decline'
+    })
+  })
+
+  it('retains the compact choice UI when submitting fails', async () => {
+    const onRespond = vi.fn().mockRejectedValue(new Error('Bridge unavailable'))
+
+    await act(async () => {
+      root.render(
+        <WorkspaceElicitationCard
+          elicitation={activity.elicitation!}
+          request={request}
+          onRespond={onRespond}
+        />
+      )
+    })
+
+    const firstChoice = container.querySelector<HTMLButtonElement>(
+      '[data-testid="elicitation-option-multi-omics"]'
+    )
+    await act(async () => firstChoice?.click())
+    const finish = Array.from(container.querySelectorAll('button')).find(
+      (button) => button.textContent?.trim() === 'Finish'
+    )
+    await act(async () => finish?.click())
+
+    expect(container.querySelector('[data-testid="elicitation-choice-mode"]')).not.toBeNull()
+    expect(container.querySelector('[role="alert"]')?.textContent).toBe('Bridge unavailable')
+  })
+
+  it('opens an answered choice as a read-only review', async () => {
+    const onRespond = vi.fn().mockResolvedValue(undefined)
+    const durableRequest = {
+      ...request,
+      durable: {
+        kind: 'agent-user-choice' as const,
+        requestId: request.requestId,
+        promptMessageId: 'prompt-1'
+      }
+    }
+
+    await act(async () => {
+      root.render(
+        <WorkspaceElicitationCard
+          elicitation={{
+            ...activity.elicitation!,
+            state: 'answered',
+            durable: durableRequest.durable,
+            answers: [{ fieldId: 'question_0', value: 'multi-omics' }]
+          }}
+          request={durableRequest}
+          onRespond={onRespond}
+        />
+      )
+    })
+
+    expect(container.querySelector('[data-testid="elicitation-choice-mode"]')).toBeNull()
+    const summary = container.querySelector('[data-testid="elicitation-answer-summary"]')
+    // Single-question cards use the question itself as the summary title.
+    expect(summary?.textContent).toContain('Skill type')
+    expect(summary?.querySelector('[data-testid="choice-kind-chip"]')?.textContent).toBe(
+      'Single select'
+    )
+    const row = container.querySelector<HTMLButtonElement>('[data-testid="elicitation-answer-row"]')
+    expect(row?.getAttribute('aria-expanded')).toBe('false')
+    expect(row?.querySelector('svg.lucide-chevron-down')).not.toBeNull()
+    await act(async () => row?.click())
+
+    expect(container.querySelector('[data-testid="elicitation-choice-review"]')).not.toBeNull()
+    expect(row?.getAttribute('aria-expanded')).toBe('true')
+    expect(row?.querySelector('svg.lucide-chevron-up')).not.toBeNull()
+    expect(
+      container
+        .querySelector('[data-testid="elicitation-option-multi-omics"]')
+        ?.getAttribute('data-selected')
+    ).toBe('true')
+    expect(container.querySelector('svg.lucide-check')).not.toBeNull()
+    expect(container.querySelector('svg.lucide-bot')).not.toBeNull()
+    // The recorded answer is a preset option, so the custom-input row stays hidden.
+    expect(container.querySelector('[data-testid="elicitation-custom-answer-review"]')).toBeNull()
+    expect(container.querySelector('textarea')).toBeNull()
+    expect(container.textContent).not.toContain('Skip')
+    expect(container.textContent).not.toContain('Submit')
+    expect(container.textContent).not.toContain('Finish')
+    expect(onRespond).not.toHaveBeenCalled()
+  })
+
+  it('shows the submitted custom answer in its stable review row', async () => {
+    const durableRequest = {
+      ...request,
+      durable: {
+        kind: 'agent-user-choice' as const,
+        requestId: request.requestId,
+        promptMessageId: 'prompt-1'
+      }
+    }
+
+    await act(async () => {
+      root.render(
+        <WorkspaceElicitationCard
+          elicitation={{
+            ...activity.elicitation!,
+            state: 'answered',
+            durable: durableRequest.durable,
+            answers: [{ fieldId: 'question_0_custom', value: 'Use our private sources' }]
+          }}
+          request={durableRequest}
+        />
+      )
+    })
+
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('[data-testid="elicitation-answer-row"]')?.click()
+    })
+
+    const customAnswer = container.querySelector('[data-testid="elicitation-custom-answer-review"]')
+    expect(customAnswer?.getAttribute('data-selected')).toBe('true')
+    expect(customAnswer?.textContent).toContain('Use our private sources')
+  })
+
+  it('uses the validated generic form for constrained indexed fields', async () => {
+    const constrainedFields = [
+      { ...fields[0], required: true },
+      { ...fields[1], maxLength: 3 }
+    ]
+
+    await act(async () => {
+      root.render(
+        <WorkspaceElicitationCard
+          elicitation={{
+            message: activity.elicitation?.message ?? '',
+            fields: constrainedFields,
+            state: 'pending'
+          }}
+          request={{ ...request, fields: constrainedFields }}
+          onRespond={vi.fn().mockResolvedValue(undefined)}
+        />
+      )
+    })
+
+    expect(container.querySelector('[data-testid="elicitation-choice-mode"]')).toBeNull()
+    expect(container.querySelector('textarea')).not.toBeNull()
+    const continueButton = Array.from(container.querySelectorAll('button')).find(
+      (button) => button.textContent?.trim() === 'Continue'
+    )
+    expect(continueButton?.disabled).toBe(true)
+  })
+})
+
+describe('WorkspaceElicitationCard generic ACP form', () => {
+  it.each([
+    [
+      'a wrong-kind preset',
+      {
+        id: 'attempts',
+        label: 'Attempts',
+        kind: 'integer' as const,
+        required: true,
+        defaultValue: '2'
+      }
+    ],
+    [
+      'an out-of-enum preset',
+      {
+        id: 'approach',
+        label: 'Approach',
+        kind: 'single-select' as const,
+        required: true,
+        options: [
+          { value: 'minimal', label: 'Minimal' },
+          { value: 'expanded', label: 'Expanded' }
+        ],
+        defaultValue: 'unsupported'
+      }
+    ],
+    [
+      'an invalid formatted preset',
+      {
+        id: 'contact',
+        label: 'Contact',
+        kind: 'text' as const,
+        required: true,
+        format: 'email' as const,
+        defaultValue: 'not-an-email'
+      }
+    ]
+  ])('keeps Continue disabled for %s', async (_label, field) => {
+    const onRespond = vi.fn().mockResolvedValue(undefined)
+
+    await act(async () => {
+      root.render(
+        <WorkspaceElicitationCard
+          elicitation={{ message: 'Provide a value', fields: [field], state: 'pending' }}
+          request={{
+            requestId: 'generic-invalid-default',
+            sessionId: 'session-1',
+            toolCallId: 'tool-generic-invalid-default',
+            message: 'Provide a value',
+            fields: [field]
+          }}
+          onRespond={onRespond}
+        />
+      )
+    })
+
+    const continueButton = Array.from(container.querySelectorAll('button')).find(
+      (button) => button.textContent?.trim() === 'Continue'
+    )
+    expect(continueButton?.disabled).toBe(true)
+    await act(async () => continueButton?.click())
+    expect(onRespond).not.toHaveBeenCalled()
+  })
+
+  it('submits an RFC3339 date-time default accepted by Main', async () => {
+    const onRespond = vi.fn().mockResolvedValue(undefined)
+    const field = {
+      id: 'scheduled-at',
+      label: 'Scheduled at',
+      kind: 'text' as const,
+      required: true,
+      format: 'date-time' as const,
+      defaultValue: '2026-08-02T12:00:00.123456Z'
+    }
+
+    await act(async () => {
+      root.render(
+        <WorkspaceElicitationCard
+          elicitation={{ message: 'Choose a time', fields: [field], state: 'pending' }}
+          request={{
+            requestId: 'generic-date-time-default',
+            sessionId: 'session-1',
+            toolCallId: 'tool-generic-date-time-default',
+            message: 'Choose a time',
+            fields: [field]
+          }}
+          onRespond={onRespond}
+        />
+      )
+    })
+
+    const continueButton = Array.from(container.querySelectorAll('button')).find(
+      (button) => button.textContent?.trim() === 'Continue'
+    )
+    expect(continueButton?.disabled).toBe(false)
+    await act(async () => continueButton?.click())
+    expect(onRespond).toHaveBeenCalledWith({
+      requestId: 'generic-date-time-default',
+      action: 'accept',
+      answers: [{ fieldId: 'scheduled-at', value: '2026-08-02T12:00:00.123456Z' }]
+    })
+  })
+
+  it('keeps non-question form fields on the generic submit path', async () => {
+    const onRespond = vi.fn().mockResolvedValue(undefined)
+    const genericFields = [
+      {
+        id: 'rationale',
+        label: 'Rationale',
+        kind: 'text' as const,
+        required: true
+      }
+    ]
+
+    await act(async () => {
+      root.render(
+        <WorkspaceElicitationCard
+          elicitation={{
+            message: 'Explain the release decision',
+            fields: genericFields,
+            state: 'pending'
+          }}
+          request={{
+            requestId: 'generic-1',
+            sessionId: 'session-1',
+            toolCallId: 'tool-generic-1',
+            message: 'Explain the release decision',
+            fields: genericFields
+          }}
+          onRespond={onRespond}
+        />
+      )
+    })
+
+    const textarea = container.querySelector<HTMLTextAreaElement>('textarea')
+    expect(textarea).not.toBeNull()
+    await act(async () => {
+      if (!textarea) return
+      const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set
+      setter?.call(textarea, 'The checks passed')
+      textarea.dispatchEvent(new Event('input', { bubbles: true }))
+    })
+    const continueButton = Array.from(container.querySelectorAll('button')).find(
+      (button) => button.textContent?.trim() === 'Continue'
+    )
+    await act(async () => continueButton?.click())
+
+    expect(onRespond).toHaveBeenCalledWith({
+      requestId: 'generic-1',
+      action: 'accept',
+      answers: [{ fieldId: 'rationale', value: 'The checks passed' }]
+    })
+  })
+})
+
+describe('elicitation reported input regressions', () => {
+  const button = (label: string): HTMLButtonElement => {
+    const result = Array.from(container.querySelectorAll('button')).find(
+      (item) => item.textContent?.trim() === label
+    )
+    expect(result).toBeDefined()
+    return result!
+  }
+  const mountForm = async (
+    formFields: ElicitationField[]
+  ): Promise<{ onRespond: ReturnType<typeof vi.fn>; formRequest: PendingElicitationRequest }> => {
+    const onRespond = vi.fn().mockResolvedValue(undefined)
+    const formRequest = { ...request, fields: formFields }
+    await act(async () =>
+      root.render(
+        <WorkspaceElicitationCard
+          elicitation={{ message: request.message, fields: formFields, state: 'pending' }}
+          request={formRequest}
+          onRespond={onRespond}
+        />
+      )
+    )
+    return { onRespond, formRequest }
+  }
+
+  it.each<ElicitationField>([
+    { id: 'optional', label: 'Email', kind: 'text', format: 'email' },
+    { id: 'optional', label: 'Text', kind: 'text', minLength: 2 },
+    {
+      id: 'optional',
+      label: 'Choices',
+      kind: 'multi-select',
+      minItems: 1,
+      options: [{ value: 'one', label: 'One' }]
+    }
+  ])('EL-01 permits omission after clearing $label', async (field) => {
+    const other: ElicitationField = {
+      id: 'other',
+      label: 'Other answer',
+      kind: 'text',
+      required: true,
+      defaultValue: 'Keep me'
+    }
+    const { onRespond, formRequest } = await mountForm([field, other])
+    const answers = [{ fieldId: 'other', value: 'Keep me' }]
+    expect(validateElicitationAnswers(formRequest, answers)).toEqual(answers)
+    expect(button('Continue').disabled).toBe(false)
+    const control = container.querySelector<HTMLInputElement | HTMLTextAreaElement>(
+      'input, textarea'
+    )!
+    if (field.kind === 'multi-select') {
+      await act(async () => control.click())
+    } else {
+      await act(async () => setTextControlValue(control, field.format ? 'a@example.com' : 'valid'))
+    }
+    expect(button('Continue').disabled).toBe(false)
+    await act(async () => {
+      if (field.kind === 'multi-select') control.click()
+      else setTextControlValue(control, '')
+    })
+    expect(button('Continue').disabled, 'cleared optional field must be omittable').toBe(false)
+    await act(async () => button('Continue').click())
+    expect(onRespond).toHaveBeenCalledWith({
+      requestId: request.requestId,
+      action: 'accept',
+      answers
+    })
+  })
+
+  it.each([20, undefined])('EL-02 edits a date-time with maxLength %s', async (maxLength) => {
+    const field: ElicitationField = {
+      id: 'time',
+      label: 'Time',
+      kind: 'text',
+      required: true,
+      format: 'date-time',
+      maxLength,
+      defaultValue: '2026-09-07T12:00:00Z'
+    }
+    const { onRespond, formRequest } = await mountForm([field])
+    expect(button('Continue').disabled).toBe(false)
+    const local = '2026-09-07T12:01:00'
+    const expected = new Date(local).toISOString().replace('.000Z', 'Z')
+    expect(validateElicitationAnswers(formRequest, [{ fieldId: 'time', value: expected }])).toEqual(
+      [{ fieldId: 'time', value: expected }]
+    )
+    await act(async () => setTextControlValue(container.querySelector('input')!, local))
+    expect(button('Continue').disabled, 'editing must not add unnecessary length').toBe(false)
+    await act(async () => button('Continue').click())
+    const sent = onRespond.mock.calls[0][0].answers[0].value
+    expect(new Date(sent).getTime()).toBe(new Date(local).getTime())
+    if (maxLength) expect(sent).toHaveLength(maxLength)
+  })
+
+  it.each([
+    { local: '2026-09-07T12:01:00.123', minLength: undefined, suffix: '.123Z' },
+    { local: '2026-09-07T12:01:00', minLength: 24, suffix: '.000Z' }
+  ])(
+    'EL-02 preserves precision and minimum length: $suffix',
+    async ({ local, minLength, suffix }) => {
+      const { onRespond } = await mountForm([
+        { id: 'time', label: 'Time', kind: 'text', format: 'date-time', minLength }
+      ])
+      await act(async () => setTextControlValue(container.querySelector('input')!, local))
+      expect(button('Continue').disabled).toBe(false)
+      await act(async () => button('Continue').click())
+      const sent = onRespond.mock.calls[0][0].answers[0].value
+      expect(sent.endsWith(suffix)).toBe(true)
+      expect(new Date(sent).getTime()).toBe(new Date(local).getTime())
+    }
+  )
+
+  it.each<ElicitationField>([
+    { id: 'value', label: 'Required', kind: 'text', required: true, minLength: 2 },
+    { id: 'value', label: 'Email', kind: 'text', format: 'email' },
+    { id: 'value', label: 'Minimum length', kind: 'text', minLength: 2 }
+  ])('EL-01 still rejects invalid nonempty $label', async (field) => {
+    const { onRespond } = await mountForm([field])
+    await act(async () => setTextControlValue(container.querySelector('input, textarea')!, 'x'))
+    expect(button('Continue').disabled).toBe(true)
+    await act(async () => setTextControlValue(container.querySelector('input, textarea')!, ''))
+    expect(button('Continue').disabled).toBe(Boolean(field.required))
+    if (field.required) {
+      await act(async () => button('Continue').click())
+      expect(onRespond).not.toHaveBeenCalled()
+    }
+  })
+
+  it('EL-03 distinguishes an omitted boolean from explicit false on screen', async () => {
+    const { onRespond } = await mountForm([{ id: 'enabled', label: 'Enabled', kind: 'boolean' }])
+    const initialView = container.textContent
+    const toggle = container.querySelector<HTMLButtonElement>('[role="switch"]')!
+    expect(toggle.getAttribute('aria-checked')).toBe('false')
+    await act(async () => button('Continue').click())
+    expect(onRespond.mock.calls[0][0].answers).toEqual([])
+    await act(async () => toggle.click())
+    await act(async () => toggle.click())
+    expect(toggle.getAttribute('aria-checked')).toBe('false')
+    await act(async () => button('Continue').click())
+    expect(onRespond.mock.calls[1][0].answers).toEqual([{ fieldId: 'enabled', value: false }])
+    expect(
+      container.textContent,
+      'different submission meanings need a visible distinction'
+    ).not.toBe(initialView)
+    await act(async () => button('Clear selection').click())
+    expect(container.textContent).toContain('Not answered')
+    await act(async () => button('Continue').click())
+    expect(onRespond.mock.calls.at(-1)?.[0].answers).toEqual([])
+  })
+
+  it('EL-04 keeps edits after a failed response and clears only after acceptance', async () => {
+    const onRespond = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('Try again'))
+      .mockResolvedValue(undefined)
+    const onEditDraftChange = vi.fn()
+    await act(async () =>
+      root.render(
+        <WorkspaceElicitationCard
+          elicitation={activity.elicitation!}
+          request={request}
+          onRespond={onRespond}
+          onEditDraftChange={onEditDraftChange}
+        />
+      )
+    )
+    await act(async () =>
+      setTextControlValue(container.querySelector('textarea')!, 'Keep this draft')
+    )
+    expect(onEditDraftChange).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        values: expect.objectContaining({ question_0_custom: 'Keep this draft' })
+      })
+    )
+    await act(async () => button('Finish').click())
+    expect(container.querySelector('[role="alert"]')?.textContent).toBe('Try again')
+    expect(onEditDraftChange).not.toHaveBeenCalledWith(undefined)
+    await act(async () => button('Finish').click())
+    expect(onEditDraftChange).toHaveBeenLastCalledWith(undefined)
+  })
+
+  it.each(['single', 'last', 'back'] as const)(
+    'EL-04 restores unsubmitted custom text: %s',
+    async (scenario) => {
+      const choiceRequest = scenario === 'single' ? request : multiQuestionRequest
+      useSessionStore.setState({
+        ...createInitialSessionState(),
+        sessions: [
+          {
+            id: request.sessionId,
+            projectId: 'project',
+            title: 'Test',
+            cwd: '/workspace',
+            status: 'waiting-for-user',
+            messages: [],
+            createdAt: 1,
+            updatedAt: 1,
+            activities: [
+              {
+                ...activity,
+                elicitation: {
+                  message: choiceRequest.message,
+                  fields: choiceRequest.fields,
+                  state: 'pending'
+                }
+              }
+            ]
+          }
+        ]
+      })
+      const onRespond = vi.fn().mockResolvedValue(undefined)
+      const DraftCard = (): React.JSX.Element => {
+        const session = useSessionStore((state) => state.sessions[0])
+        const owner = useSessionStore.getState()
+        return (
+          <WorkspaceElicitationCard
+            elicitation={session.activities![0].elicitation!}
+            request={choiceRequest}
+            onRespond={onRespond}
+            editDraft={session.elicitationEditDrafts?.[activity.id]}
+            onEditDraftChange={(draft) =>
+              owner.setElicitationEditDraft(session.id, activity.id, request.requestId, draft)
+            }
+            onDraftChange={(answers) =>
+              owner.setElicitationDraftAnswers(session.id, activity.id, answers)
+            }
+          />
+        )
+      }
+      const render = async (): Promise<void> => act(async () => root.render(<DraftCard />))
+      await render()
+      if (scenario !== 'single') {
+        await act(async () =>
+          container
+            .querySelector<HTMLButtonElement>('[data-testid="elicitation-option-clinical"]')!
+            .click()
+        )
+        await act(async () => button('Next').click())
+        if (scenario === 'back') {
+          await act(async () =>
+            container.querySelector<HTMLButtonElement>('[aria-label="Previous question"]')!.click()
+          )
+        }
+      }
+      await act(async () =>
+        setTextControlValue(container.querySelector('textarea')!, 'Unsaved custom answer')
+      )
+      const prompt = container.querySelector('h3')?.textContent
+      expect(onRespond).not.toHaveBeenCalled()
+      await act(async () => root.unmount())
+      root = createRoot(container)
+      await render()
+      expect(
+        container.querySelector('textarea')?.value,
+        'remount must restore the current input'
+      ).toBe('Unsaved custom answer')
+      expect(container.querySelector('h3')?.textContent).toBe(prompt)
+      expect(onRespond).not.toHaveBeenCalled()
+    }
+  )
+})

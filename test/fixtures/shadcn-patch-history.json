@@ -1,0 +1,117 @@
+[
+  {
+    "commit": "81d2bb78",
+    "sha256": "6306bf6bd406eb6ecb55ea050c0f1954008fe4e8b77d01c684f33d5dd3d37063",
+    "edits": [
+      [11735, 0, "(()=>{for(let $ of a)$&&$.dataset.scrollAnchor===\"true\"&&z.current.add($)})(),"]
+    ]
+  },
+  {
+    "commit": "cc73bb73",
+    "sha256": "6cef30c198329500dd3dc0ff24762cf2335a5f363ab00de33e8e5af4231be756",
+    "edits": [
+      [
+        12046,
+        0,
+        "followBottomOnResize=g.useCallback(()=>u.current!==\"following-bottom\"||!l.current?false:(Ee(),true),[Ee]),"
+      ],
+      [13316, 0, "followBottomOnResize,"],
+      [13624, 0, "e,followBottomOnResiz"],
+      [15637, 0, "followBottomOnResize:T,"],
+      [16051, 0, "if(T())return;"],
+      [16195, 0, ",T"],
+      [16424, 0, "followBottomOnResize:T,"],
+      [16880, 0, "if(T())return;"],
+      [17023, 0, "T,"]
+    ]
+  },
+  {
+    "commit": "3c6b201e",
+    "sha256": "4c620c8214a19ea267e9b465e61382699dbb5273ea8d4470fb1be40153db3a97",
+    "edits": [
+      [465, 0, "Math.min("],
+      [466, 0, ",n.scrollHeight)"]
+    ]
+  },
+  {
+    "commit": "2d0f34d1",
+    "sha256": "2bf6d13e12fb7f161bd74ddd0c7848a5224ef84dbe3c04acf430bb7d0fb669fc",
+    "edits": [
+      [11398, 1, "G"],
+      [11403, 1, "z.current"],
+      [11745, 0, "me()||"],
+      [11864, 0, ",me"]
+    ]
+  },
+  {
+    "commit": "e1ea7d51",
+    "sha256": "77e432ad0819c7e490a61a2085fc04b9ba1375c063f41614860bd6f9d7a6a641",
+    "edits": [[17022, 0, ",t"]]
+  },
+  {
+    "commit": "2e224cba",
+    "sha256": "6a757b0a426ee20bb883217dae1de8cb528bbcc2bdad79c586908495c52e5a84",
+    "edits": [
+      [12088, 12, "syncPosition"],
+      [12127, 0, "("],
+      [12157, 0, "&&u.current!==\"anchored-to-message\")"],
+      [13464, 12, "syncPosition"],
+      [13795, 12, "syncPosition"],
+      [15827, 12, "syncPosition"],
+      [16653, 12, "syncPosition"]
+    ]
+  },
+  {
+    "commit": "e4b6d48fa",
+    "sha256": "395b69a31d0aa9a32c33753b36aeb763692ae59223f7a3e629433cda460ec5c1",
+    "edits": [
+      [397, 0, "r?.hidden===true?n.scrollHeight:"],
+      [8822, 0, "W.getAttribute(\"data-scrollable\")!==(O||null)&&("],
+      [8895, 0, ")"]
+    ]
+  },
+  {
+    "commit": "98799d397",
+    "sha256": "2414956c835d1acb02599358aa6cd33ce68ced2aa3d7be52b75bcc3826835caa",
+    "edits": [
+      [8660, 0, ",pausedScrollTop=g.useRef(0),pausedAnchorStyle=g.useRef(null)"],
+      [
+        8757,
+        1,
+        ";if(T&&u.current!==\"paused-by-interaction\"&&pausedAnchorStyle.current!==null){T.style.overflowAnchor=pausedAnchorStyle.current;pausedAnchorStyle.current=null;}let "
+      ],
+      [9124, 0, "&&u.current!==\"paused-by-interaction\""],
+      [11360, 0, "u.current===\"following-bottom\"&&"],
+      [
+        13138,
+        0,
+        "stopAutoScroll=g.useCallback(()=>{u.current=\"paused-by-interaction\";C.current=true;S.current=null;Y.current=null;if(x.current!==null){window.cancelAnimationFrame(x.current);x.current=null;}if(E.current!==null){window.clearTimeout(E.current);E.current=null;}d.current=false;L.current=c.current?.scrollTop??0;pausedScrollTop.current=L.current;if(c.current){/* Keep native anchoring from impersonating user scroll during a layout change. */if(pausedAnchorStyle.current===null)pausedAnchorStyle.current=c.current.style.overflowAnchor;c.current.style.overflowAnchor=\"none\";}c.current?.scrollTo({top:L.current,behavior:\"instant\"});F();w();Z();},[F,w,Z]),"
+      ],
+      [13161, 0, "u.current===\"paused-by-interaction\"||"],
+      [
+        13517,
+        0,
+        "if(u.current===\"paused-by-interaction\"&&c.current){let top=c.current.scrollTop;if(top>pausedScrollTop.current+J)u.current=\"free-scrolling\";pausedScrollTop.current=top;}"
+      ],
+      [13559, 0, "stopAutoScroll,"],
+      [13910, 0, "stopAutoScroll,"],
+      [14952, 0, ",stopAutoScroll:s"],
+      [15028, 0, ",stopAutoScroll:s"],
+      [15037, 0, ",s"]
+    ],
+    "pauseApi": true
+  },
+  {
+    "commit": "a5498d8ad",
+    "sha256": "c5e6eae72d422fe2561b00050271ca48376cdf7e16d120bd72a92cc79ed2e161",
+    "edits": [
+      [243, 0, "d:false,pause"],
+      [6207, 0, "&&e.paused===t.paused"],
+      [9696, 0, "{...s,paused:u.current===\"paused-by-interaction\",...("],
+      [9728, 5, ""],
+      [9744, 1, "{})}"],
+      [19361, 0, "||u.paused"]
+    ],
+    "pauseApi": true
+  }
+]

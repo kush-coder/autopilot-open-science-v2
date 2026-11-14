@@ -1,0 +1,41 @@
+{
+  "ownerPaths": [
+    "src/main/session-details/composition.test.ts",
+    "src/main/session-details/owner.test.ts",
+    "src/main/session-details/owner.ts",
+    "src/main/session-details/startup-catalog.test.ts",
+    "src/main/session-details/startup-catalog.ts"
+  ],
+  "interfacePaths": [
+    "src/main/session-details/owner.ts",
+    "src/main/session-details/startup-catalog.ts"
+  ],
+  "consumerModules": [],
+  "testFiles": {
+    "owner": [
+      "src/main/session-details/composition.test.ts",
+      "src/main/session-details/owner.test.ts",
+      "src/main/session-details/startup-catalog.test.ts"
+    ],
+    "contract": [
+      "src/preload/index.test.ts",
+      "src/renderer/web/api-installer.test.ts",
+      "src/shared/renderer-contract-catalog.test.ts",
+      "src/shared/renderer-surface-matrix.test.ts",
+      "src/main/host-layer-dependencies.architecture.test.ts"
+    ],
+    "consumer": [
+      "src/main/application-command-wiring.test.ts",
+      "src/main/composition/project-lifecycle.test.ts",
+      "src/main/ipc-surfaces/session-persistence.test.ts",
+      "src/main/runtime-electron-wiring.test.ts",
+      "src/main/composition/notebook-environment.test.ts",
+      "src/main/composition/reviewer.test.ts",
+      "src/main/node-entry.test.ts",
+      "src/main/index-fatal-errors.test.ts",
+      "src/main/index-startup-failure.test.ts"
+    ]
+  },
+  "capabilityOverlays": ["e2e_regressions", "e2e_delegation", "windows_sensitive"],
+  "fallbackCapability": "main_runtime"
+}

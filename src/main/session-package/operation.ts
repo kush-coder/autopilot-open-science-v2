@@ -1,0 +1,530 @@
+import type { PackageFileSelection } from '../../shared/session-package'
+import { randomUUID } from 'node:crypto'
+import { createLogger } from '@aipoch/diagnostics/node'
+import {
+  startDiagnosticOperation,
+  type DiagnosticOperation,
+  type DiagnosticFields
+} from '@aipoch/diagnostics/node'
+import {
+  PACKAGE_DEFAULT_IO_BYTES_PER_SECOND,
+  PACKAGE_MAX_IO_BYTES_PER_SECOND,
+  PACKAGE_MIN_IO_BYTES_PER_SECOND,
+  PACKAGE_MAX_FILE_BYTES,
+  formatPackageBytes,
+  packageImportPercent
+} from '../../shared/session-package'
+import type {
+  BrowserPackageTransfer,
+  PackageOperationRequest,
+  PackageOperationSnapshot,
+  PackageProgress,
+  PackageSelectableFile,
+  PackageSelectionSummary,
+  SessionPackageRequest,
+  SessionPackageImportRequest,
+  SensitiveContentEvidence
+} from '../../shared/session-package'
+
+// One native package operation owns cancellation and presentation, independently of renderer lifetime.
+export class SessionPackageOperation {
+  private diagnostic?: DiagnosticOperation
+  private diagnosticSnapshot?: Pick<
+    PackageOperationSnapshot,
+    'state' | 'progress' | 'cleanupPending'
+  >
+  private current?: PackageOperationSnapshot
+  private controller?: AbortController
+  private importResponse?: (target?: SessionPackageImportRequest) => void
+  private pendingImports: NonNullable<PackageOperationSnapshot['pendingImports']> = []
+  private importQueueFull = false
+  private browserTransfers: BrowserPackageTransfer[] = []
+  private selection?: (selection: PackageFileSelection) => void
+  private lastProgressAt = 0
+  private completion: Promise<unknown> = Promise.resolve()
+  async close(): Promise<void> {
+    this.cancel()
+    await this.completion
+  }
+  constructor(
+    private readonly changed: (snapshot: PackageOperationSnapshot) => void = () => undefined
+  ) {}
+
+  get snapshot(): PackageOperationSnapshot | null {
+    return this.current
+      ? structuredClone({
+          ...this.current,
+          browserTransfers: this.browserTransfers,
+          pendingImports: this.pendingImports,
+          importQueueFull: this.importQueueFull
+        })
+      : null
+  }
+  get active(): boolean {
+    return this.controller !== undefined
+  }
+
+  // Stream backpressure already follows slow storage. CPU/validation pauses must not lower
+  // the next I/O stage's budget based on a throttled throughput sample.
+  get transferBytesPerSecond(): number {
+    return this.current?.transferBytesPerSecond ?? PACKAGE_DEFAULT_IO_BYTES_PER_SECOND
+  }
+
+  // Download presentation stays on the originating card until verified bytes are handed to import.
+  reportUseCaseDownload(completedBytes: number, totalBytes: number): void {
+    if (!this.current?.useCaseDownload || !this.controller) return
+    const firstBytes = this.current.useCaseDownload.completedBytes === 0 && completedBytes > 0
+    this.current = {
+      ...this.current,
+      useCaseDownload: { ...this.current.useCaseDownload, completedBytes, totalBytes }
+    }
+    if (firstBytes || completedBytes === totalBytes || Date.now() - this.lastProgressAt >= 150) {
+      this.lastProgressAt = Date.now()
+      this.publish()
+    }
+  }
+
+  finishUseCaseDownload(): void {
+    if (!this.current?.useCaseDownload) return
+    this.current = { ...this.current, useCaseDownload: undefined }
+    this.publish()
+  }
+
+  reportIo = (ioBytesPerSecond: number): void => {
+    if (!this.current || !this.controller) return
+    this.current = { ...this.current, ioBytesPerSecond }
+    if (Date.now() - this.lastProgressAt >= 150) {
+      this.lastProgressAt = Date.now()
+      this.publish()
+    }
+  }
+
+  private publish(): void {
+    this.observeDiagnostics()
+    // Presentation delivery cannot change the result or ownership of a durable operation.
+    try {
+      if (this.current) this.changed(this.snapshot!)
+    } catch {
+      /* snapshot remains queryable */
+    }
+  }
+  report = (progress: PackageProgress): void => {
+    if (!this.current || !this.controller) return
+    const previous = this.current.progress
+    const phaseChanged =
+      progress.phase !== previous.phase || progress.importStage !== previous.importStage
+    if (this.current.kind === 'import' && progress.phase !== 'cleaning') {
+      const percent =
+        progress.overallPercent ?? packageImportPercent(progress) ?? previous.overallPercent
+      if (percent !== undefined)
+        progress = { ...progress, overallPercent: Math.max(previous.overallPercent ?? 0, percent) }
+    }
+    this.current = { ...this.current, progress }
+    this.observeDiagnostics()
+    if (phaseChanged || Date.now() - this.lastProgressAt >= 150) {
+      this.lastProgressAt = Date.now()
+      this.publish()
+    }
+  }
+
+  private observeDiagnostics(): void {
+    if (!this.diagnostic || !this.current) return
+    const { state, progress, cleanupPending } = this.current
+    const previous = this.diagnosticSnapshot
+    if (
+      !previous ||
+      previous.state !== state ||
+      previous.progress.phase !== progress.phase ||
+      previous.cleanupPending !== cleanupPending
+    ) {
+      this.diagnostic.phase(progress.phase, {
+        ...this.diagnosticFields(),
+        previousPhase: previous?.progress.phase,
+        previousCompletedBytes: previous?.progress.completedBytes,
+        previousTotalBytes: previous?.progress.totalBytes,
+        previousCompletedFiles: previous?.progress.completedFiles,
+        previousTotalFiles: previous?.progress.totalFiles
+      })
+    }
+    // Keep the latest counters without writing every buffer or UI progress update to disk.
+    this.diagnosticSnapshot = { state, progress, cleanupPending }
+  }
+
+  private diagnosticFields(): DiagnosticFields {
+    const current = this.current!
+    return {
+      state: current.state,
+      ...(current.progress.importStage ? { importStage: current.progress.importStage } : {}),
+      cleanupPending: Boolean(current.cleanupPending),
+      completedBytes: current.progress.completedBytes,
+      totalBytes: current.progress.totalBytes,
+      completedFiles: current.progress.completedFiles,
+      totalFiles: current.progress.totalFiles
+    }
+  }
+
+  present(): void {
+    if (!this.current) return
+    this.current = {
+      ...this.current,
+      presentationRevision: (this.current.presentationRevision ?? 0) + 1
+    }
+    this.publish()
+  }
+
+  setBrowserTransfers(transfers: BrowserPackageTransfer[]): void {
+    const added = transfers.some((t) => !this.browserTransfers.some((old) => old.id === t.id))
+    const boundary =
+      transfers.length !== this.browserTransfers.length ||
+      transfers.some((t, i) => {
+        const previous = this.browserTransfers[i]
+        return (
+          t.id !== previous?.id ||
+          t.state !== previous.state ||
+          t.cleanupPending !== previous.cleanupPending ||
+          (t.completedBytes === t.totalBytes && previous.completedBytes !== t.completedBytes)
+        )
+      })
+    this.browserTransfers = transfers
+    // Receipt presentation does not acquire the single import/export operation owner.
+    if (!this.current || this.current.browserReceiptOnly) {
+      if (!this.current && !transfers.length) return
+      this.current = {
+        id: this.current?.id ?? randomUUID(),
+        kind: 'import',
+        browserReceiptOnly: true,
+        state: transfers.some(
+          (t) => (t.state !== 'cancelled' && t.state !== 'failed') || t.cleanupPending
+        )
+          ? 'running'
+          : transfers.some((t) => t.state === 'failed')
+            ? 'failed'
+            : 'cancelled',
+        progress: { phase: 'preparing' },
+        presentationRevision: this.current?.presentationRevision ?? 0
+      }
+    }
+    if (added || boundary || Date.now() - this.lastProgressAt >= 150) {
+      this.lastProgressAt = Date.now()
+      if (added) this.present()
+      else this.publish()
+    }
+  }
+
+  setPendingImports(
+    files: NonNullable<PackageOperationSnapshot['pendingImports']>,
+    full = this.importQueueFull
+  ): void {
+    const previousPendingCount = this.pendingImports.length
+    const changed = files.length !== previousPendingCount || full !== this.importQueueFull
+    this.pendingImports = files
+    this.importQueueFull = full
+    if (changed) {
+      try {
+        createLogger('session-package').info('Package import queue changed', {
+          pendingCount: files.length,
+          previousPendingCount,
+          full
+        })
+      } catch {
+        // Diagnostics must not suppress queue delivery or alter import ownership.
+      }
+    }
+    this.publish()
+  }
+
+  setImportSource(requestId: string, filename: string, target: SessionPackageImportRequest): void {
+    if (!this.controller || this.current?.kind !== 'import')
+      throw new Error('No active import operation.')
+    this.current = {
+      ...this.current,
+      importRequestId: requestId,
+      importFilename: filename,
+      importTarget: { ...target }
+    }
+    this.publish()
+  }
+
+  waitForImport = (
+    input: {
+      requestId?: string
+      filename?: string
+      preview?: PackageOperationSnapshot['importPreview']
+    },
+    budgetSignal?: AbortSignal
+  ): Promise<SessionPackageImportRequest | undefined> => {
+    if (!this.controller || !this.current || this.current.kind !== 'import')
+      throw new Error('No active import operation.')
+    const signal = AbortSignal.any([
+      this.controller.signal,
+      ...(budgetSignal ? [budgetSignal] : [])
+    ])
+    signal.throwIfAborted()
+    const pending = new Promise<SessionPackageImportRequest | undefined>((resolve, reject) => {
+      const abort = (): void => {
+        this.importResponse = undefined
+        reject(signal.reason)
+      }
+      signal.addEventListener('abort', abort, { once: true })
+      this.importResponse = (target) => {
+        signal.removeEventListener('abort', abort)
+        this.importResponse = undefined
+        resolve(target)
+      }
+    })
+    this.current = {
+      ...this.current,
+      importRequestId: input.requestId ?? this.current.importRequestId,
+      importFilename: input.filename ?? this.current.importFilename,
+      importPreview: input.preview,
+      state: 'awaiting-selection',
+      progress: { ...this.current.progress, phase: input.preview ? 'confirming' : 'selecting' }
+    }
+    this.publish()
+    return pending
+  }
+
+  selectFiles = (
+    files: PackageSelectableFile[],
+    budgetSignal?: AbortSignal,
+    summary?: PackageSelectionSummary
+  ): Promise<PackageFileSelection> => {
+    const signal =
+      this.controller &&
+      AbortSignal.any([this.controller.signal, ...(budgetSignal ? [budgetSignal] : [])])
+    if (!signal || !this.current) throw new Error('No active package operation.')
+    signal.throwIfAborted()
+    const selected = new Promise<PackageFileSelection>((resolve, reject) => {
+      const abort = (): void => {
+        this.selection = undefined
+        reject(signal.reason)
+      }
+      signal.addEventListener('abort', abort, { once: true })
+      this.selection = (keys) => {
+        signal.removeEventListener('abort', abort)
+        this.selection = undefined
+        resolve(keys)
+      }
+    })
+    this.current = {
+      ...this.current,
+      state: 'awaiting-selection',
+      files,
+      summary,
+      progress: { phase: 'selecting' }
+    }
+    this.publish()
+    return selected
+  }
+
+  respond(request: PackageOperationRequest): PackageOperationSnapshot | null {
+    if (request.action === 'snapshot') return this.snapshot
+    if (
+      [
+        'reveal',
+        'retry-cleanup',
+        'discard-import',
+        'next-import',
+        'retry-import',
+        'export-with-sensitive-content',
+        'dismiss-queue-warning'
+      ].includes(request.action)
+    )
+      throw new Error('This action must be handled by the desktop owner.')
+    if (!this.current || request.operationId !== this.current.id || !this.controller)
+      throw new Error('The package operation is no longer active.')
+    if (request.action === 'set-speed') {
+      if (
+        request.bytesPerSecond !== null &&
+        (!Number.isInteger(request.bytesPerSecond) ||
+          request.bytesPerSecond < PACKAGE_MIN_IO_BYTES_PER_SECOND ||
+          request.bytesPerSecond > PACKAGE_MAX_IO_BYTES_PER_SECOND)
+      )
+        throw new Error('Invalid package transfer rate.')
+      this.current = {
+        ...this.current,
+        ...(request.bytesPerSecond === null
+          ? { transferBytesPerSecond: undefined }
+          : { transferBytesPerSecond: request.bytesPerSecond })
+      }
+      this.publish()
+    } else if (request.action === 'cancel') {
+      this.current = { ...this.current, state: 'cancelling' }
+      this.publish()
+      this.controller.abort(new Error('Package operation cancelled.'))
+    } else if (request.action === 'select-project' || request.action === 'confirm-import') {
+      if (
+        this.current.kind !== 'import' ||
+        this.current.state !== 'awaiting-selection' ||
+        !this.importResponse ||
+        (request.action === 'confirm-import') !== Boolean(this.current.importPreview)
+      )
+        throw new Error('The import choice is no longer available.')
+      this.current = {
+        ...this.current,
+        state: 'running',
+        importPreview: undefined,
+        importTarget:
+          request.action === 'select-project' ? request.target : this.current.importTarget
+      }
+      this.importResponse(request.action === 'select-project' ? request.target : undefined)
+      this.publish()
+    } else if (request.action === 'select') {
+      if (this.current.state !== 'awaiting-selection' || !this.selection)
+        throw new Error('The package selection is no longer available.')
+      const keys = new Set(request.excludedStorageKeys)
+      const files = this.current.files ?? []
+      if (
+        keys.size !== request.excludedStorageKeys.length ||
+        [...keys].some((key) => !files.some((file) => file.storageKey === key))
+      )
+        throw new Error('Invalid package selection.')
+      if (
+        files.some((file) => file.sizeBytes > PACKAGE_MAX_FILE_BYTES && !keys.has(file.storageKey))
+      )
+        throw new Error(
+          `Exclude files larger than ${formatPackageBytes(PACKAGE_MAX_FILE_BYTES)} before exporting.`
+        )
+      if (files.some((file) => file.requiredForEvidence && keys.has(file.storageKey)))
+        throw new Error('Invalid package selection.')
+      this.current = { ...this.current, state: 'running', files: undefined, summary: undefined }
+      this.selection({
+        excludedStorageKeys: [...keys],
+        includePdfNotes: request.includePdfNotes === true,
+        ...(request.includeResearchFilms ? { includeResearchFilms: true } : {})
+      })
+      this.publish()
+    }
+    return this.snapshot
+  }
+
+  setCleanupPending(pending: boolean): void {
+    if (!this.current) return
+    this.current = { ...this.current, cleanupPending: pending }
+    this.publish()
+  }
+
+  setSensitiveContent(evidence: SensitiveContentEvidence[]): void {
+    if (!this.current) return
+    this.current = { ...this.current, sensitiveContent: evidence.slice(0, 20) }
+    this.publish()
+  }
+
+  async retryCleanup(
+    work: (signal: AbortSignal) => Promise<void>
+  ): Promise<PackageOperationSnapshot | null> {
+    if (!this.current?.cleanupPending || this.controller)
+      throw new Error('Package cleanup is not available.')
+    const previous = this.current
+    this.controller = new AbortController()
+    this.diagnostic = startDiagnosticOperation(createLogger('session-package'), {
+      operation: 'session-package.cleanup',
+      operationId: previous.id,
+      fields: { kind: previous.kind, transferOutcome: previous.state }
+    })
+    let settled!: () => void
+    this.completion = new Promise<void>((resolve) => {
+      settled = resolve
+    })
+    this.current = { ...previous, state: 'running', progress: { phase: 'cleaning' } }
+    this.publish()
+    try {
+      await work(this.controller.signal)
+      this.diagnostic.complete({ cleanupPending: false })
+      this.current = { ...previous, cleanupPending: false }
+    } catch (error) {
+      if (this.controller.signal.aborted) this.diagnostic.cancel({ cleanupPending: true })
+      else this.diagnostic.fail(error, { cleanupPending: true })
+      this.current = previous
+      throw error
+    } finally {
+      this.diagnostic = undefined
+      this.diagnosticSnapshot = undefined
+      this.controller = undefined
+      this.publish()
+      settled()
+    }
+    return this.snapshot
+  }
+
+  completeResult(result: NonNullable<PackageOperationSnapshot['result']>): void {
+    if (this.current && this.controller) this.current = { ...this.current, result }
+  }
+
+  cancel(): void {
+    if (this.current && this.controller)
+      this.respond({ action: 'cancel', operationId: this.current.id })
+  }
+
+  async run<T>(
+    kind: PackageOperationSnapshot['kind'],
+    session: SessionPackageRequest | undefined,
+    work: (signal: AbortSignal) => Promise<T>,
+    importTarget?: PackageOperationSnapshot['importTarget'],
+    requiresRecovery?: () => boolean,
+    downloadSlug?: string
+  ): Promise<T> {
+    if (this.controller) throw new Error('A Session package operation is already in progress.')
+    const controller = new AbortController()
+    this.controller = controller
+    this.current = {
+      id: randomUUID(),
+      kind,
+      session,
+      importTarget,
+      state: 'running',
+      ...(downloadSlug ? { useCaseDownload: { slug: downloadSlug, completedBytes: 0 } } : {}),
+      progress: { phase: 'preparing' }
+    }
+    this.diagnostic = startDiagnosticOperation(createLogger('session-package'), {
+      operation: `session-package.${kind}`,
+      operationId: this.current.id
+    })
+    this.publish()
+    let settled!: () => void
+    this.completion = new Promise<void>((resolve) => {
+      settled = resolve
+    })
+    try {
+      const result = await work(controller.signal)
+      this.current = {
+        ...this.current!,
+        state: 'succeeded',
+        files: undefined,
+        summary: undefined,
+        importPreview: undefined
+      }
+      this.diagnostic.complete(this.diagnosticFields())
+      return result
+    } catch (error) {
+      const sensitiveContent = this.current?.sensitiveContent
+      // A cancelled transfer can still own a durable import that must remain retryable.
+      const recoveryRequired = this.current?.result?.recovery || requiresRecovery?.()
+      this.current = {
+        ...this.current!,
+        state: controller.signal.aborted && !recoveryRequired ? 'cancelled' : 'failed',
+        files: undefined,
+        summary: undefined,
+        importPreview: undefined,
+        error:
+          controller.signal.aborted && !recoveryRequired
+            ? undefined
+            : error instanceof Error
+              ? error.message
+              : String(error),
+        ...(sensitiveContent ? { sensitiveContent } : {})
+      }
+      if (controller.signal.aborted) this.diagnostic.cancel(this.diagnosticFields())
+      else this.diagnostic.fail(error, this.diagnosticFields())
+      throw error
+    } finally {
+      this.diagnostic = undefined
+      this.diagnosticSnapshot = undefined
+      this.selection = undefined
+      this.importResponse = undefined
+      this.controller = undefined
+      this.publish()
+      settled()
+    }
+  }
+}

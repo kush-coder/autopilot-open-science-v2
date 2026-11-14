@@ -1,0 +1,1129 @@
+import { harnessFramework } from '../agent-framework/harness'
+import { randomBytes, randomUUID } from 'node:crypto'
+import { isLoopbackProviderBaseUrl } from '@aipoch/providers/transport'
+import { isCodexSubscriptionProvider, preferredEndpoint } from '../../shared/settings'
+import type {
+  ProviderFailureObservation,
+  ProviderFailureObserver
+} from './provider-failure-observation'
+
+import { usesVendorMessagesApiKeyHeader, type ModelReasoningEffort } from '@aipoch/providers'
+
+import {
+  CLAUDE_ACP_CONFIGURABLE_PROVIDER_ID,
+  type AgentModelCatalogEntry,
+  type AgentProviderConfiguration,
+  type ResolvedAgentBackend
+} from '../agent-framework'
+import { resolveResponsesBaseUrl } from '../agent-framework/codex'
+import { opencodeTransportProviderId } from '../agent-framework/opencode'
+import { piModelId } from '../agent-framework/pi'
+import { netFetchStandard } from '../network-fetch'
+import { MessagesBridge, type MessagesBridgeTarget } from './messages-bridge'
+import type { BackendRoutePlan } from './backend-route-planner'
+import {
+  normalizeMessagesRootUrl,
+  resolveChatCompletionsUrl,
+  resolveChatCompletionsBaseUrl,
+  bufferChatCompletionsToolNames,
+  type ResponsesNamespacedTool
+} from '@aipoch/providers/protocol'
+import {
+  ChatCompletionsCompatibilityBridge,
+  type ChatCompletionsCompatibilityTarget
+} from './chat-completions-compatibility'
+import { adaptCodeBuddyChatCompletionsRequest } from './codebuddy-chat-request-adapter'
+import {
+  createCodeBuddySkillSelectorTransport,
+  type ProviderResponsesToChatCompletionsBridgePort
+} from './codebuddy-skill-selector-transport'
+import {
+  NativeResponsesCompatibilityProxy,
+  type NativeResponsesCompatibilityTarget
+} from './native-responses-compatibility'
+import {
+  ProtocolForwardingBridge,
+  type ProtocolForwardingBridgeTarget
+} from './protocol-forwarding-bridge'
+import type { ProviderRuntimeTarget } from './provider-accounts'
+import type { CodexHarnessConnection } from './codex-harness-auth'
+
+import {
+  ResponsesToChatCompletionsBridge,
+  type ResponsesToChatCompletionsBridgeOptions
+} from './responses-to-chat-completions-bridge'
+import type {
+  ResponsesConnection,
+  ResponsesToChatCompletionsBridgeTarget
+} from './responses-transport-contract'
+import { loopbackProxyBypassEnvironment } from './system-proxy'
+import { claudeCodeLoopbackEnv, createXaiOAuthProviderBridge } from './xai-oauth-provider-bridge'
+import { sanitizeXaiResponsesRequest } from '@aipoch/providers/protocol'
+type MessagesBridgePort = Pick<MessagesBridge, 'start' | 'close' | 'setTarget' | 'clearErrorReplay'>
+type ProtocolForwardingBridgePort = Pick<
+  ProtocolForwardingBridge,
+  'start' | 'close' | 'setTarget' | 'clearErrorReplay'
+>
+type ChatCompletionsCompatibilityBridgePort = Pick<
+  ChatCompletionsCompatibilityBridge,
+  'start' | 'close'
+>
+type CreateXaiOAuthProviderBridge = typeof createXaiOAuthProviderBridge
+// Lets one Pi generation serve several protocol bridges under its single ACP API key.
+type LoopbackCredentialOptions = Readonly<{ token?: string }>
+
+const codeBuddyCompatibilityEndpoint = (
+  provider: ProviderRuntimeTarget['provider'],
+  wire: ChatCompletionsCompatibilityTarget['wire']
+): string => {
+  if (wire === 'responses') {
+    const baseUrl = resolveResponsesBaseUrl(provider)
+    if (!baseUrl) throw new Error('The CodeBuddy Responses provider target is incomplete.')
+    return `${baseUrl}/responses`
+  }
+  const baseUrl = normalizeMessagesRootUrl(provider.baseUrl ?? '')
+  if (!baseUrl) throw new Error('The CodeBuddy Messages provider target is incomplete.')
+  return `${baseUrl}/v1/messages`
+}
+
+type ResponsesToChatCompletionsBridgeEntry = {
+  bridge: ProviderResponsesToChatCompletionsBridgePort
+  connection: Promise<ResponsesConnection>
+}
+
+type NativeResponsesProxyPort = Pick<
+  NativeResponsesCompatibilityProxy,
+  | 'start'
+  | 'close'
+  | 'selectSkills'
+  | 'registerReviewerSession'
+  | 'unregisterReviewerSession'
+  | 'registerToolLessSession'
+  | 'unregisterToolLessSession'
+  | 'registerHostMessageSession'
+  | 'unregisterHostMessageSession'
+  | 'setModelTarget'
+  | 'setTarget'
+>
+
+type NativeResponsesProxyTarget = NativeResponsesCompatibilityTarget & {
+  reviewerScope: { namespacedTools: ResponsesNamespacedTool[] }
+}
+
+type NativeResponsesCompatibilityEntry = {
+  proxy: NativeResponsesProxyPort
+  connection: Promise<ResponsesConnection>
+}
+
+type LeasedResponsesConnection = ResponsesConnection & {
+  lease: NonNullable<ResolvedAgentBackend['responsesTransportLease']>
+  providerTransportLease?: NonNullable<ResolvedAgentBackend['providerTransportLease']>
+}
+
+type ProviderTransportRequest = Readonly<{
+  activeTarget: ProviderRuntimeTarget
+  plan: BackendRoutePlan
+}>
+
+type ProviderTransportGeneration = Readonly<{
+  provider?: ProviderRuntimeTarget['provider']
+  providerModelCatalog?: readonly AgentModelCatalogEntry[]
+  responsesConnection?: LeasedResponsesConnection
+  piModelBridge?: Readonly<{ token: string }>
+  environment?: Record<string, string>
+  providerConfiguration?: AgentProviderConfiguration
+  messagesBridgeLease?: NonNullable<ResolvedAgentBackend['messagesBridgeLease']>
+  providerTransportLease?: NonNullable<ResolvedAgentBackend['providerTransportLease']>
+  release: () => Promise<void>
+}>
+
+type ProviderTransportOwnerOptions = {
+  onProviderFailure?: (
+    target: ProviderRuntimeTarget,
+    failure: ProviderFailureObservation
+  ) => Promise<void>
+  getXaiOAuthAccessToken?: (forceRefresh?: boolean) => Promise<string>
+  bindCodexHarnessConnection?: BindCodexHarnessConnection
+  createResponsesToChatCompletionsBridge?: (
+    target: ResponsesToChatCompletionsBridgeTarget,
+    options?: ResponsesToChatCompletionsBridgeOptions
+  ) => ProviderResponsesToChatCompletionsBridgePort
+  createNativeResponsesProxy?: (target: NativeResponsesProxyTarget) => NativeResponsesProxyPort
+  createMessagesBridge?: (
+    targets: readonly MessagesBridgeTarget[],
+    initialTargetId: string,
+    options?: LoopbackCredentialOptions
+  ) => MessagesBridgePort
+  createProtocolForwardingBridge?: (
+    targets: readonly ProtocolForwardingBridgeTarget[],
+    initialTargetId: string,
+    options?: LoopbackCredentialOptions
+  ) => ProtocolForwardingBridgePort
+  createChatCompletionsCompatibilityBridge?: (
+    target: ChatCompletionsCompatibilityTarget
+  ) => ChatCompletionsCompatibilityBridgePort
+  createXaiOAuthProviderBridge?: CreateXaiOAuthProviderBridge
+  nextGenerationId?: () => string
+}
+
+/** Main owns authentication and binds each lease to its current account generation. */
+type BindCodexHarnessConnection = (
+  target: ProviderRuntimeTarget
+) => (signal: AbortSignal) => Promise<CodexHarnessConnection>
+
+const codexHarnessEndpoint = (value: string): string => {
+  let url: URL
+  try {
+    url = new URL(value)
+  } catch {
+    throw new Error('Invalid Codex harness endpoint.')
+  }
+  if (
+    url.username ||
+    url.password ||
+    value.includes('?') ||
+    value.includes('#') ||
+    (url.href !== 'https://chatgpt.com/backend-api/codex/responses' &&
+      !(isLoopbackProviderBaseUrl(url.href) && url.pathname.endsWith('/responses')))
+  )
+    throw new Error('Invalid Codex harness endpoint.')
+  return url.href
+}
+
+const validateCodexHarnessConnection = (connection: CodexHarnessConnection): string => {
+  if (
+    !connection.accessToken.trim() ||
+    !connection.accountId.trim() ||
+    /[\r\n]/.test(connection.accessToken + connection.accountId)
+  )
+    throw new Error('Invalid Codex harness authentication.')
+  return codexHarnessEndpoint(connection.endpoint)
+}
+
+export type HarnessProviderLease = Readonly<{
+  route: Readonly<{
+    id: string
+    providerId: string
+    configRevision: number
+    model: string
+    protocol: 'chat-completions' | 'responses' | 'messages'
+  }>
+  connection: Readonly<{ baseUrl: string; token: string }>
+  release: () => Promise<void>
+}>
+
+class ProviderTransportOwner {
+  private readonly onProviderFailure: ProviderTransportOwnerOptions['onProviderFailure']
+  private readonly createResponsesToChatCompletionsBridge: (
+    target: ResponsesToChatCompletionsBridgeTarget,
+    options?: ResponsesToChatCompletionsBridgeOptions
+  ) => ProviderResponsesToChatCompletionsBridgePort
+  private readonly createNativeResponsesProxy: (
+    target: NativeResponsesProxyTarget
+  ) => NativeResponsesProxyPort
+  private readonly createMessagesBridge: (
+    targets: readonly MessagesBridgeTarget[],
+    initialTargetId: string,
+    options?: LoopbackCredentialOptions
+  ) => MessagesBridgePort
+  private readonly createProtocolForwardingBridge: (
+    targets: readonly ProtocolForwardingBridgeTarget[],
+    initialTargetId: string,
+    options?: LoopbackCredentialOptions
+  ) => ProtocolForwardingBridgePort
+  private readonly createChatCompletionsCompatibilityBridge: (
+    target: ChatCompletionsCompatibilityTarget
+  ) => ChatCompletionsCompatibilityBridgePort
+  private readonly createXaiOAuthProviderBridge: CreateXaiOAuthProviderBridge
+  private readonly nextGenerationId: () => string
+  private readonly getXaiOAuthAccessToken?: (forceRefresh?: boolean) => Promise<string>
+  private readonly bindCodexHarnessConnection?: BindCodexHarnessConnection
+  private readonly responsesToChatCompletionsBridges = new Map<
+    string,
+    ResponsesToChatCompletionsBridgeEntry
+  >()
+  private readonly nativeResponsesCompatibilityProxies = new Map<
+    string,
+    NativeResponsesCompatibilityEntry
+  >()
+
+  constructor(options: ProviderTransportOwnerOptions = {}) {
+    this.onProviderFailure = options.onProviderFailure
+    this.createResponsesToChatCompletionsBridge =
+      options.createResponsesToChatCompletionsBridge ??
+      ((target, bridgeOptions) =>
+        new ResponsesToChatCompletionsBridge(target, netFetchStandard, bridgeOptions))
+    this.createNativeResponsesProxy =
+      options.createNativeResponsesProxy ??
+      ((target) => new NativeResponsesCompatibilityProxy(target, netFetchStandard))
+    this.createMessagesBridge =
+      options.createMessagesBridge ??
+      ((targets, initialTargetId, bridgeOptions) =>
+        new MessagesBridge(targets, initialTargetId, netFetchStandard, undefined, bridgeOptions))
+    this.createProtocolForwardingBridge =
+      options.createProtocolForwardingBridge ??
+      ((targets, initialTargetId, bridgeOptions) =>
+        new ProtocolForwardingBridge(targets, initialTargetId, netFetchStandard, bridgeOptions))
+    this.createChatCompletionsCompatibilityBridge =
+      options.createChatCompletionsCompatibilityBridge ??
+      ((target) => new ChatCompletionsCompatibilityBridge(target, netFetchStandard))
+    this.createXaiOAuthProviderBridge =
+      options.createXaiOAuthProviderBridge ?? createXaiOAuthProviderBridge
+    this.nextGenerationId = options.nextGenerationId ?? randomUUID
+    this.getXaiOAuthAccessToken = options.getXaiOAuthAccessToken
+    this.bindCodexHarnessConnection = options.bindCodexHarnessConnection
+  }
+
+  private async createCodexHarnessBridge(
+    target: ProviderRuntimeTarget,
+    id: string,
+    model: string,
+    signal: AbortSignal
+  ): Promise<ProtocolForwardingBridgePort> {
+    if (!this.bindCodexHarnessConnection)
+      throw new Error('Codex subscription authentication is unavailable.')
+    const resolve = this.bindCodexHarnessConnection(target)
+    const endpoint = validateCodexHarnessConnection(await resolve(signal))
+    signal.throwIfAborted()
+    return this.createProtocolForwardingBridge(
+      [
+        {
+          id,
+          model,
+          wire: 'responses',
+          endpoint,
+          resolveConnection: async (requestSignal) => {
+            const connection = await resolve(requestSignal)
+            requestSignal.throwIfAborted()
+            return {
+              endpoint: validateCodexHarnessConnection(connection),
+              key: connection.accessToken,
+              headers: { 'ChatGPT-Account-Id': connection.accountId }
+            }
+          },
+          adaptRequest: (request) => {
+            const adapted = { ...request }
+            delete adapted.max_output_tokens
+            return adapted
+          }
+        }
+      ],
+      id
+    )
+  }
+
+  // The signal covers acquisition; the host owns release after active requests settle.
+  async acquireHarness(
+    target: ProviderRuntimeTarget,
+    signal: AbortSignal
+  ): Promise<HarnessProviderLease> {
+    signal.throwIfAborted()
+    const snapshot = structuredClone(target)
+    const { provider, providerId, configRevision } = snapshot
+    const model = snapshot.effectiveModel ?? provider.model
+    const usesXaiOAuth = snapshot.providerType === 'xai-subscription'
+    const usesCodexOAuth = isCodexSubscriptionProvider(snapshot.providerType)
+    const wire = preferredEndpoint(snapshot.apiEndpoints, harnessFramework.supportedApiTypes)
+    if (
+      !['custom', 'official', 'xai-subscription', 'codex-isolated', 'codex-shared'].includes(
+        snapshot.providerType
+      ) ||
+      !['custom', 'official', 'xai-subscription', 'codex-isolated', 'codex-shared'].includes(
+        provider.type
+      ) ||
+      usesXaiOAuth !== (provider.type === 'xai-subscription') ||
+      usesCodexOAuth !== isCodexSubscriptionProvider(provider.type) ||
+      snapshot.disconnectedAt !== undefined ||
+      !providerId.trim() ||
+      configRevision === undefined ||
+      !Number.isSafeInteger(configRevision) ||
+      configRevision < 0 ||
+      !model?.trim() ||
+      !wire ||
+      (usesCodexOAuth && wire !== 'responses')
+    ) {
+      throw new Error('Harness requires a connected, versioned provider target.')
+    }
+    const endpoint =
+      usesXaiOAuth || usesCodexOAuth
+        ? undefined
+        : wire === 'chat-completions'
+          ? resolveChatCompletionsUrl(provider)
+          : wire === 'responses'
+            ? `${resolveResponsesBaseUrl(provider)}/responses`
+            : `${normalizeMessagesRootUrl(provider.baseUrl ?? '')}/v1/messages`
+    if (!usesXaiOAuth && !usesCodexOAuth) {
+      if (!endpoint) throw new Error('Harness provider endpoint is unavailable.')
+      const url = new URL(endpoint)
+      if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password)
+        throw new Error(
+          'Harness provider endpoint must be an HTTP URL without embedded credentials.'
+        )
+    }
+    const route = Object.freeze({
+      id: this.nextGenerationId(),
+      providerId,
+      configRevision,
+      model,
+      protocol: wire
+    })
+    const bridge = usesCodexOAuth
+      ? await this.createCodexHarnessBridge(snapshot, route.id, model, signal)
+      : usesXaiOAuth
+        ? this.createXaiOAuthProviderBridge(
+            [{ id: route.id, model }],
+            route.id,
+            wire,
+            this.getXaiOAuthAccessToken
+          )
+        : wire === 'messages'
+          ? this.createMessagesBridge(
+              [
+                {
+                  ...this.healthObservation(snapshot),
+                  id: route.id,
+                  baseUrl: normalizeMessagesRootUrl(provider.baseUrl ?? ''),
+                  key: provider.key,
+                  model,
+                  useApiKeyHeader:
+                    provider.vendorId === 'anthropic' ||
+                    (!!provider.vendorId && usesVendorMessagesApiKeyHeader(provider.vendorId))
+                }
+              ],
+              route.id
+            )
+          : this.createProtocolForwardingBridge(
+              [
+                {
+                  ...this.healthObservation(snapshot),
+                  id: route.id,
+                  wire,
+                  endpoint: endpoint!,
+                  key: provider.key,
+                  model
+                }
+              ],
+              route.id
+            )
+    let releasePromise: Promise<void> | undefined
+    const release = (): Promise<void> =>
+      (releasePromise ??= Promise.resolve().then(() => bridge.close()))
+    try {
+      const connection = await bridge.start()
+      signal.throwIfAborted()
+      return Object.freeze({
+        route,
+        connection: Object.freeze({
+          baseUrl: connection.baseUrl,
+          token: connection.token
+        }),
+        release
+      })
+    } catch (error) {
+      try {
+        await release()
+      } catch (cleanupError) {
+        throw new AggregateError(
+          [error, cleanupError],
+          'Harness transport acquisition and cleanup failed.'
+        )
+      }
+      throw error
+    }
+  }
+
+  async acquire(input: ProviderTransportRequest): Promise<ProviderTransportGeneration> {
+    if (input.plan.transport.kind === 'pi') {
+      return this.startPiTransport(input)
+    }
+    if (input.plan.modelRoute === 'codebuddy-openai') {
+      return this.startCodeBuddyTransport(input)
+    }
+    if (input.plan.transport.kind === 'claude-anthropic') {
+      return this.startClaudeTransport(input)
+    }
+    if (
+      input.plan.transport.kind === 'opencode-openai' ||
+      input.plan.transport.kind === 'opencode-anthropic'
+    ) {
+      return this.startOpenCodeTransport(input)
+    }
+    if (input.plan.transport.kind === 'codex-native-responses') {
+      return this.startNativeCodexTransport(input)
+    }
+    if (input.plan.transport.kind === 'codex-responses-compatibility') {
+      const responsesConnection = await this.startNativeResponsesCompatibility(input)
+      return Object.freeze({
+        responsesConnection,
+        environment: loopbackProxyBypassEnvironment(process.env),
+        ...(responsesConnection.providerTransportLease
+          ? { providerTransportLease: responsesConnection.providerTransportLease }
+          : {}),
+        release: responsesConnection.lease.release
+      })
+    }
+    if (input.plan.transport.kind !== 'codex-chat')
+      return Object.freeze({ release: async () => undefined })
+    const responsesConnection = await this.startResponsesToChatCompletionsBridge(input)
+    return Object.freeze({
+      responsesConnection,
+      environment: loopbackProxyBypassEnvironment(process.env),
+      ...(responsesConnection.providerTransportLease
+        ? { providerTransportLease: responsesConnection.providerTransportLease }
+        : {}),
+      release: responsesConnection.lease.release
+    })
+  }
+
+  private healthObservation(target: ProviderRuntimeTarget): {
+    onProviderFailure?: ProviderFailureObserver
+  } {
+    const observe = this.onProviderFailure
+    if (
+      !observe ||
+      target.configRevision === undefined ||
+      !['custom', 'official'].includes(target.providerType)
+    )
+      return {}
+    return { onProviderFailure: (failure) => observe(target, failure) }
+  }
+
+  private async startPiTransport(
+    input: ProviderTransportRequest
+  ): Promise<ProviderTransportGeneration> {
+    const transport = input.plan.transport
+    if (transport.kind !== 'pi') throw new Error('Pi provider transport is unavailable.')
+    // Every bridge accepts the one key Pi receives over ACP authentication.
+    const token = randomBytes(24).toString('hex')
+    const bridges: Array<
+      MessagesBridgePort | ProtocolForwardingBridgePort | ReturnType<CreateXaiOAuthProviderBridge>
+    > = []
+    const targetIds = new Set<string>()
+    const catalog: AgentModelCatalogEntry[] = []
+    let activeProvider: ProviderRuntimeTarget['provider'] | undefined
+    try {
+      for (const planned of transport.targets) {
+        const candidate = planned.target
+        const model = candidate.effectiveModel ?? candidate.provider.model
+        if (!model) continue
+        const key = candidate.provider.key ? { key: candidate.provider.key } : {}
+        const bridge =
+          planned.oauth === 'xai'
+            ? this.createXaiOAuthProviderBridge(
+                [{ id: planned.id, model }],
+                planned.id,
+                'chat-completions',
+                this.getXaiOAuthAccessToken,
+                { token }
+              )
+            : planned.wire === 'messages'
+              ? this.createMessagesBridge(
+                  [
+                    {
+                      ...this.healthObservation(candidate),
+                      id: planned.id,
+                      baseUrl: planned.endpoint!,
+                      ...key,
+                      model,
+                      ...(candidate.provider.vendorId &&
+                      usesVendorMessagesApiKeyHeader(candidate.provider.vendorId)
+                        ? { useApiKeyHeader: true }
+                        : {})
+                    }
+                  ],
+                  planned.id,
+                  { token }
+                )
+              : this.createProtocolForwardingBridge(
+                  [
+                    {
+                      ...this.healthObservation(candidate),
+                      id: planned.id,
+                      wire: planned.wire,
+                      endpoint: planned.endpoint!,
+                      ...key,
+                      model
+                    }
+                  ],
+                  planned.id,
+                  { token }
+                )
+        bridges.push(bridge)
+        const connection = await bridge.start()
+        const localProvider = Object.freeze({
+          ...candidate.provider,
+          agentProviderId: piModelId(candidate.providerId, model),
+          baseUrl: connection.baseUrl,
+          chatCompletionsBaseUrl: undefined,
+          responsesBaseUrl: undefined,
+          model,
+          key: token,
+          apiEndpoints: [planned.wire] as const
+        })
+        catalog.push(
+          Object.freeze({
+            provider: localProvider,
+            ...(planned.reasoningEffort ? { reasoningEffort: planned.reasoningEffort } : {}),
+            ...(planned.reasoningEfforts ? { reasoningEfforts: planned.reasoningEfforts } : {})
+          })
+        )
+        targetIds.add(planned.id)
+        if (planned.id === transport.initialTargetId) activeProvider = localProvider
+      }
+      if (!activeProvider) throw new Error('The active Pi model was not registered.')
+      let released = false
+      const release = async (): Promise<void> => {
+        if (released) return
+        released = true
+        await Promise.all(bridges.map((bridge) => bridge.close()))
+      }
+      return Object.freeze({
+        provider: activeProvider,
+        providerModelCatalog: Object.freeze(catalog),
+        piModelBridge: Object.freeze({ token }),
+        environment: loopbackProxyBypassEnvironment(process.env),
+        providerTransportLease: {
+          // Pi selects among catalog models itself; each target keeps its own bridge.
+          setTarget: (targetId: string) => !released && targetIds.has(targetId),
+          release
+        },
+        release
+      })
+    } catch (error) {
+      await Promise.all(bridges.map((bridge) => bridge.close().catch(() => undefined)))
+      throw error
+    }
+  }
+
+  private async startCodeBuddyTransport(
+    input: ProviderTransportRequest
+  ): Promise<ProviderTransportGeneration> {
+    const provider = input.activeTarget.provider
+    const model = input.activeTarget.effectiveModel ?? provider.model
+    if (!model) throw new Error('The CodeBuddy provider target is incomplete.')
+    const targetId = JSON.stringify(['codebuddy', input.activeTarget.providerId, model])
+    const transport = input.plan.transport
+    const usesXaiOAuth = provider.type === 'xai-subscription'
+    const bridge: ChatCompletionsCompatibilityBridgePort =
+      transport.kind === 'codebuddy-provider-compatibility'
+        ? this.createChatCompletionsCompatibilityBridge({
+            ...this.healthObservation(input.activeTarget),
+            wire: transport.wire,
+            endpoint: codeBuddyCompatibilityEndpoint(provider, transport.wire),
+            ...(provider.key ? { key: provider.key } : {}),
+            model,
+            adaptRequest: adaptCodeBuddyChatCompletionsRequest
+          })
+        : usesXaiOAuth
+          ? this.createXaiOAuthProviderBridge(
+              [{ id: targetId, model }],
+              targetId,
+              'chat-completions',
+              this.getXaiOAuthAccessToken,
+              { adaptChatCompletionsRequest: adaptCodeBuddyChatCompletionsRequest }
+            )
+          : (() => {
+              const endpoint = resolveChatCompletionsUrl(provider)
+              if (!endpoint) throw new Error('The CodeBuddy provider target is incomplete.')
+              return this.createProtocolForwardingBridge(
+                [
+                  {
+                    ...this.healthObservation(input.activeTarget),
+                    id: targetId,
+                    wire: 'chat-completions',
+                    endpoint,
+                    ...(provider.key ? { key: provider.key } : {}),
+                    model,
+                    adaptRequest: adaptCodeBuddyChatCompletionsRequest
+                  }
+                ],
+                targetId
+              )
+            })()
+    let selector: ReturnType<typeof createCodeBuddySkillSelectorTransport> | undefined =
+      transport.kind === 'codebuddy-provider-compatibility' || usesXaiOAuth
+        ? undefined
+        : createCodeBuddySkillSelectorTransport({
+            activeTarget: input.activeTarget,
+            ...(input.plan.sessionEffort ? { reasoningEffort: input.plan.sessionEffort } : {}),
+            createSelector: this.createResponsesToChatCompletionsBridge
+          })
+    try {
+      const connection = await bridge.start()
+      const routedProvider = Object.freeze({
+        ...provider,
+        baseUrl: connection.baseUrl,
+        chatCompletionsBaseUrl: `${connection.baseUrl}/v1`,
+        model,
+        key: connection.token,
+        apiEndpoints: ['chat-completions'] as const
+      })
+      selector ??= createCodeBuddySkillSelectorTransport({
+        activeTarget: {
+          ...input.activeTarget,
+          provider: routedProvider,
+          apiEndpoints: ['chat-completions']
+        },
+        ...(input.plan.sessionEffort ? { reasoningEffort: input.plan.sessionEffort } : {}),
+        createSelector: this.createResponsesToChatCompletionsBridge
+      })
+      let released = false
+      const release = async (): Promise<void> => {
+        if (released) return
+        released = true
+        await Promise.all([bridge.close(), selector?.release()])
+      }
+      const selectSkills = selector.providerTransportLease?.selectSkills
+      return Object.freeze({
+        provider: routedProvider,
+        environment: loopbackProxyBypassEnvironment(process.env),
+        providerTransportLease: {
+          setTarget: () => false,
+          ...(selectSkills ? { selectSkills } : {}),
+          release
+        },
+        release
+      })
+    } catch (error) {
+      await Promise.all([
+        bridge.close().catch(() => undefined),
+        selector?.release().catch(() => undefined)
+      ])
+      throw error
+    }
+  }
+
+  private async startNativeCodexTransport(
+    input: ProviderTransportRequest
+  ): Promise<ProviderTransportGeneration> {
+    const transport = input.plan.transport
+    if (transport.kind !== 'codex-native-responses') {
+      throw new Error('Native Codex provider transport is unavailable.')
+    }
+    const targets = transport.targets.map((planned): ProtocolForwardingBridgeTarget => {
+      const candidate = planned.target
+      const model = candidate.effectiveModel ?? candidate.provider.model
+      const baseUrl = resolveResponsesBaseUrl(candidate.provider)
+      if (!model || !baseUrl) throw new Error('The native Responses provider target is incomplete.')
+      return Object.freeze({
+        ...this.healthObservation(candidate),
+        id: planned.id,
+        wire: 'responses',
+        endpoint: `${baseUrl}/responses`,
+        ...(candidate.provider.key ? { key: candidate.provider.key } : {}),
+        model
+      })
+    })
+    const activeModel = input.activeTarget.effectiveModel ?? input.activeTarget.provider.model
+    if (!activeModel) throw new Error('The active native Responses model is unavailable.')
+    const initialTargetId = transport.initialTargetId
+    if (!initialTargetId) throw new Error('The active native Responses model is unavailable.')
+    const bridge = this.createProtocolForwardingBridge(targets, initialTargetId)
+    try {
+      const connection = await bridge.start()
+      let released = false
+      const release = async (): Promise<void> => {
+        if (released) return
+        released = true
+        await bridge.close()
+      }
+      return Object.freeze({
+        provider: Object.freeze({
+          ...input.activeTarget.provider,
+          baseUrl: connection.baseUrl,
+          chatCompletionsBaseUrl: `${connection.baseUrl}/v1`,
+          model: activeModel,
+          key: connection.token,
+          apiEndpoints: ['responses'] as const
+        }),
+        environment: loopbackProxyBypassEnvironment(process.env),
+        providerTransportLease: {
+          setTarget: (targetId: string) => bridge.setTarget(targetId),
+          release
+        },
+        release
+      })
+    } catch (error) {
+      await bridge.close().catch(() => undefined)
+      throw error
+    }
+  }
+
+  private async startOpenCodeTransport(
+    input: ProviderTransportRequest
+  ): Promise<ProviderTransportGeneration> {
+    const transport = input.plan.transport
+    if (transport.kind !== 'opencode-openai' && transport.kind !== 'opencode-anthropic') {
+      throw new Error('OpenCode provider transport is unavailable.')
+    }
+    const bridges: Array<MessagesBridgePort | ProtocolForwardingBridgePort> = []
+    const targetIds = new Set<string>()
+    const catalog: AgentModelCatalogEntry[] = []
+    let activeProvider: ProviderRuntimeTarget['provider'] | undefined
+    let activeTargetId: string | undefined
+    try {
+      for (const planned of transport.targets) {
+        const candidate = planned.target
+        const model = candidate.effectiveModel ?? candidate.provider.model
+        if (!model) continue
+        const targetId = planned.id
+        const bridge =
+          candidate.provider.type === 'xai-subscription'
+            ? this.createXaiOAuthProviderBridge(
+                [{ id: targetId, model }],
+                targetId,
+                'chat-completions',
+                this.getXaiOAuthAccessToken
+              )
+            : transport.kind === 'opencode-openai'
+              ? this.createProtocolForwardingBridge(
+                  [
+                    {
+                      ...this.healthObservation(candidate),
+                      id: targetId,
+                      wire: 'chat-completions',
+                      endpoint: resolveChatCompletionsUrl(candidate.provider)!,
+                      adaptStream: bufferChatCompletionsToolNames,
+                      ...(candidate.provider.key ? { key: candidate.provider.key } : {}),
+                      model
+                    }
+                  ],
+                  targetId
+                )
+              : this.createMessagesBridge(
+                  [
+                    {
+                      ...this.healthObservation(candidate),
+                      id: targetId,
+                      baseUrl: normalizeMessagesRootUrl(candidate.provider.baseUrl ?? ''),
+                      ...(candidate.provider.key ? { key: candidate.provider.key } : {}),
+                      model,
+                      ...(candidate.provider.vendorId &&
+                      usesVendorMessagesApiKeyHeader(candidate.provider.vendorId)
+                        ? { useApiKeyHeader: true }
+                        : {})
+                    }
+                  ],
+                  targetId
+                )
+        bridges.push(bridge)
+        const connection = await bridge.start()
+        const apiEndpoints = [
+          transport.kind === 'opencode-openai'
+            ? ('chat-completions' as const)
+            : ('messages' as const)
+        ]
+        const localProvider = Object.freeze({
+          ...candidate.provider,
+          agentProviderId: opencodeTransportProviderId(candidate.providerId, model),
+          baseUrl: connection.baseUrl,
+          ...(transport.kind === 'opencode-openai'
+            ? { chatCompletionsBaseUrl: `${connection.baseUrl}/v1` }
+            : { chatCompletionsBaseUrl: undefined }),
+          model,
+          key: connection.token,
+          apiEndpoints
+        })
+        catalog.push(
+          Object.freeze({
+            provider: localProvider,
+            ...(planned.reasoningEffort ? { reasoningEffort: planned.reasoningEffort } : {}),
+            ...(planned.reasoningEfforts ? { reasoningEfforts: planned.reasoningEfforts } : {})
+          })
+        )
+        targetIds.add(targetId)
+        if (
+          candidate.providerId === input.activeTarget.providerId &&
+          model === (input.activeTarget.effectiveModel ?? input.activeTarget.provider.model)
+        ) {
+          activeProvider = localProvider
+          activeTargetId = targetId
+        }
+      }
+      if (!activeProvider)
+        throw new Error('The active OpenCode transport target was not registered.')
+      let released = false
+      const release = async (): Promise<void> => {
+        if (released) return
+        released = true
+        await Promise.all(bridges.map((bridge) => bridge.close()))
+      }
+      return Object.freeze({
+        provider: activeProvider,
+        providerModelCatalog: Object.freeze(catalog),
+        environment: loopbackProxyBypassEnvironment(process.env),
+        providerTransportLease: {
+          setTarget: (targetId: string) => {
+            if (!targetIds.has(targetId)) return false
+            if (activeTargetId !== targetId) {
+              activeTargetId = targetId
+              for (const bridge of bridges) bridge.clearErrorReplay()
+            }
+            return true
+          },
+          release
+        },
+        release
+      })
+    } catch (error) {
+      await Promise.all(bridges.map((bridge) => bridge.close().catch(() => undefined)))
+      throw error
+    }
+  }
+
+  private async startClaudeTransport(
+    input: ProviderTransportRequest
+  ): Promise<ProviderTransportGeneration> {
+    const transport = input.plan.transport
+    if (transport.kind !== 'claude-anthropic') {
+      throw new Error('Claude Anthropic transport is unavailable.')
+    }
+    const bridge =
+      input.activeTarget.provider.type === 'xai-subscription'
+        ? this.createXaiOAuthProviderBridge(
+            transport.targets.map(({ id, model }) => ({ id, model })),
+            transport.initialTargetId,
+            'messages',
+            this.getXaiOAuthAccessToken
+          )
+        : this.createMessagesBridge(
+            transport.targets.map(({ runtimeTarget, ...target }) => ({
+              ...target,
+              ...(runtimeTarget ? this.healthObservation(runtimeTarget) : {})
+            })),
+            transport.initialTargetId
+          )
+    try {
+      const connection = await bridge.start()
+      let released = false
+      const release = async (): Promise<void> => {
+        if (released) return
+        released = true
+        await bridge.close()
+      }
+      return Object.freeze({
+        environment: {
+          ...claudeCodeLoopbackEnv(
+            connection,
+            input.activeTarget.provider.type === 'xai-subscription'
+          ),
+          ...loopbackProxyBypassEnvironment(process.env)
+        },
+        providerConfiguration: {
+          providerId: CLAUDE_ACP_CONFIGURABLE_PROVIDER_ID,
+          apiType: 'anthropic',
+          baseUrl: connection.baseUrl,
+          headers: { 'x-api-key': connection.token }
+        },
+        messagesBridgeLease: {
+          setTarget: (targetId: string) => bridge.setTarget(targetId),
+          release
+        },
+        release
+      })
+    } catch (error) {
+      await bridge.close().catch(() => undefined)
+      throw error
+    }
+  }
+
+  private async startNativeResponsesCompatibility(
+    input: ProviderTransportRequest
+  ): Promise<LeasedResponsesConnection> {
+    const transport = input.plan.transport
+    if (transport.kind !== 'codex-responses-compatibility') {
+      throw new Error('Native Responses compatibility transport is unavailable.')
+    }
+    const createTarget = (candidate: ProviderRuntimeTarget): NativeResponsesProxyTarget => {
+      const targetBaseUrl = resolveResponsesBaseUrl(candidate.provider)
+      if (!targetBaseUrl) throw new Error('The native Responses provider has no base URL.')
+      return {
+        ...this.healthObservation(candidate),
+        baseUrl: targetBaseUrl,
+        vendorId: candidate.provider.vendorId,
+        key: candidate.provider.key,
+        ...(candidate.provider.type === 'xai-subscription'
+          ? {
+              resolveKey: this.getXaiOAuthAccessToken,
+              sanitizeRequest: sanitizeXaiResponsesRequest
+            }
+          : {}),
+        model: candidate.effectiveModel ?? candidate.provider.model,
+        reviewerScope: { namespacedTools: [...(input.plan.reviewerBridgeTools ?? [])] }
+      }
+    }
+    const targets = new Map<string, NativeResponsesProxyTarget>()
+    for (const planned of transport.targets) {
+      const candidate = planned.target
+      if (!(candidate.effectiveModel ?? candidate.provider.model)) continue
+      targets.set(planned.id, createTarget(candidate))
+    }
+    const activeModel = input.activeTarget.effectiveModel ?? input.activeTarget.provider.model
+    const initialTargetId = activeModel
+      ? transport.targets.find(
+          ({ target }) =>
+            target.providerId === input.activeTarget.providerId &&
+            (target.effectiveModel ?? target.provider.model) === activeModel
+        )?.id
+      : undefined
+    const generationId = this.nextGenerationId()
+    const proxy = this.createNativeResponsesProxy(
+      (initialTargetId ? targets.get(initialTargetId) : undefined) ??
+        createTarget(input.activeTarget)
+    )
+    const entry = { proxy, connection: proxy.start() }
+    this.nativeResponsesCompatibilityProxies.set(generationId, entry)
+
+    let connection: ResponsesConnection
+    try {
+      connection = await entry.connection
+    } catch (error) {
+      if (this.nativeResponsesCompatibilityProxies.get(generationId) === entry) {
+        this.nativeResponsesCompatibilityProxies.delete(generationId)
+      }
+      await entry.proxy.close().catch(() => undefined)
+      throw error
+    }
+
+    let released = false
+    const release = async (): Promise<void> => {
+      if (released) return
+      released = true
+      if (this.nativeResponsesCompatibilityProxies.get(generationId) !== entry) return
+      this.nativeResponsesCompatibilityProxies.delete(generationId)
+      await entry.proxy.close()
+    }
+    return Object.freeze({
+      ...connection,
+      lease: {
+        selectSkills: (text, catalog, signal, observeUsage) =>
+          entry.proxy.selectSkills(text, catalog, signal, observeUsage),
+        registerReviewerSession: (key) => entry.proxy.registerReviewerSession(key),
+        unregisterReviewerSession: (key) => entry.proxy.unregisterReviewerSession(key),
+        registerToolLessSession: (key) => entry.proxy.registerToolLessSession(key),
+        unregisterToolLessSession: (key) => entry.proxy.unregisterToolLessSession(key),
+        registerHostMessageSession: (key, tools, options) =>
+          entry.proxy.registerHostMessageSession(key, tools, options),
+        unregisterHostMessageSession: (key) => entry.proxy.unregisterHostMessageSession(key),
+        setModelTarget: (target) => entry.proxy.setModelTarget(target),
+        release
+      },
+      ...(targets.size > 0
+        ? {
+            providerTransportLease: {
+              setTarget: (targetId: string) => {
+                const providerTarget = targets.get(targetId)
+                if (!providerTarget) return false
+                entry.proxy.setTarget(providerTarget)
+                return true
+              },
+              release
+            }
+          }
+        : {})
+    })
+  }
+
+  private async startResponsesToChatCompletionsBridge(
+    input: ProviderTransportRequest
+  ): Promise<LeasedResponsesConnection> {
+    const transport = input.plan.transport
+    if (transport.kind !== 'codex-chat') throw new Error('Codex Chat transport is unavailable.')
+    const createTarget = (
+      candidate: ProviderRuntimeTarget,
+      effort: ModelReasoningEffort | undefined
+    ): ResponsesToChatCompletionsBridgeTarget => {
+      const targetBaseUrl = resolveChatCompletionsBaseUrl(candidate.provider)
+      if (!targetBaseUrl) throw new Error('The Chat Completions provider has no base URL.')
+      return {
+        ...this.healthObservation(candidate),
+        baseUrl: targetBaseUrl,
+        key: candidate.provider.key,
+        vendorId: candidate.provider.vendorId,
+        reasoningEffortTransport: candidate.provider.reasoningEffortTransport,
+        model: candidate.effectiveModel ?? candidate.provider.model,
+        reasoningEffort: effort,
+        namespacedTools: [...(input.plan.codexBridgeTools ?? [])],
+        reviewerScope: { namespacedTools: [...(input.plan.reviewerBridgeTools ?? [])] }
+      }
+    }
+    const targets = new Map<string, ResponsesToChatCompletionsBridgeTarget>()
+    for (const planned of transport.targets) {
+      const candidate = planned.target
+      const model = candidate.effectiveModel ?? candidate.provider.model
+      if (!model) continue
+      targets.set(planned.id, createTarget(candidate, planned.reasoningEffort))
+    }
+    const activeModel = input.activeTarget.effectiveModel ?? input.activeTarget.provider.model
+    const initialTargetId = activeModel
+      ? transport.targets.find(
+          ({ target }) =>
+            target.providerId === input.activeTarget.providerId &&
+            (target.effectiveModel ?? target.provider.model) === activeModel
+        )?.id
+      : undefined
+    const target =
+      (initialTargetId ? targets.get(initialTargetId) : undefined) ??
+      createTarget(input.activeTarget, input.plan.sessionEffort)
+    const generationId = this.nextGenerationId()
+    const bridge = this.createResponsesToChatCompletionsBridge(target)
+    const entry = { bridge, connection: bridge.start() }
+    this.responsesToChatCompletionsBridges.set(generationId, entry)
+
+    let connection: ResponsesConnection
+    try {
+      connection = await entry.connection
+    } catch (error) {
+      if (this.responsesToChatCompletionsBridges.get(generationId) === entry) {
+        this.responsesToChatCompletionsBridges.delete(generationId)
+      }
+      await entry.bridge.close().catch(() => undefined)
+      throw error
+    }
+
+    let released = false
+    const release = async (): Promise<void> => {
+      if (released) return
+      released = true
+      if (this.responsesToChatCompletionsBridges.get(generationId) !== entry) return
+      this.responsesToChatCompletionsBridges.delete(generationId)
+      await entry.bridge.close()
+    }
+    return Object.freeze({
+      ...connection,
+      lease: {
+        selectSkills: (text, catalog, signal, observeUsage) =>
+          entry.bridge.selectSkills(text, catalog, signal, observeUsage),
+        registerReviewerSession: (key) => entry.bridge.registerReviewerSession(key),
+        unregisterReviewerSession: (key) => entry.bridge.unregisterReviewerSession(key),
+        registerToolLessSession: (key) => entry.bridge.registerToolLessSession(key),
+        unregisterToolLessSession: (key) => entry.bridge.unregisterToolLessSession(key),
+        registerHostMessageSession: (key, tools, options) =>
+          entry.bridge.registerHostMessageSession(key, tools, options),
+        unregisterHostMessageSession: (key) => entry.bridge.unregisterHostMessageSession(key),
+        registerMcpSession: (key, tools, namespaces) =>
+          entry.bridge.registerMcpSession?.(key, tools, namespaces),
+        unregisterMcpSession: (key) => entry.bridge.unregisterMcpSession?.(key) ?? false,
+        setReasoningEffort: (effort) => entry.bridge.setReasoningEffort(effort),
+        setModelTarget: (target) => entry.bridge.setModelTarget(target),
+        release
+      },
+      ...(targets.size > 0
+        ? {
+            providerTransportLease: {
+              setTarget: (targetId: string) => {
+                const providerTarget = targets.get(targetId)
+                if (!providerTarget) return false
+                entry.bridge.setTarget(providerTarget)
+                return true
+              },
+              release
+            }
+          }
+        : {})
+    })
+  }
+}
+
+export { ProviderTransportOwner }
+export type { ProviderTransportOwnerOptions }

@@ -1,0 +1,765 @@
+/* eslint-disable @typescript-eslint/explicit-function-return-type */
+
+// These proofs use native paragraph/ordinal ownership, never detector confidence.
+// A caption or a spanning native table rule remains the caller's stronger evidence.
+function wholeNativeRows(frame, items, rules) {
+  if (
+    frame.length !== 4 ||
+    !frame.every(Number.isFinite) ||
+    frame[2] <= frame[0] ||
+    frame[3] <= frame[1] ||
+    rules.some((r) => r.length !== 4 || !r.every(Number.isFinite)) ||
+    // Unknown coordinates cannot prove that a meaningful native field is
+    // external to this crop. Check them before selecting the owned subset.
+    items.some((i) => i.text?.trim() && (i.rect?.length !== 4 || !i.rect.every(Number.isFinite)))
+  )
+    return undefined
+  const source = items.filter(
+    (i) =>
+      i.rect?.length === 4 &&
+      i.rect[2] > frame[0] &&
+      i.rect[0] < frame[2] &&
+      i.rect[3] > frame[1] &&
+      i.rect[1] < frame[3]
+  )
+  if (
+    !source.length ||
+    source.some(
+      (i) =>
+        !i.horizontal ||
+        !i.text?.trim() ||
+        !i.rect.every(Number.isFinite) ||
+        !Number.isFinite(i.height) ||
+        !Number.isFinite(i.baseline) ||
+        i.height <= 0 ||
+        i.rect[2] <= i.rect[0] ||
+        Math.abs(i.height - (i.rect[3] - i.rect[1])) > 1e-7 ||
+        Math.abs(i.baseline - i.rect[3]) > 1e-7 ||
+        i.rect[0] < frame[0] ||
+        i.rect[1] < frame[1] ||
+        i.rect[2] > frame[2] ||
+        i.rect[3] > frame[3]
+    ) ||
+    source.some((i, n) =>
+      source
+        .slice(n + 1)
+        .some((p) => p.text === i.text && p.rect.every((v, k) => Math.abs(v - i.rect[k]) < 1e-7))
+    )
+  )
+    return undefined
+  const rows = []
+  for (const i of [...source].sort((a, b) => a.baseline - b.baseline || a.rect[0] - b.rect[0])) {
+    const row = rows.find(
+      (r) => Math.abs(r[0].baseline - i.baseline) < Math.min(r[0].height, i.height) * 0.15
+    )
+    if (row) row.push(i)
+    else rows.push([i])
+  }
+  rows.forEach((r) => r.sort((a, b) => a.rect[0] - b.rect[0]))
+  return rows
+}
+
+function hasWholeFontContents(rows, left, width) {
+  if (
+    !rows ||
+    rows[0].length !== 1 ||
+    !/^Contents$/i.test(rows[0][0].text.trim()) ||
+    rows.slice(1).some((r) => r.length !== 2)
+  )
+    return false
+  const entries = rows.slice(1).map((r) => ({
+    title: r[0],
+    target: r[1],
+    match: /^([A-Z])(\d+)\.\s+(.+)$/u.exec(r[0].text.trim())
+  }))
+  if (
+    entries.length < 4 ||
+    entries.some(
+      (r) => !r.match || !/\p{L}{2}/u.test(r.match[3]) || !/^\d+$/.test(r.target.text.trim())
+    )
+  )
+    return false
+  const em = entries[0].title.height
+  return entries.every(
+    (r, n) =>
+      Math.abs(r.title.height - em) < 1e-7 &&
+      Math.abs(r.target.height - em) < 1e-7 &&
+      r.title.rect[0] <= left + width * 0.2 &&
+      r.target.rect[0] >= left + width * 0.8 &&
+      r.target.rect[0] - r.title.rect[2] >= em * 3 &&
+      Math.abs(r.target.rect[2] - entries[0].target.rect[2]) <= em * 0.2 &&
+      Math.abs(r.title.rect[0] - entries[0].title.rect[0]) <= em * 0.6 &&
+      (!n ||
+        (r.match[1] === entries[0].match[1] &&
+          Number(r.match[2]) === Number(entries[n - 1].match[2]) + 1 &&
+          Number(r.target.text) >= Number(entries[n - 1].target.text) &&
+          r.title.baseline - entries[n - 1].title.baseline >= em * 1.2 &&
+          r.title.baseline - entries[n - 1].title.baseline <= em * 3.5))
+  )
+}
+
+function hasWholeFontNumberedReferences(rows, table, left, width) {
+  if (!rows) return false
+  const starts = rows.filter((r) => /^\d+\.$/.test(r[0].text.trim()) && r.length >= 2)
+  if (starts.length < 3 || starts[0] !== rows[0]) return false
+  const em = starts[0][0].height,
+    margin = starts[0][0].rect[0],
+    bodyLeft = starts[0][1].rect[0]
+  if (
+    starts.some(
+      (r, n) =>
+        Math.abs(r[0].rect[0] - margin) > em * 0.2 ||
+        Math.abs(r[1].rect[0] - bodyLeft) > em * 0.2 ||
+        r[1].rect[0] - r[0].rect[2] < em ||
+        bodyLeft - margin < em * 2 ||
+        bodyLeft - margin > em * 4 ||
+        (n && Number(r[0].text.slice(0, -1)) !== Number(starts[n - 1][0].text.slice(0, -1)) + 1)
+    )
+  )
+    return false
+  const paragraphs = []
+  for (const row of rows) {
+    if (row.some((i) => Math.abs(i.height - em) > 1e-7)) return false
+    if (starts.includes(row)) paragraphs.push([row.slice(1)])
+    else {
+      const paragraph = paragraphs.at(-1),
+        previous = paragraph?.at(-1)
+      if (!paragraph) return false
+      // An isolated last page ordinal is external to the citation paragraphs.
+      // Require its complete font, common margin and independent lower gap.
+      if (
+        row.length === 1 &&
+        /^\d+$/.test(row[0].text.trim()) &&
+        row === rows.at(-1) &&
+        Math.abs(row[0].rect[0] - margin) < em * 0.2 &&
+        row[0].baseline - previous[0].baseline > em * 3
+      )
+        continue
+      if (
+        Math.abs(row[0].rect[0] - margin) > em * 0.2 ||
+        row[0].baseline - previous[0].baseline < em * 1.5 ||
+        row[0].baseline - previous[0].baseline > em * 3
+      )
+        return false
+      paragraph.push(row)
+    }
+  }
+  if (
+    paragraphs.some((paragraph) => {
+      const text = paragraph.map((r) => r.map((i) => i.text).join('')).join(' ')
+      return (
+        !/^\p{Lu}[\p{L}’'-]+,\s*\p{Lu}\./u.test(text) ||
+        (text.match(/\p{L}{2,}/gu) ?? []).length < 5 ||
+        !(
+          /\((?:19|20)\d{2}[a-z]?\)\.?\s*$/.test(text) ||
+          /https:\/\/(?:dx\.)?doi\.org\/10\.\d+\/[\w./-]+\.?\s*$/.test(text)
+        ) ||
+        paragraph[0].at(-1).rect[2] - bodyLeft < width * 0.5 ||
+        paragraph.some((r) =>
+          r.some(
+            (i, n) => n && (i.rect[0] - r[n - 1].rect[2] > em * 0.9 || i.rect[0] < r[n - 1].rect[0])
+          )
+        )
+      )
+    })
+  )
+    return false
+  const cuts = [
+    ...new Set(
+      (table.cells ?? [])
+        .filter((c) => c.colSpan === 1)
+        .map((c) => c.rect?.[2])
+        .filter((x) => Number.isFinite(x) && x > left + em && x < left + width - em)
+    )
+  ]
+  // A complete continuation crosses the detector's cell division. No font or
+  // fragment may be sliced into an independent citation comparison field.
+  return paragraphs.some((paragraph) =>
+    paragraph
+      .slice(1)
+      .some((r) => r.some((i) => cuts.some((x) => i.rect[0] < x - em && i.rect[2] > x + em)))
+  )
+}
+
+// The detector can see only the final pair of entries and a page ordinal. The
+// complete native packet above the crop must establish the reference section.
+function hasNativeBracketedReferenceTail(table, items, rules) {
+  const [left, top, right, bottom] = table.cropRect
+  const keys = table.grid.map((row) => row[0]?.trim()).filter(Boolean)
+  if (
+    keys.length !== 2 ||
+    keys.some((key) => !/^\[[1-9]\d*\]$/u.test(key)) ||
+    table.grid.some((row) => row.length !== 2) ||
+    table.grid.at(-1)[0].trim() ||
+    !/^\d+$/.test(table.grid.at(-1)[1].trim())
+  )
+    return false
+  const headings = items.filter(
+    (item) =>
+      item.horizontal &&
+      /^(?:References|Bibliography)$/iu.test(item.text.trim()) &&
+      item.rect[0] >= left &&
+      item.rect[2] <= right &&
+      item.rect[3] < top
+  )
+  if (headings.length !== 1) return false
+  const heading = headings[0]
+  const rows = wholeNativeRows([left, heading.rect[1], right, bottom], items, rules)
+  if (
+    !rows ||
+    rows.length < 6 ||
+    rows.length > 80 ||
+    rows[0].length !== 1 ||
+    rows[0][0] !== heading ||
+    rules.some(
+      (rule) =>
+        Math.abs(rule[3] - rule[1]) < 1 &&
+        rule[1] >= heading.rect[1] &&
+        rule[1] <= bottom &&
+        Math.min(rule[2], right) - Math.max(rule[0], left) > (right - left) / 2
+    )
+  )
+    return false
+  const last = rows.at(-1),
+    folio = last[0]
+  const origin = (item) =>
+    item.sourceItem?.text === item.text &&
+    Number.isSafeInteger(item.sourceItem.index) &&
+    item.sourceItem.pageNumber === folio.sourceItem?.pageNumber
+  if (
+    last.length !== 1 ||
+    !origin(heading) ||
+    !origin(folio) ||
+    !Number.isSafeInteger(folio.sourceItem.pageNumber) ||
+    folio.sourceItem.pageNumber < 1 ||
+    folio.text.trim() !== String(folio.sourceItem.pageNumber) ||
+    folio.text.trim() !== table.grid.at(-1)[1].trim() ||
+    Math.abs(folio.rect[0] + folio.rect[2] - left - right) > folio.height
+  )
+    return false
+  const first = rows[1][0],
+    em = first.height,
+    bodyLeft = rows[1][1]?.rect[0]
+  if (!Number.isFinite(bodyLeft) || first.baseline - heading.baseline > em * 4) return false
+  const entries = []
+  for (const row of rows.slice(1, -1)) {
+    const marker = row[0]
+    if (row.some((item) => Math.abs(item.height - em) > em * 0.05)) return false
+    if (marker.text.trim() === `[${entries.length + 1}]`) {
+      if (
+        !origin(marker) ||
+        row.length < 2 ||
+        Math.abs(marker.rect[0] - first.rect[0]) > em * 0.2 ||
+        Math.abs(row[1].rect[0] - bodyLeft) > em * 0.2 ||
+        bodyLeft - marker.rect[2] < em * 0.3
+      )
+        return false
+      entries.push({ marker, lines: [row.slice(1)] })
+    } else {
+      const entry = entries.at(-1),
+        prior = entry?.lines.at(-1)[0]
+      if (
+        !prior ||
+        Math.abs(marker.rect[0] - bodyLeft) > em * 0.2 ||
+        marker.baseline - prior.baseline < em * 0.7 ||
+        marker.baseline - prior.baseline > em * 2.5
+      )
+        return false
+      entry.lines.push(row)
+    }
+  }
+  if (entries.length < 4 || folio.baseline - rows.at(-2)[0].baseline < em * 2.5) return false
+  const tail = entries.slice(-2)
+  return (
+    tail.every(({ marker }, i) => marker.rect[1] >= top && marker.text.trim() === keys[i]) &&
+    entries
+      .slice(0, -2)
+      .every(({ lines }) => lines.every((line) => line.every((item) => item.rect[3] <= top))) &&
+    entries.every(({ lines }) => {
+      const text = lines
+        .flat()
+        .map((item) => item.text)
+        .join(' ')
+      return (
+        /^\p{Lu}\.\s/u.test(text) &&
+        /\b(?:19|20)\d{2}\b/u.test(text) &&
+        (text.match(/\p{L}{2,}/gu) ?? []).length >= 6
+      )
+    })
+  )
+}
+
+// A detector crop may slice a two-column caption directory. Its complete
+// native navigation packets, rather than the detector's clipped rows, prove
+// that the repeated integers are ordinals and page targets.
+function hasCaptionDirectory(table, items) {
+  const headings = items.filter((t) => /^List of (?:Figures|Tables)$/u.test(t.text))
+  if (headings.length !== 1) return false
+  const heading = headings[0],
+    h = heading.height
+  const valid = (t) =>
+    t.horizontal &&
+    Number.isFinite(t.baseline) &&
+    Number.isFinite(t.height) &&
+    t.height > 0 &&
+    t.rect?.length === 4 &&
+    t.rect.every(Number.isFinite) &&
+    t.rect[2] > t.rect[0] &&
+    t.rect[3] > t.rect[1] &&
+    Number.isSafeInteger(t.sourceItem?.pageNumber) &&
+    t.sourceItem.pageNumber > 0 &&
+    t.sourceItem.pageNumber === heading.sourceItem?.pageNumber &&
+    Number.isSafeInteger(t.sourceItem?.index) &&
+    t.sourceItem.index >= 0 &&
+    t.sourceItem.text === t.text &&
+    !t.sourceSegment
+  if (!valid(heading)) return false
+  const source = items
+    .filter((t) => t.sourceItem?.index > heading.sourceItem.index)
+    .sort((a, b) => a.sourceItem.index - b.sourceItem.index)
+  if (
+    !source.length ||
+    source.some((t) => !valid(t) || Math.abs(t.height - h) > h * 0.05) ||
+    new Set(items.map((t) => t.sourceItem?.index)).size !== items.length
+  )
+    return false
+  const records = []
+  for (let n = 0; n < source.length;) {
+    const ordinal = source[n++],
+      title = []
+    if (!/^[1-9]\d*$/u.test(ordinal.text)) return false
+    while (source[n] && /\p{L}/u.test(source[n].text)) title.push(source[n++])
+    const target = source[n++]
+    if (
+      !title.length ||
+      !target ||
+      !/^\d+$/u.test(target.text) ||
+      Math.abs(ordinal.baseline - title[0].baseline) > h * 0.1 ||
+      Math.abs(target.baseline - title.at(-1).baseline) > h * 0.1 ||
+      target.rect[0] - ordinal.rect[2] < h * 8 ||
+      title.some((t) => t.rect[0] < ordinal.rect[2] + h * 0.5 || t.rect[2] > target.rect[0] - h)
+    )
+      return false
+    records.push({ ordinal, title, target })
+  }
+  if (
+    records.length < 6 ||
+    records.some(
+      (r, n) =>
+        Number(r.ordinal.text) !== n + 1 ||
+        (n && Number(r.target.text) < Number(records[n - 1].target.text))
+    )
+  )
+    return false
+  const lanes = []
+  for (const r of records) {
+    let lane = lanes.find((g) => Math.abs(g[0].ordinal.rect[0] - r.ordinal.rect[0]) < h * 0.2)
+    if (!lane) lanes.push((lane = []))
+    lane.push(r)
+  }
+  if (
+    lanes.length !== 2 ||
+    lanes.some(
+      (g) =>
+        g.length < 3 ||
+        g.some(
+          (r, n) =>
+            Math.abs(r.target.rect[2] - g[0].target.rect[2]) > h * 0.2 ||
+            (n &&
+              (Number(r.ordinal.text) !== Number(g[n - 1].ordinal.text) + 1 ||
+                r.ordinal.baseline <= g[n - 1].target.baseline))
+        )
+    ) ||
+    lanes[0].at(-1).target.rect[2] >= lanes[1][0].ordinal.rect[0] ||
+    heading.rect[0] < lanes[0][0].ordinal.rect[0] ||
+    heading.rect[2] > lanes[0][0].target.rect[2] ||
+    heading.baseline >= records[0].ordinal.rect[1]
+  )
+    return false
+  const [l, t, r, b] = table.cropRect
+  const selected = items.filter(
+    (i) => i.rect?.[0] < r && i.rect[2] > l && i.rect[1] < b && i.rect[3] > t
+  )
+  const owned = new Set([heading, ...source])
+  const prior = selected
+    .filter((i) => !owned.has(i))
+    .sort((a, b) => a.sourceItem?.index - b.sourceItem?.index)
+  if (
+    prior.length &&
+    (prior.length !== 3 ||
+      prior.some((i) => !valid(i) || Math.abs(i.height - h) > h * 0.05) ||
+      prior[1].rect[0] < prior[0].rect[2] + h * 0.5 ||
+      prior[1].rect[2] > prior[2].rect[0] - h ||
+      prior[2].rect[0] - prior[0].rect[2] < h * 8 ||
+      !/^[1-9]\d*$/u.test(prior[0].text) ||
+      !/\p{L}/u.test(prior[1].text) ||
+      !/^\d+$/u.test(prior[2].text) ||
+      prior.some(
+        (i) => Math.abs(i.baseline - prior[0].baseline) > h * 0.1 || i.baseline >= heading.rect[1]
+      ) ||
+      Math.abs(prior[0].rect[0] - records[0].ordinal.rect[0]) > h * 0.2 ||
+      Math.abs(prior[2].rect[2] - records[0].target.rect[2]) > h * 0.2)
+  )
+    return false
+  return true
+}
+
+// A theorem's final prose line, one complete display, and the terminal page
+// folio form a paragraph tail, even when the detector invents empty table rows.
+function hasProseDisplayFolio(table, items) {
+  const frame = table.cropRect
+  if (items.length > 8192) return false
+  const source = items.filter(
+    (i) =>
+      i.text?.trim() &&
+      i.rect?.[0] < frame[2] &&
+      i.rect[2] > frame[0] &&
+      i.rect[1] < frame[3] &&
+      i.rect[3] > frame[1]
+  )
+  const page = table.page ?? source[0]?.sourceItem?.pageNumber
+  if (
+    !Number.isSafeInteger(page) ||
+    page < 1 ||
+    source.length < 8 ||
+    source.some(
+      (i) =>
+        !i.horizontal ||
+        !(i.height > 0) ||
+        !Number.isFinite(i.baseline) ||
+        i.rect.length !== 4 ||
+        !i.rect.every(Number.isFinite) ||
+        i.rect[0] < frame[0] ||
+        i.rect[1] < frame[1] ||
+        i.rect[2] > frame[2] ||
+        i.rect[3] > frame[3] ||
+        i.sourceItem?.pageNumber !== page ||
+        !Number.isSafeInteger(i.sourceItem.index) ||
+        i.sourceItem.text !== i.text ||
+        i.sourceSegment
+    )
+  )
+    return false
+  source.sort((a, b) => a.sourceItem.index - b.sourceItem.index)
+  const folio = source.at(-1),
+    first = source[0],
+    h = first.height
+  if (
+    new Set(source.map((i) => i.sourceItem.index)).size !== source.length ||
+    folio.text !== String(page) ||
+    (first.text.match(/\p{Ll}{2,}/gu) ?? []).length < 4 ||
+    items.some(
+      (i) =>
+        i.text?.trim() &&
+        i.sourceItem?.index >= first.sourceItem.index &&
+        (!source.includes(i) || i.sourceItem.index > folio.sourceItem.index)
+    )
+  )
+    return false
+  const introduction = source.filter((i) => Math.abs(i.baseline - first.baseline) < h * 0.1),
+    display = source.filter((i) => !introduction.includes(i) && i !== folio)
+  if (
+    display.length < 5 ||
+    introduction[0] !== first ||
+    introduction.some(
+      (i, n) =>
+        Math.abs(i.height - h) > h * 0.05 ||
+        (n &&
+          (i.rect[0] < introduction[n - 1].rect[2] - h * 0.05 ||
+            i.rect[0] - introduction[n - 1].rect[2] > h * 0.8))
+    ) ||
+    display.some((i) => i.rect[1] < first.baseline + h * 0.5) ||
+    Math.max(...display.map((i) => i.rect[3])) - Math.min(...display.map((i) => i.rect[1])) >
+      h * 2 ||
+    folio.rect[1] - Math.max(...display.map((i) => i.rect[3])) < h ||
+    !display.some((i) => /^[=≃≅≈↔]$/u.test(i.text)) ||
+    display.at(-1).text !== '.'
+  )
+    return false
+  const previous = items.filter(
+    (i) =>
+      i.text?.trim() &&
+      i.sourceItem?.pageNumber === page &&
+      i.sourceItem.index < first.sourceItem.index &&
+      i.rect?.[1] > first.rect[1] - h * 8
+  )
+  return previous.some((i) => /\b(?:Corollary|Theorem|Proposition|Lemma)\s+\d/u.test(i.text))
+}
+
+export function hasNativeNonTableLayout(table, items, rules) {
+  if (!table.cropRect || !Array.isArray(rules)) return false
+  const [left, top, right, bottom] = table.cropRect,
+    width = right - left
+  const source = items.filter(
+    (i) =>
+      i.horizontal &&
+      i.height > 0 &&
+      i.rect[3] > top &&
+      i.rect[1] < bottom &&
+      i.rect[2] > left &&
+      i.rect[0] < right
+  )
+  if (
+    !source.length ||
+    rules.some(
+      (r) => Math.abs(r[3] - r[1]) < 1 && r[1] >= top && r[3] <= bottom && r[2] - r[0] > width * 0.5
+    )
+  )
+    return false
+  // Some directories print each section ordinal and its entire title as one
+  // native font. Preserve that whole font; two complete lanes and all repeated
+  // navigation roles must close before treating the page numbers as prose.
+  if (hasCaptionDirectory(table, items)) return true
+  if (hasProseDisplayFolio(table, items)) return true
+  const wholeRows = wholeNativeRows(table.cropRect, items, rules)
+  if (hasWholeFontContents(wholeRows, left, width)) return true
+  if (hasWholeFontNumberedReferences(wholeRows, table, left, width)) return true
+  if (hasNativeBracketedReferenceTail(table, items, rules)) return true
+  const rows = []
+  for (const item of [...source].sort((a, b) => a.baseline - b.baseline || a.rect[0] - b.rect[0])) {
+    const row = rows.find(
+      (r) =>
+        Math.abs(r[0].baseline - item.baseline) < Math.min(r[0].height, item.height) * 0.2 &&
+        Math.min(r[0].height, item.height) > Math.max(r[0].height, item.height) * 0.8
+    )
+    if (row) row.push(item)
+    else rows.push([item])
+  }
+  const chains = rows.flatMap((row) => {
+    const groups = []
+    for (const item of row.sort((a, b) => a.rect[0] - b.rect[0])) {
+      const group = groups.at(-1),
+        previous = group?.at(-1)
+      if (
+        previous &&
+        item.rect[0] - previous.rect[2] < Math.min(item.height, previous.height) * 0.9
+      )
+        group.push(item)
+      else groups.push([item])
+    }
+    return groups
+  })
+  const paragraphs = chains.map((chain) => ({
+    text: chain.map((i) => i.text).join(''),
+    left: chain[0].rect[0],
+    right: chain.at(-1).rect[2],
+    y: chain[0].rect[1],
+    bottom: chain[0].rect[3],
+    em: chain[0].height
+  }))
+  // Page ordinals in a section directory are navigation targets, not measured
+  // records. Require the native title and independently printed section/title/
+  // page lanes before the scalar-record escape below; ruled tables declined above.
+  const contentsTitle = source.filter((i) => /^Contents$/i.test(i.text.trim()))
+  if (contentsTitle.length === 1) {
+    const entries = rows.flatMap((row) => {
+      const ordered = [...row].sort((a, b) => a.rect[0] - b.rect[0]),
+        ordinal = ordered[0],
+        target = ordered.at(-1),
+        middle = ordered.slice(1, -1)
+      if (
+        !ordinal ||
+        !target ||
+        !middle.length ||
+        !/^\d+\.$/.test(ordinal.text.trim()) ||
+        !/^\d+$/.test(target.text.trim()) ||
+        ordinal.baseline <= contentsTitle[0].baseline ||
+        target.rect[0] < left + width * 0.8 ||
+        target.rect[0] - middle.at(-1).rect[2] < target.height ||
+        !middle.some((i) => /\p{L}{2}/u.test(i.text))
+      )
+        return []
+      return [{ ordinal: Number(ordinal.text.slice(0, -1)), page: Number(target.text), target }]
+    })
+    if (
+      entries.length >= 4 &&
+      entries.every(
+        (entry, n) =>
+          !n ||
+          (entry.ordinal === entries[n - 1].ordinal + 1 &&
+            entry.page >= entries[n - 1].page &&
+            Math.abs(entry.target.rect[2] - entries[0].target.rect[2]) < entry.target.height)
+      )
+    )
+      return true
+  }
+  const independentScalars = (table.cells ?? []).filter(
+    (cell) =>
+      /^[-+−]?\d+(?:\.\d+)?(?:\s*\([^)]*\))?$/.test(cell.text.trim()) &&
+      source.some(
+        (i) =>
+          i.text.trim() === cell.text.trim() &&
+          i.rect[0] >= cell.rect[0] &&
+          i.rect[2] <= cell.rect[2] &&
+          source.some(
+            (peer) =>
+              peer !== i &&
+              Math.abs(peer.baseline - i.baseline) < Math.min(i.height, peer.height) * 0.2 &&
+              Math.min(peer.height, i.height) >= Math.max(peer.height, i.height) * 0.8 &&
+              peer.rect[2] <= cell.rect[0] &&
+              i.rect[0] - peer.rect[2] > i.height * 2
+          )
+      )
+  )
+  const cuts = [
+    ...new Set(
+      (table.cells ?? [])
+        .filter((c) => c.colSpan === 1)
+        .map((c) => c.rect[2])
+        .filter((x) => x > left + 2 && x < right - 2)
+    )
+  ]
+  const citations = paragraphs.filter(
+    (p) =>
+      /^\p{Lu}[\p{L}’'-]+,\s*\p{Lu}\./u.test(p.text) &&
+      /\b(?:19|20)\d{2}[a-z]?(?:,|\s)/.test(p.text) &&
+      (p.text.match(/\p{L}{2,}/gu) ?? []).length >= 5 &&
+      p.right - p.left > width * 0.25
+  )
+  // Independent citation fields in a comparison do not form long, repeated
+  // author/year paragraphs at each native prose-column margin.
+  const citationMargins = []
+  for (const p of citations) {
+    const margin = citationMargins.find((g) => Math.abs(g[0].left - p.left) < p.em * 0.3)
+    if (margin) margin.push(p)
+    else citationMargins.push([p])
+  }
+  const proseScalar = (cell) =>
+    citationMargins.some(
+      (g) =>
+        g.length >= 3 &&
+        source.some(
+          (i) =>
+            i.text.trim() === cell.text.trim() &&
+            i.rect[0] >= g[0].left &&
+            i.rect[2] <= Math.max(...g.map((p) => p.right)) + i.height &&
+            i.rect[1] >= Math.min(...g.map((p) => p.y)) &&
+            i.rect[3] <= Math.max(...g.map((p) => p.bottom)) + i.height * 2
+        )
+    )
+  const measured = independentScalars.filter((cell) => !proseScalar(cell))
+  if (
+    measured.some((cell) =>
+      measured.some((peer) => peer.row !== cell.row && peer.column === cell.column)
+    )
+  )
+    return false
+  if (
+    citationMargins.some((g) => {
+      if (
+        g.length < 3 ||
+        g.length <
+          paragraphs.filter(
+            (p) => Math.abs(p.left - g[0].left) < p.em * 0.3 && p.right - p.left > width * 0.25
+          ).length *
+            0.6
+      )
+        return false
+      const independentPeers = paragraphs.filter(
+        (p) =>
+          !citations.includes(p) &&
+          !(p.right > right + p.em * 2 && right - p.left < (p.right - p.left) * 0.2) &&
+          !citationMargins.some(
+            (m) =>
+              m.length >= 3 &&
+              p.left >= m[0].left &&
+              p.left < m[0].left + p.em * 2 &&
+              p.right <= Math.max(...m.map((c) => c.right)) + p.em
+          ) &&
+          (p.text.match(/\p{L}{2,}/gu) ?? []).length >= 3 &&
+          g.some(
+            (c) =>
+              Math.abs(c.y - p.y) < c.em * 0.2 &&
+              (p.left > c.right + c.em * 2 || c.left > p.right + c.em * 2)
+          )
+      )
+      return independentPeers.length < 3
+    })
+  )
+    return true
+
+  const labels = source.filter(
+    (i) => /^\((?:[A-Z]\.)?\d+(?:\.\d+)*\)$/.test(i.text.trim()) && i.rect[0] > left + width * 0.8
+  )
+  const text = table.grid.flat().join(' ')
+  const alignedLabels =
+    labels.length >= 2 &&
+    labels.every(
+      (i) =>
+        Math.abs(i.rect[0] - labels[0].rect[0]) < i.height * 0.2 && text.includes(i.text.trim())
+    )
+  const crossedMathRows = chains.filter(
+    (g) =>
+      cuts.some((x) => g[0].rect[0] < x - g[0].height && g.at(-1).rect[2] > x + g[0].height) &&
+      g.some((i) => /[=≤≥⪰∥∇⇒]/.test(i.text))
+  )
+  const introductions = paragraphs.filter(
+    (p) =>
+      /^(?:\p{L}+\s+){2}\p{L}+/u.test(p.text) &&
+      p.left < left + width * 0.1 &&
+      p.right - p.left > width * 0.16
+  )
+  if (
+    alignedLabels &&
+    crossedMathRows.length >= 2 &&
+    introductions.length >= 2 &&
+    labels.every((label) =>
+      source.some(
+        (i) =>
+          /[=≤≥⪰∥∇⇒]/.test(i.text) &&
+          Math.abs(i.baseline - label.baseline) < label.height * 5 &&
+          i.rect[2] < label.rect[0] - label.height * 2
+      )
+    )
+  )
+    return true
+
+  // Parallel page footnotes have short separators, smaller raised ordinals,
+  // indented opening prose and a following line at the separator's left edge.
+  // A small numeric detector cell does not establish an independent record.
+  const noteRules = rules.filter(
+    (r) =>
+      Math.abs(r[3] - r[1]) < 1 &&
+      r[1] >= top &&
+      r[1] <= bottom &&
+      r[2] - r[0] > width * 0.2 &&
+      r[2] - r[0] < width * 0.5
+  )
+  const nativeNotes = noteRules.filter((r) => {
+    const marker = source.find(
+      (i) =>
+        /^\d{1,3}$/.test(i.text.trim()) &&
+        Math.abs(i.rect[0] - r[0]) < i.height * 0.3 &&
+        i.rect[1] >= r[1] &&
+        i.rect[1] - r[1] < i.height * 0.4
+    )
+    if (!marker) return false
+    return (
+      source.some(
+        (i) =>
+          i.height > marker.height * 1.4 &&
+          Math.abs(i.rect[1] - marker.rect[1]) < marker.height * 0.2 &&
+          i.rect[0] > marker.rect[2] &&
+          i.rect[0] - marker.rect[2] < i.height &&
+          (i.text.match(/\p{L}{2,}/gu) ?? []).length >= 5
+      ) &&
+      source.some(
+        (i) =>
+          i.height > marker.height * 1.4 &&
+          Math.abs(i.rect[0] - r[0]) < i.height * 0.2 &&
+          i.rect[1] > marker.rect[1] + marker.height &&
+          i.rect[1] < marker.rect[1] + marker.height * 3 &&
+          /\p{L}/u.test(i.text)
+      )
+    )
+  })
+  return (
+    nativeNotes.length >= 1 &&
+    noteRules.length >= 2 &&
+    table.grid.length <= 3 &&
+    table.grid.every((row) => row.length <= 2) &&
+    paragraphs.filter(
+      (p) => (p.text.match(/\p{L}{2,}/gu) ?? []).length >= 5 && p.right - p.left > width * 0.6
+    ).length >= 2
+  )
+}

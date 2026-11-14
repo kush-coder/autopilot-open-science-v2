@@ -1,0 +1,2702 @@
+import { execFileSync, spawnSync } from 'node:child_process'
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync
+} from 'node:fs'
+import { tmpdir } from 'node:os'
+import { dirname, join } from 'node:path'
+
+import { load } from 'js-yaml'
+import { describe, expect, it } from 'vitest'
+
+import { macosGroupsForPlan } from './classify-pr-changes.mjs'
+import { evaluatePrGate } from './evaluate-pr-gate.mjs'
+import { loadModuleImpactManifest } from './load-module-impact.mjs'
+
+type Step = {
+  'continue-on-error'?: boolean
+  env?: Record<string, string>
+  id?: string
+  if?: string
+  name?: string
+  run?: string
+  uses?: string
+  with?: Record<string, unknown>
+}
+
+type Job = {
+  'continue-on-error'?: boolean
+  env?: Record<string, string>
+  if?: string
+  name?: string
+  needs?: string | string[]
+  outputs?: Record<string, string>
+  'runs-on'?: string
+  strategy?: {
+    'fail-fast'?: boolean
+    matrix?:
+      | {
+          shard?: number[] | string
+          group?: string[] | string
+          include?: Array<{ scope: string; shard: number; total: number }>
+        }
+      | string
+  }
+  steps?: Step[]
+  'timeout-minutes'?: number
+}
+
+type Workflow = {
+  concurrency?: { 'cancel-in-progress'?: boolean; group?: string }
+  jobs: Record<string, Job>
+  on?: {
+    merge_group?: { types?: string[] }
+    pull_request?: { branches?: string[]; 'paths-ignore'?: string[]; types?: string[] }
+    workflow_dispatch?: unknown
+  }
+  permissions?: Record<string, string>
+}
+
+type DependabotUpdate = {
+  'commit-message'?: { prefix?: string }
+  directory?: string
+  groups?: Record<
+    string,
+    { 'applies-to'?: string; 'dependency-type'?: string; patterns?: string[] }
+  >
+  'open-pull-requests-limit'?: number
+  'package-ecosystem'?: string
+  'pull-request-branch-name'?: {
+    'branch-name-case'?: string
+    prefix?: string
+    template?: string
+  }
+}
+
+const workflowText = readFileSync(join(process.cwd(), '.github/workflows/pr-gate.yml'), 'utf8')
+const workflow = load(workflowText) as Workflow
+const dependabot = load(readFileSync(join(process.cwd(), '.github/dependabot.yml'), 'utf8')) as {
+  updates: DependabotUpdate[]
+}
+const manifest = JSON.parse(
+  readFileSync(join(process.cwd(), 'scripts/ci/change-impact.json'), 'utf8')
+) as { bundleOrder: string[]; laneBundles: Record<string, string>; laneOrder: string[] }
+
+describe('PR Gate workflow', () => {
+  it.skipIf(process.platform === 'win32')(
+    'allocates package runners only for trusted affected package evidence',
+    () => {
+      const cwd = mkdtempSync(join(tmpdir(), 'portable-matrix-'))
+      const git = (...args: string[]): string =>
+        execFileSync('git', args, { cwd, encoding: 'utf8' }).trim()
+      const write = (path: string, content = 'changed'): void => {
+        mkdirSync(dirname(join(cwd, path)), { recursive: true })
+        writeFileSync(join(cwd, path), content)
+      }
+      const step = workflow.jobs.preflight.steps!.find(({ id }) => id === 'portable_matrix')!
+      const trustedDir = join(process.cwd(), 'scripts/ci')
+      const registry = readFileSync(join(trustedDir, 'package-test-boundaries.json'), 'utf8')
+      try {
+        git('init', '--quiet')
+        git('config', 'user.email', 'ci@example.com')
+        git('config', 'user.name', 'CI Test')
+        write('scripts/ci/package-test-boundaries.json', registry)
+        for (const { root } of JSON.parse(registry).packages) {
+          write(
+            `${root}/package.json`,
+            readFileSync(join(process.cwd(), root, 'package.json'), 'utf8')
+          )
+        }
+        write('packages/compute/src/old.ts')
+        git('add', '.')
+        git('commit', '--quiet', '-m', 'trusted package baseline')
+        const base = git('rev-parse', 'HEAD')
+        const run = (
+          head: string,
+          event = 'pull_request',
+          dir = trustedDir,
+          trustedBase = base,
+          bundles = ['unit'],
+          comparisonBase = base
+        ): string[] => {
+          const output = join(cwd, 'output')
+          writeFileSync(output, '')
+          const result = spawnSync('bash', ['-e', '-c', step.run!], {
+            cwd,
+            encoding: 'utf8',
+            env: {
+              ...process.env,
+              EVENT_NAME: event,
+              EXECUTION_PLAN: JSON.stringify({ bundles }),
+              BASE_SHA: comparisonBase,
+              HEAD_SHA: head,
+              TRUSTED_BASE_SHA: trustedBase,
+              TRUSTED_CLASSIFIER_DIR: dir,
+              GITHUB_OUTPUT: output,
+              GITHUB_STEP_SUMMARY: join(cwd, 'summary')
+            }
+          })
+          expect(result.status, result.stderr).toBe(0)
+          const [matrixLine, sourceLine] = readFileSync(output, 'utf8').trim().split('\n')
+          const matrix = JSON.parse(matrixLine.slice('matrix='.length))
+          expect(sourceLine).toBe(
+            `package_sources=${['pull_request', 'merge_group'].includes(event) && !bundles.includes('unit') && matrix.include.some(({ scope }: { scope: string }) => scope === 'packages')}`
+          )
+          return matrix.include.map(
+            ({ scope, shard, total }: { scope: string; shard: number; total: number }) =>
+              `${scope}:${shard}/${total}`
+          )
+        }
+        const host = [1, 2, 3, 4].map((shard) => `host:${shard}/4`)
+        const both = [...host, 'packages:1/2', 'packages:2/2']
+        for (const [path, selected] of [
+          ['src/main/host.ts', false],
+          ['docs/packages.md', false],
+          ['scripts/unrelated.test.ts', false],
+          ['test/fixtures/nbformat.v4.5.schema.json', false],
+          ['packages/compute/src/index.ts', true],
+          ['packages/open-science/cli.ts', true],
+          ['packages/new-package/test.ts', true],
+          ['test/fixtures/pdf-translation/sample.json', true],
+          ['package-lock.json', true],
+          ['.nvmrc', true]
+        ] as const) {
+          git('reset', '--hard', base)
+          write(path)
+          git('add', path)
+          git('commit', '--quiet', '-m', 'changed input')
+          const head = git('rev-parse', 'HEAD')
+          // Candidate selector code cannot authorize a skip.
+          write('scripts/ci/package-test-impact.mjs', 'throw new Error("candidate executed")')
+          for (const event of ['pull_request', 'merge_group']) {
+            // Exercise ordinary portable coverage and deferred host coverage without duplicating fixtures.
+            const bundles = event === 'pull_request' ? ['unit'] : []
+            expect(run(head, event, trustedDir, base, bundles), `${event}: ${path}`).toEqual(
+              selected ? both : host
+            )
+          }
+        }
+        git('reset', '--hard', base)
+        write('src/main/host.ts')
+        git('add', 'src/main/host.ts')
+        git('commit', '--quiet', '-m', 'host only')
+        const head = git('rev-parse', 'HEAD')
+        expect(run(head, 'workflow_dispatch')).toEqual(both)
+        expect(run(head, 'pull_request', join(cwd, 'missing-policy'))).toEqual(both)
+        expect(run(head, 'pull_request', trustedDir, '0'.repeat(40))).toEqual(both)
+        // A package change in the synthetic checkout still requires the package group.
+        git('rm', 'packages/compute/src/old.ts')
+        git('commit', '--quiet', '-m', 'delete package source')
+        expect(run(head)).toEqual(both)
+        expect(run(git('rev-parse', 'HEAD'), 'merge_group')).toEqual(both)
+        // Main advancing after a docs branch fork must not become package evidence for that PR.
+        git('reset', '--hard', base)
+        write('docs/ROADMAP.md')
+        git('add', 'docs/ROADMAP.md')
+        git('commit', '--quiet', '-m', 'docs only')
+        const docsHead = git('rev-parse', 'HEAD')
+        git('checkout', '-b', 'advanced-main', base)
+        write('.github/workflows/package-smoke.yml')
+        write('packages/compute/src/main-only.ts')
+        git('add', '.github', 'packages')
+        git('commit', '--quiet', '-m', 'advance main')
+        const targetTip = git('rev-parse', 'HEAD')
+        git('merge', '--no-ff', docsHead, '-m', 'synthetic docs merge')
+        // PR preflight passes the fork point as base and the target tip as trusted-base.
+        expect(run(docsHead, 'pull_request', trustedDir, targetTip, ['docs'])).toEqual(host)
+        // GitHub can recreate the synthetic merge on a newer main than the event's base.sha.
+        expect(run(docsHead, 'pull_request', trustedDir, base, ['docs'])).toEqual(host)
+        expect(
+          run(git('rev-parse', 'HEAD'), 'merge_group', trustedDir, targetTip, ['docs'], targetTip)
+        ).toEqual(host)
+        // Changes introduced by the merge itself must still select package coverage.
+        write('packages/compute/src/merge-only.ts')
+        git('add', 'packages')
+        git('commit', '--amend', '--no-edit')
+        expect(run(docsHead, 'pull_request', trustedDir, targetTip, ['docs'])).toEqual(both)
+        expect(run(docsHead, 'pull_request', trustedDir, base, ['docs'])).toEqual(both)
+      } finally {
+        rmSync(cwd, { recursive: true, force: true })
+      }
+    },
+    30000
+  )
+
+  it('requires selective execution for every affected-test step', () => {
+    const steps = Object.values(workflow.jobs)
+      .flatMap((job) => job.steps ?? [])
+      .filter((step) => step.run?.includes('npm run test:affected'))
+    expect(steps).toHaveLength(3)
+    for (const step of steps) expect(step.run).toContain('--require-selective')
+  })
+
+  it('rejects module dry-runs against changed application code while allowing CI-only fixes', () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'module-coverage-source-'))
+    const git = (...args: string[]): string =>
+      execFileSync('git', args, { cwd, encoding: 'utf8' }).trim()
+    const revisions = workflow.jobs.preflight.steps?.find(({ id }) => id === 'revisions')
+    try {
+      git('init', '--quiet')
+      git('config', 'user.email', 'ci@example.com')
+      git('config', 'user.name', 'CI Test')
+      writeFileSync(join(cwd, 'app.ts'), 'export const value = 1\n')
+      git('add', '.')
+      git('commit', '--quiet', '-m', 'application baseline')
+      const comparisonHead = git('rev-parse', 'HEAD')
+      mkdirSync(join(cwd, 'scripts/ci'), { recursive: true })
+      writeFileSync(join(cwd, 'scripts/ci/runner.mjs'), '// updated runner\n')
+      git('add', '.')
+      git('commit', '--quiet', '-m', 'CI-only fix')
+      const env = {
+        ...process.env,
+        EVENT_NAME: 'workflow_dispatch',
+        DRY_RUN_MODE: 'module-coverage',
+        INPUT_COMPARISON_BASE_SHA: comparisonHead,
+        INPUT_COMPARISON_HEAD_SHA: comparisonHead,
+        GITHUB_OUTPUT: join(cwd, 'output')
+      }
+      const matching = spawnSync('bash', ['-c', revisions!.run!], { cwd, env, encoding: 'utf8' })
+      expect(matching.status, matching.stderr).toBe(0)
+      writeFileSync(join(cwd, 'app.ts'), 'export const value = 2\n')
+      git('add', 'app.ts')
+      git('commit', '--quiet', '-m', 'different application')
+      const mismatched = spawnSync('bash', ['-c', revisions!.run!], { cwd, env, encoding: 'utf8' })
+      expect(mismatched.status).toBe(1)
+      expect(mismatched.stderr).toContain('must match comparison head outside CI files')
+    } finally {
+      rmSync(cwd, { recursive: true, force: true })
+    }
+  })
+
+  it('replays explicit module dry-run revisions through the real revision and plan scripts', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'module-coverage-plan-'))
+    // Mirror the revisions step fallback: shallow or single-commit checkouts have no parent, so
+    // compare HEAD against itself instead of failing the whole suite.
+    const parent = spawnSync('git', ['rev-parse', 'HEAD^'], { encoding: 'utf8' })
+    const base = (
+      parent.status === 0
+        ? parent.stdout
+        : execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' })
+    ).trim()
+    const head = execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()
+    const revisions = workflow.jobs.preflight.steps?.find(({ id }) => id === 'revisions')
+    const classify = workflow.jobs.preflight.steps?.find(({ id }) => id === 'classify')
+    const output = join(dir, 'output')
+    const env = {
+      ...process.env,
+      EVENT_NAME: 'workflow_dispatch',
+      DRY_RUN_MODE: 'module-coverage',
+      INPUT_COMPARISON_BASE_SHA: base,
+      INPUT_COMPARISON_HEAD_SHA: head,
+      GITHUB_OUTPUT: output
+    }
+    try {
+      const resolved = spawnSync('bash', ['-c', revisions!.run!], { env, encoding: 'utf8' })
+      expect(resolved.status, resolved.stderr).toBe(0)
+      expect(readFileSync(output, 'utf8')).toContain(`base=${base}\nhead=${head}`)
+      const planned = spawnSync('bash', ['-c', classify!.run!], { env, encoding: 'utf8' })
+      expect(planned.status, planned.stderr).toBe(0)
+      const planLine = readFileSync(output, 'utf8')
+        .split('\n')
+        .find((line) => line.startsWith('plan='))!
+      expect(JSON.parse(planLine.slice(5))).toMatchObject({
+        mode: 'selective',
+        macosProfile: 'smoke',
+        lanes: ['policy', 'unit_macos'],
+        bundles: ['policy', 'unit']
+      })
+      const invalid = spawnSync('bash', ['-c', revisions!.run!], {
+        env: { ...env, INPUT_COMPARISON_HEAD_SHA: '--bad-revision' },
+        encoding: 'utf8'
+      })
+      expect(invalid.status).toBe(1)
+      expect(invalid.stderr).toContain('Preflight revisions must be full Git commit SHAs')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('runs affected module coverage in the existing portable shards before enforcing merged thresholds', () => {
+    const shards = workflow.jobs.unit_shard
+    for (const event of ['pull_request', 'merge_group']) {
+      expect(shards.if).toContain(`github.event_name == '${event}'`)
+    }
+    const selected = shards.steps?.find(({ id }) => id === 'unit_macos_related_shard')
+    expect(selected?.run).toContain('npm run test:affected')
+    expect(selected?.run).toContain('--coverage-changed "$BASE_SHA" --')
+    expect(selected?.run).toContain('--shard=${{ matrix.shard }}/${{ matrix.total }}')
+    expect(selected?.run).toContain('--reporter=dot')
+    expect(selected?.run).toContain('--reporter=blob')
+    expect(shards.env?.VITEST_DEFER_COVERAGE_THRESHOLDS).toBe('1')
+    const merge = workflow.jobs.unit.steps?.find(({ id }) => id === 'unit_macos_related_merge')
+    expect(merge?.run).toContain(
+      '--coverage-changed "$BASE_SHA" --tier "$TEST_TIER" --require-selective ${FULL_FLOOR:+--full-floor} -- --merge-reports=vitest-reports'
+    )
+    // Trusted preflight marks deferred full plans that keep a declared module test floor. The
+    // runner selects the same floor, never the complete suite, and still refuses full plans.
+    const floor = 'fromJSON(needs.preflight.outputs.plan).unitFloor == true'
+    const serialFloor = workflow.jobs.unit.steps?.find(({ id }) => id === 'unit_macos_related')
+    for (const step of [selected, merge, serialFloor]) {
+      expect(step?.if).toContain(floor)
+      expect(step?.env?.FULL_FLOOR).toBe(`\${{ ${floor} && '1' || '' }}`)
+      expect(step?.run).toContain('--require-selective ${FULL_FLOOR:+--full-floor}')
+    }
+    const completeShard = shards.steps?.find(({ id }) => id === 'unit_macos_shard')
+    const completeMerge = workflow.jobs.unit.steps?.find(({ id }) => id === 'unit_macos_full')
+    for (const step of [completeShard, completeMerge]) {
+      expect(step?.if).toContain('fromJSON(needs.preflight.outputs.plan).unitFloor != true')
+    }
+    expect(workflow.jobs.unit.env?.VITEST_DEFER_COVERAGE_THRESHOLDS).toBeUndefined()
+    const serial = workflow.jobs.unit.steps?.find(({ id }) => id === 'unit_macos_related')
+    expect(serial?.if).toContain("needs.unit_shard.result == 'skipped'")
+    const enforce = workflow.jobs.unit.steps?.find(
+      ({ name }) => name === 'Enforce selected unit checks'
+    )
+    const result = spawnSync('bash', ['-c', enforce!.run!], {
+      env: {
+        ...process.env,
+        UNIT_MACOS_FULL_OUTCOME: 'skipped',
+        UNIT_MACOS_RELATED_OUTCOME: 'skipped',
+        UNIT_MACOS_RELATED_MERGE_OUTCOME: 'failure',
+        UNIT_MACOS_SHARDS_RESULT: 'success'
+      },
+      encoding: 'utf8'
+    })
+    expect(result.status).toBe(1)
+    expect(result.stderr).toContain('unit_macos_related_merge ended with failure')
+  })
+
+  it('exports the complete trusted base tree and never candidate files', () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'pr-gate-trusted-')))
+    const git = (...args: string[]): string =>
+      execFileSync('git', args, { cwd: root, encoding: 'utf8' }).trim()
+    const put = (path: string, contents: string): void => {
+      mkdirSync(dirname(join(root, path)), { recursive: true })
+      writeFileSync(join(root, path), contents)
+    }
+    const prepare = workflow.jobs.preflight.steps!.find(({ id }) => id === 'trusted_classifier')!
+    const run = (base: string): { output: string; dir: string } => {
+      const output = join(root, 'outputs')
+      writeFileSync(output, '')
+      const result = spawnSync('bash', ['-c', prepare.run!], {
+        cwd: root,
+        encoding: 'utf8',
+        env: { ...process.env, BASE_SHA: base, RUNNER_TEMP: root, GITHUB_OUTPUT: output }
+      })
+      expect(result.status, result.stderr).toBe(0)
+      return { output: readFileSync(output, 'utf8'), dir: join(root, 'pr-gate-trusted-classifier') }
+    }
+    try {
+      git('init', '--quiet')
+      git('config', 'user.email', 'ci@example.com')
+      git('config', 'user.name', 'CI Test')
+      put('scripts/ci/classify-pr-changes.mjs', 'export const policy = "unrelated"\n')
+      git('add', '.')
+      git('commit', '--quiet', '-m', 'base without a trusted classifier')
+      expect(run(git('rev-parse', 'HEAD')).output).toContain('source=bootstrap')
+
+      // Nested internals and data travel with the entrypoint; no workflow file list exists.
+      put(
+        'scripts/ci/module-impact-authority.mjs',
+        "import { value } from './module-graph/policy.mjs'\nprocess.stdout.write(value)\n"
+      )
+      put('scripts/ci/module-graph/policy.mjs', 'export const value = "trusted nested"\n')
+      put('scripts/ci/module-boundaries.json', '{"trusted":true}\n')
+      git('add', '.')
+      git('commit', '--quiet', '-m', 'trusted base')
+      const base = git('rev-parse', 'HEAD')
+      put('scripts/ci/module-graph/policy.mjs', 'throw new Error("candidate internals")\n')
+      put('scripts/ci/candidate-only.mjs', 'throw new Error("candidate addition")\n')
+
+      const { output, dir } = run(base)
+      expect(output).toContain('source=base')
+      expect(readFileSync(join(dir, 'module-boundaries.json'), 'utf8')).toContain('trusted')
+      expect(existsSync(join(dir, 'candidate-only.mjs'))).toBe(false)
+      expect(
+        execFileSync(process.execPath, [join(dir, 'module-impact-authority.mjs')], {
+          encoding: 'utf8'
+        })
+      ).toBe('trusted nested')
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it.each([
+    'pull_request',
+    'merge_group',
+    'merge_group_stacked',
+    'deleted',
+    'renamed',
+    'ci-edit',
+    'unrelated',
+    'sharded'
+  ])(
+    'resolves actual Git history without mixing trusted policy and PR differences: %s',
+    (scenario) => {
+      const queued = scenario.startsWith('merge_group')
+      const event = queued ? 'merge_group' : 'pull_request'
+      const root = realpathSync(mkdtempSync(join(tmpdir(), 'pr-gate-revisions-')))
+      const git = (...args: string[]): string =>
+        execFileSync('git', args, { cwd: root, encoding: 'utf8' }).trim()
+      const put = (path: string, contents: string): void => {
+        mkdirSync(join(root, path, '..'), { recursive: true })
+        writeFileSync(join(root, path), contents)
+      }
+      const source = 'packages/connector-core/src/engine.ts'
+      const test = 'packages/connector-core/src/engine.test.ts'
+      try {
+        git('init', '--quiet', '-b', 'main')
+        git('config', 'user.email', 'ci@example.com')
+        git('config', 'user.name', 'CI Test')
+        for (const name of [
+          'module-impact-authority.mjs',
+          'windows-core-plan.mjs',
+          'windows-core-checks.json',
+          'module-impact-inputs.mjs',
+          'module-impact-shadow.mjs',
+          'module-ownership-paths.mjs',
+          'module-test-impact.mjs',
+          'module-graph/policy.mjs',
+          'module-graph/boundaries.mjs',
+          'module-graph/derived-index.mjs',
+          'module-graph/layers.mjs',
+          'module-boundaries.json',
+          'module-impact.json',
+          'load-module-impact.mjs',
+          'package-test-impact.mjs',
+          'package-test-boundaries.json',
+          'validate-module-impact.mjs',
+          'classify-pr-changes.mjs',
+          'change-impact.json'
+        ]) {
+          put(
+            `scripts/ci/${name}`,
+            name === 'module-impact.json'
+              ? JSON.stringify(loadModuleImpactManifest())
+              : readFileSync(`scripts/ci/${name}`, 'utf8')
+          )
+        }
+        if (scenario === 'sharded') {
+          const registered = loadModuleImpactManifest()
+          put('scripts/ci/module-impact.json', JSON.stringify({ schemaVersion: 1 }))
+          for (const [id, module] of Object.entries(registered.modules)) {
+            put(`scripts/ci/module-impact/${id}.json`, JSON.stringify(module))
+          }
+        }
+        put(source, 'export const value = 1\n')
+        put(test, '// initial contract\n')
+        git('add', '.')
+        git('commit', '--quiet', '-m', 'common ancestor')
+        const ancestor = git('rev-parse', 'HEAD')
+        put('.github/workflows/pr-gate.yml', '# base-only CI update\n')
+        put(
+          'scripts/ci/classify-pr-changes.mjs',
+          readFileSync('scripts/ci/classify-pr-changes.mjs', 'utf8') +
+            '\n// current trusted policy\n'
+        )
+        git('add', '.')
+        git('commit', '--quiet', '-m', 'advance main')
+        const base = git('rev-parse', 'HEAD')
+        if (scenario === 'unrelated') {
+          git('checkout', '--quiet', '--orphan', 'topic')
+          git('rm', '-rf', '.')
+        } else {
+          git('checkout', '--quiet', '-b', 'topic', ancestor)
+        }
+        if (scenario === 'deleted') git('rm', source)
+        else if (scenario === 'renamed')
+          git('mv', source, source.replace('engine', 'renamed-engine'))
+        else if (scenario === 'ci-edit') put('.github/workflows/pr-gate.yml', '# PR CI update\n')
+        else {
+          put(source, 'export const value = 2\n')
+          put(test, '// changed contract\n')
+        }
+        git('add', '.')
+        git('commit', '--quiet', '-m', 'PR contribution')
+        let head = git('rev-parse', 'HEAD')
+        if (queued) {
+          // GitHub builds the queue head on the target tip plus every entry ahead in the queue.
+          git('checkout', '--quiet', '-b', 'gh-readonly-queue/main/pr-1', base)
+          if (scenario === 'merge_group_stacked') {
+            put('.github/workflows/pr-gate.yml', '# CI update from the entry ahead\n')
+            git('add', '.')
+            git('commit', '--quiet', '-m', 'entry ahead in queue')
+          }
+          git('merge', '--quiet', '--no-ff', '-m', 'queue merge', 'topic')
+          head = git('rev-parse', 'HEAD')
+          git('remote', 'add', 'origin', root)
+        }
+        const revisionStep = workflow.jobs.preflight.steps!.find(({ id }) => id === 'revisions')!
+        const output = join(root, 'outputs')
+        const result = spawnSync('bash', ['-c', revisionStep.run!], {
+          cwd: root,
+          encoding: 'utf8',
+          env: {
+            ...process.env,
+            EVENT_NAME: event,
+            PULL_BASE_SHA: base,
+            PULL_HEAD_SHA: head,
+            MERGE_BASE_REF: 'refs/heads/main',
+            MERGE_HEAD_SHA: head,
+            GITHUB_OUTPUT: output
+          }
+        })
+        if (scenario === 'unrelated') {
+          expect(result.status).not.toBe(0)
+          expect(existsSync(output)).toBe(false)
+          return
+        }
+        expect(result.status, result.stderr).toBe(0)
+        const revisions = Object.fromEntries(
+          readFileSync(output, 'utf8')
+            .trim()
+            .split('\n')
+            .map((line) => line.split('='))
+        )
+        // Queue runs classify the whole group against the target tip, never against the entry ahead.
+        expect(revisions).toEqual({
+          base: queued ? base : ancestor,
+          head,
+          'trusted-base': base
+        })
+        const prepare = workflow.jobs.preflight.steps!.find(
+          ({ id }) => id === 'trusted_classifier'
+        )!
+        expect(prepare.env!.BASE_SHA).toBe('${{ steps.revisions.outputs.trusted-base }}')
+        const prepared = spawnSync('bash', ['-c', prepare.run!], {
+          cwd: root,
+          encoding: 'utf8',
+          env: {
+            ...process.env,
+            BASE_SHA: revisions['trusted-base'],
+            RUNNER_TEMP: root,
+            GITHUB_OUTPUT: output
+          }
+        })
+        expect(prepared.status, prepared.stderr).toBe(0)
+
+        expect(
+          readFileSync(join(root, 'pr-gate-trusted-classifier/classify-pr-changes.mjs'), 'utf8')
+        ).toContain('// current trusted policy')
+        expect(
+          loadModuleImpactManifest(join(root, 'pr-gate-trusted-classifier/module-impact.json'))
+        ).toEqual(loadModuleImpactManifest())
+        const classified = spawnSync(
+          process.execPath,
+          [
+            join(root, 'pr-gate-trusted-classifier/module-impact-authority.mjs'),
+            '--base',
+            revisions.base,
+            '--head',
+            revisions.head
+          ],
+          {
+            cwd: root,
+            encoding: 'utf8',
+            env: {
+              ...process.env,
+              EVENT_NAME: event,
+              PR_GATE_PLATFORM_POLICY: 'risk-v1',
+              GITHUB_OUTPUT: '',
+              GITHUB_STEP_SUMMARY: ''
+            }
+          }
+        )
+        expect(classified.status, classified.stderr).toBe(0)
+        const plan = JSON.parse(classified.stdout)
+        if (['pull_request', 'merge_group', 'sharded'].includes(scenario)) {
+          expect(git('diff', '--name-only', revisions.base, head).split('\n')).toEqual([
+            test,
+            source
+          ])
+          expect(plan.mode).toBe('selective')
+          expect(plan.macosProfile).toBe('smoke')
+        } else {
+          expect(plan.mode).toBe('full')
+          expect(plan.roots).toContain(
+            ['ci-edit', 'merge_group_stacked'].includes(scenario)
+              ? 'global_gate_input'
+              : 'destructive_change'
+          )
+        }
+      } finally {
+        rmSync(root, { recursive: true, force: true, maxRetries: 3 })
+      }
+    }
+  )
+
+  it('includes portable Session journeys in both native functional lanes', () => {
+    const { scripts } = JSON.parse(readFileSync(join(process.cwd(), 'package.json'), 'utf8')) as {
+      scripts: Record<string, string>
+    }
+    for (const platform of ['macos', 'windows']) {
+      const source =
+        platform === 'windows'
+          ? (load(
+              readFileSync('.github/workflows/windows-e2e-regression.yml', 'utf8')
+            ) as typeof workflow)
+          : workflow
+      const command = source.jobs[`${platform}_e2e`].steps?.find(
+        ({ id }) => id === `e2e_functional_${platform}`
+      )?.run
+      const script = command?.match(/^npm run (\S+)/)?.[1]
+      expect(script, `${platform} functional lane must invoke a registered script`).toBeDefined()
+      for (const spec of [
+        'e2e/session-package.spec.ts',
+        'e2e/session-package-drop.spec.ts',
+        'e2e/session-fork.spec.ts'
+      ])
+        expect(
+          scripts[script!]?.split(/\s+/),
+          `${platform} must exercise Session packages`
+        ).toContain(spec)
+    }
+  })
+
+  it('keeps release certification and Linux E2E out of ordinary pull requests', () => {
+    expect(workflow.jobs).not.toHaveProperty('linux_e2e')
+    expect(manifest.bundleOrder).not.toContain('linux_e2e')
+    expect(
+      manifest.laneOrder.some((lane) => lane.startsWith('e2e_') && lane.endsWith('_linux'))
+    ).toBe(false)
+    expect(
+      manifest.laneOrder.some((lane) =>
+        /^e2e_(storage_migration|provider_bridge|notebook_lifecycle|remote_pairing|artifact_provenance)_/.test(
+          lane
+        )
+      )
+    ).toBe(false)
+
+    const windowsRuns = workflow.jobs.windows_e2e.steps?.map(({ run }) => run).filter(Boolean) ?? []
+    expect(windowsRuns).not.toContain('npm run test:e2e:visual')
+    expect(windowsRuns).not.toContain('node scripts/ci/run-selected-release-e2e.mjs')
+
+    const macosRuns = workflow.jobs.macos_e2e.steps?.map(({ run }) => run).filter(Boolean) ?? []
+    expect(macosRuns).not.toContain('node scripts/ci/run-selected-release-e2e.mjs')
+  })
+
+  it('is the only repository-owned pull request quality workflow', () => {
+    for (const legacyWorkflow of [
+      'pr-check.yml',
+      'windows-path-portability.yml',
+      'commit-message-check.yml'
+    ]) {
+      expect(
+        existsSync(join(process.cwd(), '.github/workflows', legacyWorkflow)),
+        `${legacyWorkflow} must not duplicate PR Gate`
+      ).toBe(false)
+    }
+  })
+
+  it('always emits the same gate without workflow-level path exclusions', () => {
+    expect(workflow.on?.pull_request).toEqual({
+      branches: ['main'],
+      types: ['opened', 'synchronize', 'reopened', 'ready_for_review', 'converted_to_draft']
+    })
+    expect(workflow.on?.pull_request?.['paths-ignore']).toBeUndefined()
+    expect(workflow.on?.merge_group).toEqual({ types: ['checks_requested'] })
+    expect(workflow.on?.workflow_dispatch).toEqual({
+      inputs: {
+        dry_run: {
+          description: 'Focused no-side-effect validation plan',
+          required: false,
+          default: 'classified',
+          type: 'choice',
+          options: [
+            'classified',
+            'static',
+            'unit-coverage',
+            'module-coverage',
+            'i18n',
+            'runtime-bundle',
+            'windows-e2e',
+            'windows-e2e-mainline',
+            'windows-process',
+            'windows-notebook-runtime',
+            'linux-notebook-isolation',
+            'e2e',
+            'source-regressions',
+            'macos-smoke'
+          ]
+        },
+        comparison_base_sha: {
+          description: 'Test-selection diff base for module-coverage (full SHA; runs dispatch ref)',
+          type: 'string'
+        },
+        comparison_head_sha: {
+          description:
+            'Test-selection diff head (full SHA; only CI files may differ from dispatch ref)',
+          type: 'string'
+        }
+      }
+    })
+    expect(workflow.permissions).toEqual({ contents: 'read', 'pull-requests': 'read' })
+    expect(workflow.concurrency).toEqual({
+      group:
+        'pr-gate-${{ github.event.pull_request.number || github.event.merge_group.head_ref || github.ref }}',
+      'cancel-in-progress': true
+    })
+  })
+
+  it('fans semantic lanes into the declared runner bundles', () => {
+    expect(workflow.jobs.preflight.outputs).toEqual({
+      base: '${{ steps.revisions.outputs.base }}',
+      trusted_base: '${{ steps.revisions.outputs.trusted-base }}',
+      head: '${{ steps.revisions.outputs.head }}',
+      lanes: '${{ steps.classify.outputs.lanes }}',
+      plan: '${{ steps.classify.outputs.plan }}',
+      windows_e2e_grep: '${{ steps.windows_mainline.outputs.grep }}',
+      portable_matrix: '${{ steps.portable_matrix.outputs.matrix }}',
+      package_sources: '${{ steps.portable_matrix.outputs.package_sources }}'
+    })
+
+    for (const bundle of manifest.bundleOrder) {
+      expect(workflow.jobs[bundle], `missing job for ${bundle}`).toBeDefined()
+      expect(
+        Array.isArray(workflow.jobs[bundle].needs)
+          ? workflow.jobs[bundle].needs
+          : [workflow.jobs[bundle].needs]
+      ).toContain('preflight')
+      expect(workflow.jobs[bundle].if).toContain("needs.preflight.result == 'success'")
+      expect(workflow.jobs[bundle].if).toContain(`'${bundle}'`)
+    }
+
+    for (const lane of manifest.laneOrder) {
+      if (manifest.bundleOrder.includes(lane)) continue
+      expect(workflow.jobs[lane], `lane ${lane} must execute through its bundle`).toBeUndefined()
+    }
+  })
+
+  it('does not make the renderer layout pilot an unrelated blocking check', () => {
+    const macos = workflow.jobs.macos_e2e.steps?.find(
+      ({ name }) => name === 'Run renderer layout pilot'
+    )
+    const windows = workflow.jobs.windows_e2e.steps?.find(
+      ({ name }) => name === 'Run renderer layout pilot'
+    )
+
+    expect(macos?.if).toContain(
+      "contains(fromJSON(needs.preflight.outputs.plan).lanes, 'e2e_visual_macos')"
+    )
+    expect(windows).toBeUndefined()
+  })
+
+  it('lets retries absorb flakes on PR and merge-queue business E2E while scheduled regressions stay strict', () => {
+    for (const [jobId, job] of Object.entries(workflow.jobs)) {
+      for (const step of job.steps ?? []) {
+        expect(step.run ?? '', `${jobId}/${step.id ?? step.name}`).not.toContain(
+          '--fail-on-flaky-tests'
+        )
+      }
+    }
+    for (const strict of [
+      '.github/actions/source-regression/action.yml',
+      '.github/workflows/source-regression.yml'
+    ]) {
+      expect(readFileSync(join(process.cwd(), strict), 'utf8'), strict).toContain(
+        '--fail-on-flaky-tests'
+      )
+    }
+  })
+
+  it.skipIf(process.platform === 'win32')(
+    'retains all Windows mainlines when the trusted selector returns no focused journeys',
+    () => {
+      const cwd = mkdtempSync(join(tmpdir(), 'windows-mainline-fallback-'))
+      const git = (...args: string[]): string =>
+        execFileSync('git', args, { cwd, encoding: 'utf8' }).trim()
+      const selector = workflow.jobs.preflight.steps!.find(({ id }) => id === 'windows_mainline')!
+      try {
+        git('init', '--quiet')
+        git('config', 'user.email', 'ci@example.com')
+        git('config', 'user.name', 'CI Test')
+        mkdirSync(join(cwd, 'scripts/ci'), { recursive: true })
+        writeFileSync(
+          join(cwd, 'scripts/ci/windows-e2e-mainline.mjs'),
+          'import { appendFileSync } from "node:fs"; appendFileSync(process.env.GITHUB_OUTPUT, `grep=${process.env.TEST_GREP}\\n`)'
+        )
+        git('add', '.')
+        git('commit', '--quiet', '-m', 'trusted selector')
+        const base = git('rev-parse', 'HEAD')
+        const trustedDir = join(cwd, 'trusted')
+        mkdirSync(trustedDir)
+        writeFileSync(
+          join(cwd, 'scripts/ci/windows-e2e-mainline.mjs'),
+          'throw new Error("candidate selector must not execute")'
+        )
+        for (const grep of ['', '@pr-mainline-notebook']) {
+          const output = join(cwd, 'output')
+          writeFileSync(output, '')
+          const result = spawnSync('bash', ['-e', '-c', selector.run!], {
+            cwd,
+            encoding: 'utf8',
+            env: {
+              ...process.env,
+              EVENT_NAME: 'pull_request',
+              DRY_RUN_MODE: 'classified',
+              TRUSTED_BASE_SHA: base,
+              TRUSTED_DIR: trustedDir,
+              TEST_GREP: grep,
+              GITHUB_OUTPUT: output,
+              GITHUB_STEP_SUMMARY: join(cwd, 'summary')
+            }
+          })
+          expect(result.status, result.stderr).toBe(0)
+          const selected = readFileSync(output, 'utf8').trim().split('\n').at(-1)!.slice(5)
+          if (grep) expect(selected).toBe(grep)
+          else {
+            const pattern = new RegExp(selected)
+            expect(selected).not.toBe('')
+            for (const group of ['projects', 'conversation', 'files', 'notebook', 'windows']) {
+              expect(pattern.test(`journey @pr-mainline-${group}`)).toBe(true)
+            }
+            expect(pattern.test('extended regression case')).toBe(false)
+            expect(pattern.test('journey @pr-mainline-notebook-extra')).toBe(false)
+          }
+        }
+      } finally {
+        rmSync(cwd, { recursive: true, force: true })
+      }
+    }
+  )
+
+  it('requires a nonempty Windows mainline selection and successful setup and execution', () => {
+    const enforce = workflow.jobs.windows_e2e.steps!.find(
+      ({ name }) => name === 'Enforce selected Windows E2E checks'
+    )!
+    const baseline = {
+      ...process.env,
+      E2E_GREP: '@pr-mainline-notebook',
+      SETUP_OUTCOME: 'success',
+      MAINLINE_OUTCOME: 'success'
+    }
+    for (const key of ['SETUP_OUTCOME', 'MAINLINE_OUTCOME']) {
+      for (const outcome of ['success', 'failure', 'cancelled', 'skipped', '']) {
+        const result = spawnSync('bash', ['-c', enforce.run!], {
+          encoding: 'utf8',
+          env: { ...baseline, [key]: outcome }
+        })
+        expect(result.status, `${key}=${outcome}`).toBe(outcome === 'success' ? 0 : 1)
+      }
+    }
+    expect(
+      spawnSync('bash', ['-c', enforce.run!], { env: { ...baseline, E2E_GREP: '' } }).status
+    ).toBe(1)
+  })
+
+  it('plans with the trusted base classifier and fails closed during bootstrap', () => {
+    const prepare = workflow.jobs.preflight.steps?.find(
+      ({ name }) => name === 'Prepare trusted classifier'
+    )
+    const classify = workflow.jobs.preflight.steps?.find(
+      ({ name }) => name === 'Classify change impact'
+    )
+
+    expect(prepare?.run).toContain('git archive --format=tar "$BASE_SHA" scripts/ci')
+    expect(prepare?.run).toContain('source=bootstrap')
+    expect(classify?.env).toMatchObject({
+      DRY_RUN_MODE: "${{ inputs.dry_run || 'classified' }}",
+      EVENT_NAME: '${{ github.event_name }}',
+      TRUSTED_CLASSIFIER_DIR: '${{ steps.trusted_classifier.outputs.dir }}',
+      TRUSTED_CLASSIFIER_SOURCE: '${{ steps.trusted_classifier.outputs.source }}'
+    })
+    expect(classify?.run).toContain(
+      '[[ "$EVENT_NAME" == "workflow_dispatch" && "$DRY_RUN_MODE" == "unit-coverage" ]]'
+    )
+    expect(classify?.run).toContain(
+      '[[ "$EVENT_NAME" == "workflow_dispatch" && "$DRY_RUN_MODE" == "i18n" ]]'
+    )
+    expect(classify?.run).toContain(
+      '[[ "$EVENT_NAME" == "workflow_dispatch" && "$DRY_RUN_MODE" == "runtime-bundle" ]]'
+    )
+    expect(classify?.run).toContain('"lanes":["policy","unit_macos"]')
+    expect(classify?.run).toContain('"bundles":["policy","unit"]')
+    expect(classify?.run).toContain('"lanes":["policy","i18n"]')
+    expect(classify?.run).toContain('"bundles":["policy","static"]')
+    expect(classify?.run).toContain(
+      'node "$TRUSTED_CLASSIFIER_DIR/module-impact-authority.mjs" --base "$BASE_SHA" --head "$HEAD_SHA"'
+    )
+    expect(classify?.run).toContain("mode: 'full'")
+    expect(classify?.run).toContain("'runtime_bundle'")
+    expect(classify?.run).not.toContain(
+      'node scripts/ci/classify-pr-changes.mjs --base "$BASE_SHA" --head "$HEAD_SHA"'
+    )
+  })
+
+  it.each(['pull_request', 'workflow_dispatch'])(
+    'bootstraps a full plan without PR desktop bundles for %s',
+    (event) => {
+      const dir = mkdtempSync(join(tmpdir(), 'pr-gate-bootstrap-'))
+      try {
+        const output = join(dir, 'output')
+        const classify = workflow.jobs.preflight.steps?.find(({ id }) => id === 'classify')
+        // Pass the script through stdin so Windows argument quoting cannot alter its heredoc.
+        const run = spawnSync('bash', ['-eu'], {
+          input: classify!.run!,
+          env: {
+            ...process.env,
+            EVENT_NAME: event,
+            DRY_RUN_MODE: 'classified',
+            TRUSTED_CLASSIFIER_SOURCE: 'bootstrap',
+            TRUSTED_CLASSIFIER_DIR: dir,
+            BASE_SHA: 'a'.repeat(40),
+            HEAD_SHA: 'b'.repeat(40),
+            GITHUB_OUTPUT: output,
+            GITHUB_STEP_SUMMARY: join(dir, 'summary')
+          },
+          encoding: 'utf8'
+        })
+        expect(run.status, run.stderr).toBe(0)
+        const lines = readFileSync(output, 'utf8').split('\n')
+        const plan = JSON.parse(lines.find((line) => line.startsWith('plan='))!.slice(5))
+        const lanes = JSON.parse(lines.find((line) => line.startsWith('lanes='))!.slice(6))
+        expect(plan).toMatchObject({ mode: 'full', roots: ['bootstrap'] })
+        expect(plan).not.toHaveProperty('macosProfile')
+        expect(plan.lanes).toEqual(lanes)
+        for (const lane of plan.lanes) expect(manifest.laneOrder).toContain(lane)
+        const expectedBundles = manifest.bundleOrder.filter((bundle) =>
+          plan.lanes.some((lane: string) => manifest.laneBundles[lane] === bundle)
+        )
+        expect(plan.bundles).toEqual(expectedBundles)
+        const desktop = ['macos_e2e', 'windows_e2e']
+        if (event === 'pull_request') {
+          expect(plan.bundles).toEqual([
+            'policy',
+            'static',
+            'unit',
+            'linux_runtime',
+            'windows_core'
+          ])
+          expect(plan.lanes.some((lane: string) => lane.startsWith('e2e_'))).toBe(false)
+        } else {
+          expect(plan.bundles).toEqual(expect.arrayContaining(desktop))
+        }
+        const conclusions = Object.fromEntries(
+          ['preflight', ...manifest.bundleOrder].map((job) => [
+            job,
+            plan.bundles.includes(job) || job === 'preflight' ? 'success' : 'skipped'
+          ])
+        )
+        expect(evaluatePrGate(plan, conclusions, { executionMode: 'bundles' }).ok).toBe(true)
+      } finally {
+        rmSync(dir, { recursive: true, force: true })
+      }
+    }
+  )
+
+  it('fails the bootstrap evaluator closed on platform policy and skipped selected bundles', () => {
+    const evaluate = workflow.jobs.gate.steps?.find(
+      ({ name }) => name === 'Evaluate deterministic gate from trusted base'
+    )
+    const dir = mkdtempSync(join(tmpdir(), 'pr-gate-bootstrap-evaluator-'))
+    const bundles = ['policy', 'static', 'unit', 'linux_runtime', 'windows_core']
+    const plan = {
+      schemaVersion: 1,
+      mode: 'full',
+      roots: ['bootstrap'],
+      lanes: ['policy', 'lint', 'unit_macos', 'linux_runtime', 'windows_runtime'],
+      bundles
+    }
+    const needs = (overrides: Record<string, string>): string =>
+      JSON.stringify(
+        Object.fromEntries(
+          ['preflight', ...manifest.bundleOrder].map((job) => [
+            job,
+            {
+              result:
+                overrides[job] ??
+                (job === 'preflight' || bundles.includes(job) ? 'success' : 'skipped')
+            }
+          ])
+        )
+      )
+    // Run from an empty directory so the inline bootstrap evaluator is exercised.
+    const run = (planJson: string, needsJson: string): ReturnType<typeof spawnSync> =>
+      spawnSync('bash', ['-c', evaluate!.run!], {
+        cwd: dir,
+        env: {
+          ...process.env,
+          PREFLIGHT_RESULT: 'success',
+          REGISTRATION_RESULT: 'success',
+          RUNTIME_REQUIRED: 'false',
+          RUNTIME_RESULT: 'skipped',
+          PACKAGE_RESULT: 'skipped',
+          PACKAGE_SOURCE_REQUIRED: 'false',
+          PACKAGE_SOURCE_RESULT: 'skipped',
+          EVENT_NAME: 'pull_request',
+          PR_GATE_PLAN: planJson,
+          PR_GATE_NEEDS: needsJson,
+          GITHUB_STEP_SUMMARY: join(dir, 'summary')
+        },
+        encoding: 'utf8'
+      })
+    try {
+      expect(evaluate?.run).toContain("'macosProfile' in plan")
+      expect(run(JSON.stringify(plan), needs({})).status).toBe(0)
+      expect(run(JSON.stringify(plan), needs({ windows_core: 'skipped' })).status).toBe(1)
+      expect(run(JSON.stringify(plan), needs({ windows_e2e: 'failure' })).status).toBe(1)
+      for (const macosProfile of ['smoke', 'expanded', 'skip']) {
+        expect(run(JSON.stringify({ ...plan, macosProfile }), needs({})).status).toBe(1)
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('makes base-trusted module evidence authoritative without shadow steps', () => {
+    const prepare = workflow.jobs.preflight.steps?.find(
+      ({ name }) => name === 'Prepare trusted classifier'
+    )
+    const shadowPrepare = workflow.jobs.preflight.steps?.find(
+      ({ name }) => name === 'Prepare trusted module shadow'
+    )
+    const shadowPublish = workflow.jobs.preflight.steps?.find(
+      ({ name }) => name === 'Publish module impact shadow'
+    )
+
+    expect(workflow.jobs.preflight.outputs).toEqual({
+      base: '${{ steps.revisions.outputs.base }}',
+      trusted_base: '${{ steps.revisions.outputs.trusted-base }}',
+      head: '${{ steps.revisions.outputs.head }}',
+      lanes: '${{ steps.classify.outputs.lanes }}',
+      plan: '${{ steps.classify.outputs.plan }}',
+      windows_e2e_grep: '${{ steps.windows_mainline.outputs.grep }}',
+      portable_matrix: '${{ steps.portable_matrix.outputs.matrix }}',
+      package_sources: '${{ steps.portable_matrix.outputs.package_sources }}'
+    })
+    expect(prepare?.['continue-on-error']).toBeUndefined()
+    // The authority marks a trusted base; the whole base tree is exported, never a file list.
+    expect(prepare?.run).toContain('scripts/ci/module-impact-authority.mjs')
+    expect(prepare?.run).toContain('git archive --format=tar "$BASE_SHA" scripts/ci')
+    expect(prepare?.run).not.toContain('git show')
+    expect(prepare?.run).toContain('source=bootstrap')
+    expect(shadowPrepare).toBeUndefined()
+    expect(shadowPublish).toBeUndefined()
+  })
+
+  it('keeps the file-level test impact report advisory and output-free', () => {
+    const job = workflow.jobs.file_test_impact
+    const step = job.steps?.find(({ id }) => id === 'file_test_impact')
+    expect(job).toMatchObject({ needs: 'preflight', 'continue-on-error': true })
+    expect(job['timeout-minutes']).toBeLessThanOrEqual(10)
+    expect(job.outputs).toBeUndefined()
+    expect(job.if).toContain("github.event_name == 'pull_request'")
+    // The gate never waits on or evaluates the report, and no job consumes it.
+    expect(JSON.stringify(workflow.jobs.gate)).not.toContain('file_test_impact')
+    for (const other of Object.values(workflow.jobs))
+      expect([other.needs ?? []].flat()).not.toContain('file_test_impact')
+    expect(step).toMatchObject({ 'continue-on-error': true })
+    expect(step?.run).toContain('node scripts/ci/file-test-impact.mjs compare')
+    // Revisions reach the script through env, never interpolated into the shell.
+    expect(step?.run).not.toContain('${{')
+    for (const { run = '' } of job.steps ?? []) {
+      expect(run).not.toContain('GITHUB_OUTPUT')
+      expect(run).not.toContain('npm run test:affected')
+    }
+  })
+
+  it('aggregates all deterministic bundles into the stable PR Gate job', () => {
+    const gate = workflow.jobs.gate
+
+    expect(gate.name).toBe('PR Gate')
+    expect(gate.if).toBe('${{ always() }}')
+    expect(gate.needs).toEqual(expect.arrayContaining(['preflight', ...manifest.bundleOrder]))
+    expect(gate.env).toBeUndefined()
+    expect(gate.steps?.at(0)).toMatchObject({
+      name: 'Checkout trusted gate evaluator',
+      if: "${{ needs.preflight.result == 'success' }}",
+      with: {
+        'fetch-depth': 1,
+        'persist-credentials': false,
+        ref: "${{ github.event_name == 'workflow_dispatch' && github.sha || github.event.pull_request.base.sha || needs.preflight.outputs.base }}"
+      }
+    })
+    expect(gate.steps?.at(0)?.env).toBeUndefined()
+    expect(gate.steps?.at(-1)).toMatchObject({
+      name: 'Evaluate deterministic gate from trusted base',
+      env: {
+        PR_GATE_EXECUTION_MODE: 'bundles',
+        PR_GATE_PLAN: '${{ needs.preflight.outputs.plan }}',
+        PREFLIGHT_RESULT: '${{ needs.preflight.result }}'
+      }
+    })
+    const gateNeeds = Array.isArray(gate.needs) ? gate.needs : []
+    for (const jobId of gateNeeds) {
+      expect(gate.steps?.at(-1)?.env?.PR_GATE_NEEDS).toContain(
+        `"${jobId}":{"result":"\${{ needs.${jobId}.result }}"}`
+      )
+    }
+    expect(gate.steps?.at(-1)?.env?.PR_GATE_NEEDS).not.toContain('outputs')
+    expect(gate.steps?.at(-1)?.run).toContain('node scripts/ci/evaluate-pr-gate.mjs')
+    expect(gate.steps?.at(-1)?.run).toContain('Bootstrap-only strict evaluator')
+    expect(workflowText).not.toContain('toJSON(needs)')
+    expect(workflowText).not.toMatch(/needs:.*(?:ai|codex|review)/i)
+  })
+
+  it('validates commit policy without coupling the gate to editable PR metadata', () => {
+    const policy = workflow.jobs.policy.steps?.find(
+      ({ name }) => name === 'Validate pull request policy'
+    )
+
+    // Merge groups reuse preflight's target-branch narrowing so the migration set covers every
+    // queued entry, not just the trailing pull request.
+    expect(policy?.env).toEqual({
+      BASE_SHA: '${{ github.event.pull_request.base.sha || needs.preflight.outputs.base }}',
+      EVENT_NAME: '${{ github.event_name }}',
+      HEAD_SHA:
+        '${{ github.event.pull_request.head.sha || needs.preflight.outputs.head || github.sha }}',
+      POLICY_SCOPE: 'commits'
+    })
+  })
+
+  it('rejects newly introduced high-severity dependency vulnerabilities', () => {
+    const review = workflow.jobs.policy.steps?.find(
+      ({ name }) => name === 'Review dependency changes'
+    )
+
+    expect(review).toMatchObject({
+      if: "${{ github.event_name == 'pull_request' || github.event_name == 'merge_group' }}",
+      uses: 'actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294',
+      with: {
+        'base-ref': '${{ needs.preflight.outputs.base }}',
+        'fail-on-severity': 'high',
+        'fail-on-scopes': 'runtime, development',
+        'head-ref': '${{ needs.preflight.outputs.head }}',
+        'license-check': false,
+        'show-openssf-scorecard': false
+      }
+    })
+  })
+
+  it('disables npm updates while keeping GitHub Actions updates policy-compatible', () => {
+    const npm = dependabot.updates.find(
+      (update) => update['package-ecosystem'] === 'npm' && update.directory === '/'
+    )
+    const actions = dependabot.updates.find(
+      (update) => update['package-ecosystem'] === 'github-actions' && update.directory === '/'
+    )
+
+    expect(npm).toBeUndefined()
+    expect(actions).toMatchObject({
+      'commit-message': { prefix: 'ci(dependencies): update' },
+      'open-pull-requests-limit': 2,
+      'pull-request-branch-name': {
+        'branch-name-case': 'lowercase',
+        prefix: 'ci',
+        template: '{prefix}/{group_name}'
+      },
+      groups: {
+        'github-actions-security-updates': {
+          'applies-to': 'security-updates',
+          patterns: ['*']
+        },
+        'github-actions-version-updates': {
+          'applies-to': 'version-updates',
+          patterns: ['*']
+        }
+      }
+    })
+  })
+
+  it('pins every third-party action to an immutable commit', () => {
+    for (const job of Object.values(workflow.jobs)) {
+      for (const step of job.steps ?? []) {
+        if (!step.uses || step.uses.startsWith('./')) continue
+        expect(step.uses).toMatch(/^[^@]+@[0-9a-f]{40}$/)
+      }
+    }
+  })
+
+  it('blocks on actionlint and reports pinned zizmor findings during static checks', () => {
+    const actionlint = workflow.jobs.static.steps?.find(
+      ({ name }) => name === 'Check GitHub Actions correctness'
+    )
+    const zizmor = workflow.jobs.static.steps?.find(
+      ({ name }) => name === 'Audit GitHub Actions security with zizmor'
+    )
+    const enforce = workflow.jobs.static.steps?.find(
+      ({ name }) => name === 'Enforce selected static checks'
+    )
+
+    // All-package isolation measured about 17 minutes before the existing static checks.
+    expect(workflow.jobs.static['timeout-minutes']).toBe(30)
+    expect(actionlint).toMatchObject({
+      id: 'actionlint',
+      'continue-on-error': true
+    })
+    expect(actionlint?.run).toContain(
+      'releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz'
+    )
+    expect(actionlint?.run).toContain(
+      '8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8'
+    )
+    expect(actionlint?.run).toContain('-shellcheck= -pyflakes=')
+    // A stalled release download must fail fast and retry instead of consuming the job budget.
+    expect(actionlint?.run).toContain('--connect-timeout 30 --max-time 120 --retry 3')
+    expect(zizmor).toMatchObject({
+      'continue-on-error': true,
+      uses: 'zizmorcore/zizmor-action@cc914d7f3750a2d13d75c7f184a1060aa0e9d482',
+      with: {
+        'advanced-security': false,
+        annotations: true,
+        'min-confidence': 'high',
+        'min-severity': 'medium',
+        version: 'v1.30.1'
+      }
+    })
+    expect(enforce?.env).toMatchObject({
+      ACTIONLINT_OUTCOME: '${{ steps.actionlint.outcome }}'
+    })
+    expect(enforce?.run).toContain('check actionlint "$ACTIONLINT_OUTCOME"')
+    expect(enforce?.run).not.toContain('check zizmor')
+  })
+
+  it('isolates lint while keeping setup and enforcement in both static groups', () => {
+    const job = workflow.jobs.static
+    expect(job.name).toBe('Static checks (${{ matrix.group }})')
+    expect(job.strategy).toEqual({
+      'fail-fast': false,
+      matrix: {
+        group:
+          '${{ fromJSON(contains(fromJSON(needs.preflight.outputs.plan).lanes, \'lint\') && \'["checks","lint"]\' || \'["checks"]\') }}'
+      }
+    })
+    expect(job['continue-on-error']).not.toBe(true)
+    const common = ['Checkout', 'Setup Node', 'Install dependencies']
+    for (const step of job.steps ?? []) {
+      if (common.includes(step.name!)) {
+        expect(step.if).toBeUndefined()
+      } else if (step.name === 'Enforce selected static checks') {
+        expect(step.if).toBe('${{ always() }}')
+      } else {
+        const group = step.name === 'Lint' ? 'lint' : 'checks'
+        expect(step.if, step.name).toMatch(
+          new RegExp(`^\\$\\{\\{ matrix.group == '${group}'(?: && \\(.*\\))? \\}\\}$`)
+        )
+      }
+    }
+    expect(workflow.jobs.gate.needs).toContain('static')
+    const gate = workflow.jobs.gate.steps?.find(
+      ({ name }) => name === 'Evaluate deterministic gate from trusted base'
+    )
+    expect(gate?.env?.PR_GATE_NEEDS).toContain('needs.static.result')
+  })
+
+  it.each(['LINT_OUTCOME', 'TYPECHECKS_OUTCOME', 'ACTIONLINT_OUTCOME', 'I18N_OUTCOME'])(
+    'blocks the static bundle when %s fails even if its sibling group succeeds',
+    (failedOutcome) => {
+      const enforce = workflow.jobs.static.steps!.find(
+        ({ name }) => name === 'Enforce selected static checks'
+      )!
+      for (const outcome of ['success', 'failure', 'cancelled']) {
+        // A lint-only runner skips every checks-group outcome and vice versa.
+        const env = Object.fromEntries(Object.keys(enforce.env!).map((key) => [key, 'skipped']))
+        env[failedOutcome] = outcome
+        const result = spawnSync('bash', ['-eu'], {
+          input: enforce.run,
+          encoding: 'utf8',
+          env: { ...process.env, ...env }
+        })
+        expect(result.status, result.stderr).toBe(outcome === 'success' ? 0 : 1)
+        const plan = {
+          schemaVersion: 1,
+          lanes: ['policy', 'lint', 'i18n'],
+          bundles: ['policy', 'static']
+        }
+        expect(
+          evaluatePrGate(
+            plan,
+            {
+              preflight: 'success',
+              policy: 'success',
+              static: result.status === 0 ? 'success' : 'failure'
+            },
+            { executionMode: 'bundles' }
+          ).ok
+        ).toBe(outcome === 'success')
+      }
+    }
+  )
+
+  it('dispatches the real static groups and contracts without runtime or desktop jobs', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pr-gate-static-dispatch-'))
+    try {
+      const output = join(dir, 'output')
+      const classify = workflow.jobs.preflight.steps!.find(({ id }) => id === 'classify')!
+      const result = spawnSync('bash', ['-eu'], {
+        input: classify.run,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          EVENT_NAME: 'workflow_dispatch',
+          DRY_RUN_MODE: 'static',
+          GITHUB_OUTPUT: output
+        }
+      })
+      expect(result.status, result.stderr).toBe(0)
+      const lines = readFileSync(output, 'utf8').split('\n')
+      const plan = JSON.parse(lines.find((line) => line.startsWith('plan='))!.slice(5))
+      expect(plan.mode).toBe('selective')
+      expect(plan.roots).toEqual(['module_registration'])
+      expect(plan.bundles).toEqual(['policy', 'static'])
+      expect(plan.lanes).toEqual([
+        'policy',
+        'docs',
+        'format',
+        'lint',
+        'typecheck_node',
+        'typecheck_web',
+        'interface_contracts',
+        'i18n'
+      ])
+      expect(
+        evaluatePrGate(
+          plan,
+          { preflight: 'success', policy: 'success', static: 'success' },
+          { executionMode: 'bundles' }
+        ).ok
+      ).toBe(true)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('uses runner-local concurrency while preserving separate static outcomes', () => {
+    const lint = workflow.jobs.static.steps?.find(({ name }) => name === 'Lint')
+    const typechecks = workflow.jobs.static.steps?.find(
+      ({ name }) => name === 'Typecheck node and web'
+    )
+    const enforce = workflow.jobs.static.steps?.find(
+      ({ name }) => name === 'Enforce selected static checks'
+    )
+
+    expect(lint?.run).toBe('npm run lint -- --concurrency auto')
+    expect(typechecks).toMatchObject({
+      id: 'typechecks',
+      'continue-on-error': true,
+      env: {
+        RUN_TYPECHECK_NODE:
+          "${{ contains(fromJSON(needs.preflight.outputs.plan).lanes, 'typecheck_node') }}",
+        RUN_TYPECHECK_WEB:
+          "${{ contains(fromJSON(needs.preflight.outputs.plan).lanes, 'typecheck_web') }}"
+      }
+    })
+    expect(typechecks?.if).toContain("'typecheck_node'")
+    expect(typechecks?.if).toContain("'typecheck_web'")
+    expect(typechecks?.run).toContain('npm run typecheck:node:compiled >"$node_log" 2>&1 &')
+    expect(typechecks?.run).toContain('npm run typecheck:web:compiled >"$web_log" 2>&1 &')
+    expect(typechecks?.run).toContain('echo "node=$node_outcome" >> "$GITHUB_OUTPUT"')
+    expect(typechecks?.run).toContain('echo "web=$web_outcome" >> "$GITHUB_OUTPUT"')
+    expect(enforce?.env).toMatchObject({
+      TYPECHECK_NODE_OUTCOME: '${{ steps.typechecks.outputs.node }}',
+      TYPECHECK_WEB_OUTCOME: '${{ steps.typechecks.outputs.web }}',
+      TYPECHECKS_OUTCOME: '${{ steps.typechecks.outcome }}'
+    })
+    expect(enforce?.run).toContain('check typechecks "$TYPECHECKS_OUTCOME"')
+  })
+
+  it.each(['', 'build:packages', 'typecheck:node:compiled', 'typecheck:web:compiled'])(
+    'finishes package declarations before parallel typechecks and propagates %s failures',
+    (failure) => {
+      const directory = mkdtempSync(join(tmpdir(), 'typecheck-writer-'))
+      const step = workflow.jobs.static.steps?.find(({ id }) => id === 'typechecks')
+      const stub = `
+        npm() {
+          echo "$2" >> "$RUNNER_TEMP/commands"
+          if [[ "$2" == "build:packages" ]]; then
+            [[ "$FAIL_COMMAND" != "$2" ]] || return 1
+            touch "$RUNNER_TEMP/declarations-ready"
+          else
+            [[ -f "$RUNNER_TEMP/declarations-ready" ]] || return 2
+            [[ "$2" == "typecheck:node:compiled" || "$2" == "typecheck:web:compiled" ]] || return 3
+            [[ "$FAIL_COMMAND" != "$2" ]] || return 1
+          fi
+        }
+      `
+      try {
+        const output = join(directory, 'outputs')
+        const result = spawnSync('bash', ['-c', stub + step!.run!], {
+          encoding: 'utf8',
+          env: {
+            ...process.env,
+            RUNNER_TEMP: directory,
+            GITHUB_OUTPUT: output,
+            RUN_TYPECHECK_NODE: 'true',
+            RUN_TYPECHECK_WEB: 'true',
+            FAIL_COMMAND: failure
+          }
+        })
+        expect(result.status, result.stderr).toBe(failure ? 1 : 0)
+        const commands = readFileSync(join(directory, 'commands'), 'utf8').trim().split('\n')
+        expect(commands[0]).toBe('build:packages')
+        expect(commands.filter((command) => command === 'build:packages')).toHaveLength(1)
+        if (failure === 'build:packages') {
+          expect(commands).toHaveLength(1)
+        } else {
+          expect(commands.slice(1).sort()).toEqual([
+            'typecheck:node:compiled',
+            'typecheck:web:compiled'
+          ])
+          expect(readFileSync(output, 'utf8')).toBe(
+            `node=${failure === 'typecheck:node:compiled' ? 'failure' : 'success'}\n` +
+              `web=${failure === 'typecheck:web:compiled' ? 'failure' : 'success'}\n`
+          )
+        }
+      } finally {
+        rmSync(directory, { recursive: true, force: true })
+      }
+    }
+  )
+
+  it('checks selective source imports without duplicating the registration/full contract suite', () => {
+    const guard = workflow.jobs.static.steps?.find(
+      ({ name }) => name === 'Check complete module ownership and consumer evidence'
+    )
+    expect(guard?.run).toContain('scripts/ci/audit-module-ownership.test.ts')
+    expect(guard?.run).toContain('scripts/ci/module-graph/consumer-coverage.test.ts')
+    expect(guard?.if).toBe(
+      "${{ matrix.group == 'checks' && (contains(fromJSON(needs.preflight.outputs.plan).bundles, 'unit') && fromJSON(needs.preflight.outputs.plan).mode != 'full' && !contains(fromJSON(needs.preflight.outputs.plan).roots, 'module_registration')) }}"
+    )
+    expect(guard?.['continue-on-error']).not.toBe(true)
+    const generate = workflow.jobs.static.steps?.find(
+      ({ name }) => name === 'Generate derived consumer index'
+    )
+    expect(generate?.run).toContain('generate:module-consumers')
+    expect(generate?.if).toBe(
+      "${{ matrix.group == 'checks' && (contains(fromJSON(needs.preflight.outputs.plan).bundles, 'unit')) }}"
+    )
+    const steps = workflow.jobs.static.steps ?? []
+    expect(steps.indexOf(generate!)).toBe(steps.indexOf(guard!) - 1)
+  })
+
+  it('runs manifest-reading contracts as a blocking check for registration and full plans', () => {
+    const step = workflow.jobs.static.steps?.find(
+      ({ name }) => name === 'Check module registration policy and architecture contracts'
+    )
+    expect(step?.run).toBe('node scripts/ci/module-registration-tests.mjs')
+    expect(step?.if).toBe(
+      "${{ matrix.group == 'checks' && (contains(fromJSON(needs.preflight.outputs.plan).roots, 'module_registration') || fromJSON(needs.preflight.outputs.plan).mode == 'full') }}"
+    )
+    expect(step?.['continue-on-error']).not.toBe(true)
+  })
+
+  it('runs the i18n catalog guard as a named static check', () => {
+    const i18n = workflow.jobs.static.steps?.find(({ name }) => name === 'Check i18n catalog')
+    const enforce = workflow.jobs.static.steps?.find(
+      ({ name }) => name === 'Enforce selected static checks'
+    )
+
+    expect(i18n).toMatchObject({
+      id: 'i18n',
+      'continue-on-error': true,
+      run: 'npx vitest run src/renderer/src/i18n/resources.test.ts'
+    })
+    expect(i18n?.if).toContain("'i18n'")
+    expect(enforce?.env).toMatchObject({
+      I18N_OUTCOME: '${{ steps.i18n.outcome }}'
+    })
+    expect(enforce?.run).toContain('check i18n "$I18N_OUTCOME"')
+    expect(manifest.laneBundles.i18n).toBe('static')
+    expect(manifest.laneOrder).toContain('i18n')
+  })
+
+  it('verifies the published runtime bundle as a separate runtime check', () => {
+    const runtimeBundle = workflow.jobs.runtime_checks.steps?.find(
+      ({ name }) => name === 'Verify published runtime bundle'
+    )
+    const enforce = workflow.jobs.runtime_checks.steps?.find(
+      ({ name }) => name === 'Enforce selected runtime checks'
+    )
+
+    expect(runtimeBundle).toMatchObject({
+      id: 'runtime_bundle',
+      'continue-on-error': true,
+      run: 'node scripts/verify-runtime-bundle.mjs linux-64 linux-aarch64 osx-arm64 osx-64 win-64'
+    })
+    expect(runtimeBundle?.if).toContain("'runtime_bundle'")
+    expect(runtimeBundle?.if).toContain("fromJSON(needs.preflight.outputs.plan).mode == 'full'")
+    expect(enforce?.env).toMatchObject({
+      RUNTIME_BUNDLE_OUTCOME: '${{ steps.runtime_bundle.outcome }}'
+    })
+    expect(enforce?.run).toContain('check runtime_bundle "$RUNTIME_BUNDLE_OUTCOME"')
+    expect(manifest.laneBundles.runtime_bundle).toBe('static')
+    expect(manifest.laneOrder).toContain('runtime_bundle')
+    const classify = workflow.jobs.preflight.steps?.find(
+      ({ name }) => name === 'Classify change impact'
+    )
+    expect(classify?.run).toContain("'runtime_bundle'")
+  })
+
+  it('separates host and package Ubuntu runners and merges coverage into the stable unit bundle', () => {
+    const unit = workflow.jobs.unit
+    const shards = workflow.jobs.unit_shard
+    const sourceRegressionWorkflow = load(
+      readFileSync(join(process.cwd(), '.github/workflows/source-regression.yml'), 'utf8')
+    ) as Workflow
+    // Complete portable shards share the scheduled regression budget.
+    expect(shards['timeout-minutes']).toBe(
+      sourceRegressionWorkflow.jobs.portable['timeout-minutes']
+    )
+    const checkout = unit.steps?.find(({ name }) => name === 'Checkout')
+    const related = unit.steps?.find(({ name }) => name === 'Test affected Modules')
+    const download = unit.steps?.find(({ name }) => name === 'Download full-suite blob reports')
+    const merge = unit.steps?.find(({ name }) => name === 'Merge full-suite reports and coverage')
+    const coverageUpload = unit.steps?.find(({ name }) => name === 'Upload Module coverage report')
+    const install = unit.steps?.find(({ name }) => name === 'Install dependencies')
+    const installMerge = unit.steps?.find(
+      ({ name }) => name === 'Install report merge dependencies'
+    )
+    const shardRun = shards.steps?.find(({ name }) => name === 'Test complete suite shard')
+    const shardUpload = shards.steps?.find(({ name }) => name === 'Upload full-suite blob report')
+
+    expect(workflow.jobs.coverage_macos).toBeUndefined()
+    expect(unit).toMatchObject({
+      name: 'Module tests and coverage',
+      needs: ['preflight', 'unit_shard'],
+      'runs-on':
+        "${{ (github.event_name == 'pull_request' || github.event_name == 'merge_group' || needs.unit_shard.result != 'skipped' || fromJSON(needs.preflight.outputs.plan).macosProfile == 'smoke') && 'ubuntu-latest' || 'macos-15' }}"
+    })
+    expect(unit.if).toContain('always()')
+    expect(unit.env?.VITEST_DEFER_COVERAGE_THRESHOLDS).toBeUndefined()
+    expect(shards.env?.VITEST_MAX_WORKERS).toBeUndefined()
+    expect(shards.env?.OPEN_SCIENCE_TEST_MAX_WORKERS).toBeUndefined()
+    expect(shards).toMatchObject({
+      env: {
+        VITEST_DEFER_COVERAGE_THRESHOLDS: '1',
+        VITEST_PORTABLE_CI: '1',
+        OPEN_SCIENCE_CI_PORTABLE_SCOPE: '${{ matrix.scope }}'
+      },
+      name: 'Portable ${{ matrix.scope }} tests (Ubuntu, shard ${{ matrix.shard }}/${{ matrix.total }})',
+      needs: 'preflight',
+      'runs-on': 'ubuntu-latest',
+      strategy: {
+        'fail-fast': false,
+        matrix: '${{ fromJSON(needs.preflight.outputs.portable_matrix) }}'
+      }
+    })
+    expect(shards.if).toContain("fromJSON(needs.preflight.outputs.plan).mode == 'full'")
+    expect(shards.if).toContain(
+      "!contains(fromJSON(needs.preflight.outputs.plan).lanes, 'unit_macos')"
+    )
+    expect(shardRun).toMatchObject({
+      'continue-on-error': true,
+      run: [
+        'npx vitest run',
+        '--coverage',
+        '--coverage.reporter=text-summary',
+        '--testTimeout=30000',
+        '--shard=${{ matrix.shard }}/${{ matrix.total }}',
+        '--reporter=dot',
+        '--reporter=blob',
+        '--reporter=github-actions',
+        '--outputFile=vitest-reports/blob-${{ matrix.scope }}-${{ matrix.shard }}.json'
+      ].join(' ')
+    })
+    expect(shardUpload).toMatchObject({
+      if: '${{ always() }}',
+      with: {
+        name: 'unit-portable-blob-${{ matrix.scope }}-${{ matrix.shard }}',
+        path: 'vitest-reports/',
+        'retention-days': 1,
+        'if-no-files-found': 'error'
+      }
+    })
+    expect(checkout?.with).toMatchObject({ 'fetch-depth': 0 })
+    expect(related).toMatchObject({
+      id: 'unit_macos_related',
+      'continue-on-error': true,
+      env: {
+        BASE_SHA: '${{ needs.preflight.outputs.base }}',
+        HEAD_SHA: '${{ needs.preflight.outputs.head }}'
+      },
+      run: expect.stringContaining(
+        'npm run test:affected -- --base "$BASE_SHA" --head "$HEAD_SHA" --coverage-changed "$BASE_SHA"'
+      )
+    })
+    expect(related?.run).not.toMatch(/(?:^|\s)--changed(?:\s|$)/)
+    expect(related?.if).toContain("fromJSON(needs.preflight.outputs.plan).mode == 'selective'")
+    expect(install).toMatchObject({
+      if: "${{ needs.unit_shard.result == 'skipped' }}",
+      run: 'node scripts/ci/npm-ci.mjs'
+    })
+    expect(installMerge).toMatchObject({
+      if: "${{ needs.unit_shard.result != 'skipped' }}",
+      run: 'node scripts/ci/npm-ci.mjs --ignore-scripts --prefer-offline --no-audit --fund=false'
+    })
+    expect(download).toMatchObject({
+      if: "${{ needs.unit_shard.result != 'skipped' }}",
+      with: {
+        pattern: 'unit-portable-blob-*',
+        path: 'vitest-reports',
+        'merge-multiple': true
+      }
+    })
+    expect(merge).toMatchObject({
+      id: 'unit_macos_full',
+      'continue-on-error': true,
+      if: "${{ needs.unit_shard.result != 'skipped' && fromJSON(needs.preflight.outputs.plan).unitFloor != true && (fromJSON(needs.preflight.outputs.plan).mode == 'full' || !contains(fromJSON(needs.preflight.outputs.plan).lanes, 'unit_macos')) }}",
+      run: 'npx vitest run --merge-reports=vitest-reports --coverage --passWithNoTests'
+    })
+    expect(unit.steps?.some(({ name }) => name === 'Test Renderer (blocking)')).toBe(false)
+    expect(unit.steps?.filter(({ run }) => run === 'npm run test:coverage')).toHaveLength(0)
+    expect(coverageUpload).toMatchObject({
+      if: "${{ always() && (steps.unit_macos_related.outcome != 'skipped' || steps.unit_macos_full.outcome != 'skipped' || steps.unit_macos_related_merge.outcome != 'skipped') }}",
+      'continue-on-error': true,
+      with: {
+        name: 'coverage-report',
+        path: 'coverage/',
+        'retention-days': 5,
+        'if-no-files-found': 'warn'
+      }
+    })
+  })
+
+  it.each(['macos'])(
+    'prepares %s E2E once and restores its exact artifact in every consumer',
+    (platform) => {
+      const bundle = `${platform}_e2e`
+      const producerId = `${bundle}_setup`
+      const producer = workflow.jobs[producerId]
+      const consumer = workflow.jobs[bundle]
+      expect(producer.needs).toEqual(
+        platform === 'windows' ? ['preflight', 'windows_notebook_runtime'] : 'preflight'
+      )
+      if (platform === 'windows') {
+        expect(producer.if).toBe(
+          "${{ needs.preflight.result == 'success' && contains(fromJSON(needs.preflight.outputs.plan).bundles, 'windows_e2e') }}"
+        )
+        expect(consumer.if).toBe(
+          "${{ !cancelled() && needs.preflight.result == 'success' && contains(fromJSON(needs.preflight.outputs.plan).bundles, 'windows_e2e') && needs.windows_e2e_setup.result == 'success' }}"
+        )
+      } else {
+        expect(producer.if).toContain(
+          "!(fromJSON(needs.preflight.outputs.plan).macosProfile == 'smoke' || (fromJSON(needs.preflight.outputs.plan).macosProfile == 'expanded' && contains(fromJSON(needs.preflight.outputs.plan).lanes, 'e2e_smoke_macos')))"
+        )
+        expect(consumer.if).toContain(
+          "(fromJSON(needs.preflight.outputs.plan).macosProfile == 'smoke' || (fromJSON(needs.preflight.outputs.plan).macosProfile == 'expanded' && contains(fromJSON(needs.preflight.outputs.plan).lanes, 'e2e_smoke_macos'))) || needs.macos_e2e_setup.result == 'success'"
+        )
+      }
+      expect(producer.strategy).toBeUndefined()
+      expect(producer['runs-on']).toBe(consumer['runs-on'])
+      expect(consumer.needs).toEqual(['preflight', producerId])
+      // A failed or cancelled producer must skip its consumer explicitly, never run it.
+      expect(consumer.if).toContain('!cancelled()')
+      expect(consumer.if).not.toContain('always()')
+      expect(consumer.if).toContain(`needs.${producerId}.result == 'success'`)
+      expect(producer.outputs).toEqual({
+        artifact_id: '${{ steps.upload.outputs.artifact-id }}',
+        node_version: '${{ steps.node.outputs.node-version }}'
+      })
+      expect(producer.steps?.filter(({ run }) => run === 'npm run build:e2e')).toHaveLength(1)
+      expect(producer.steps?.some(({ run }) => /npm run build:web\b/.test(run ?? ''))).toBe(false)
+      const upload = producer.steps?.find(({ id }) => id === 'upload')
+      expect(upload?.['continue-on-error']).not.toBe(true)
+      expect(upload?.with).toMatchObject({
+        name: `e2e-setup-${platform}-\${{ github.run_id }}-\${{ github.run_attempt }}`,
+        'retention-days': 1,
+        'compression-level': 0,
+        'if-no-files-found': 'error'
+      })
+      expect(upload?.with).not.toHaveProperty('overwrite')
+      const node = consumer.steps?.find(({ name }) => name === 'Setup Node')
+      expect(node?.with).toEqual({
+        'node-version':
+          platform === 'macos'
+            ? "${{ needs.macos_e2e_setup.outputs.node_version || '24' }}"
+            : `\${{ needs.${producerId}.outputs.node_version }}`,
+        ...(platform === 'macos'
+          ? {
+              cache:
+                "${{ (fromJSON(needs.preflight.outputs.plan).macosProfile == 'smoke' || (fromJSON(needs.preflight.outputs.plan).macosProfile == 'expanded' && contains(fromJSON(needs.preflight.outputs.plan).lanes, 'e2e_smoke_macos'))) && 'npm' || '' }}"
+            }
+          : {}),
+        'package-manager-cache': false
+      })
+      const download = consumer.steps?.find(({ name }) => name === 'Download E2E setup')
+      expect(download?.with).toEqual({
+        'artifact-ids': `\${{ needs.${producerId}.outputs.artifact_id }}`,
+        path: '${{ runner.temp }}/e2e-setup/',
+        'merge-multiple': true
+      })
+      const restore = consumer.steps?.find(({ id }) => id === 'setup')
+      expect(restore?.run).toContain('e2e-setup-snapshot.mjs restore')
+      expect(restore?.['continue-on-error']).not.toBe(true)
+      expect(
+        consumer.steps?.some(
+          ({ run, if: condition }) =>
+            /npm-ci\.mjs|npm ci|npm run build:/.test(run ?? '') &&
+            !condition?.includes(
+              "contains(fromJSON(needs.preflight.outputs.plan).lanes, 'e2e_smoke_macos')"
+            )
+        )
+      ).toBe(false)
+      // The trusted evaluator already rejects a selected bundle skipped by a failed/cancelled setup.
+      const lane = `e2e_functional_${platform}`
+      const result = evaluatePrGate(
+        {
+          schemaVersion: 1,
+          mode: 'selective',
+          lanes: ['policy', lane],
+          bundles: ['policy', bundle],
+          roots: ['manual:e2e'],
+          reasonChains: []
+        },
+        { preflight: 'success', policy: 'success', [bundle]: 'skipped' },
+        { executionMode: 'bundles' }
+      )
+      expect(result.ok).toBe(false)
+    }
+  )
+
+  it.each([
+    ['runtime_checks', 'Install dependencies'],
+    ['linux_runtime', 'Install application dependencies'],
+    ['unit_shard', 'Install dependencies'],
+    ['package_source', 'Install dependencies']
+  ])(
+    'installs locked dependencies without the retired local translation runtime in %s',
+    (job, installStep) => {
+      const steps = workflow.jobs[job].steps
+      const install = steps?.find(({ name }) => name === installStep)
+      expect(install?.run).toBe('node scripts/ci/npm-ci.mjs')
+      expect(install?.env?.ONNXRUNTIME_NODE_INSTALL).toBeUndefined()
+      expect(steps?.some(({ run }) => run?.includes('onnxruntime-node'))).toBe(false)
+    }
+  )
+
+  it('preserves test commands while moving matrix setup into platform producers', () => {
+    for (const bundle of ['static', 'unit_shard', 'windows_core', 'macos_e2e_setup']) {
+      expect(
+        workflow.jobs[bundle].steps?.filter(({ run }) => run === 'node scripts/ci/npm-ci.mjs'),
+        `${bundle} must install dependencies exactly once`
+      ).toHaveLength(1)
+    }
+    expect(
+      workflow.jobs.unit.steps?.filter(({ name }) =>
+        ['Install dependencies', 'Install report merge dependencies'].includes(name ?? '')
+      )
+    ).toHaveLength(2)
+    expect(
+      workflow.jobs.windows_e2e.steps?.filter(({ name }) => name === 'Install dependencies')
+    ).toEqual([
+      expect.objectContaining({
+        run: 'node scripts/ci/npm-ci.mjs --prefer-offline --no-audit --fund=false'
+      })
+    ])
+
+    const macosRuns = workflow.jobs.macos_e2e.steps?.map(({ run }) => run).filter(Boolean)
+    expect(macosRuns?.filter((run) => run === 'npm run build:e2e')).toHaveLength(1)
+    expect(macosRuns).toEqual(
+      expect.arrayContaining([
+        'npm run test:e2e:journey -- --global-timeout=600000',
+        'npm run test:e2e:workspace -- --global-timeout=900000',
+        'npm run test:e2e:accessibility:signal',
+        'npm run test:e2e:visual -- --global-timeout=300000'
+      ])
+    )
+
+    const windowsRuns = workflow.jobs.windows_e2e.steps?.map(({ run }) => run).filter(Boolean)
+    expect(windowsRuns?.filter((run) => run === 'npm run build:e2e')).toHaveLength(1)
+    expect(windowsRuns).toEqual(
+      expect.arrayContaining([
+        expect.stringContaining(
+          'npm run test:e2e -- --workers=1 --global-timeout=900000 --grep "$env:E2E_GREP"'
+        )
+      ])
+    )
+    expect(windowsRuns?.some((run) => run?.includes('test:e2e:accessibility'))).toBe(false)
+  })
+
+  it('selects Windows mainline groups with trusted base policy on every entry point', () => {
+    const job = workflow.jobs.windows_e2e
+    expect(job.env!.E2E_GREP).toBe('${{ needs.preflight.outputs.windows_e2e_grep }}')
+    expect(job.strategy).toBeUndefined()
+    expect(workflow.jobs.windows_e2e_setup).toBeUndefined()
+    expect(job.needs).toEqual(['preflight', 'windows_notebook_runtime'])
+    expect(job.steps?.filter(({ run }) => run === 'npm run build:e2e')).toHaveLength(1)
+    expect(job.steps?.some(({ run }) => run?.includes('e2e-setup-snapshot'))).toBe(false)
+    const selector = workflow.jobs.preflight.steps!.find(({ id }) => id === 'windows_mainline')!
+    expect(selector.run).toContain('git show "$TRUSTED_BASE_SHA:$selector"')
+    expect(selector.run).toContain('node "$TRUSTED_DIR/windows-e2e-mainline.mjs"')
+    expect(selector.run).toContain('@pr-mainline-(projects|conversation|files|notebook|windows)')
+    expect(selector.run).not.toContain('grep=.*')
+    const commands = job.steps!.map(({ run }) => run ?? '').join('\n')
+    expect(commands).toContain(
+      'npm run test:e2e -- --workers=1 --global-timeout=900000 --grep "$env:E2E_GREP"'
+    )
+    expect(commands).not.toContain('test:e2e:browser')
+    expect(commands).not.toContain('test:e2e:workspace')
+    expect(commands).not.toContain('test:e2e:journey')
+    expect(commands).not.toContain('--pass-with-no-tests')
+    expect(commands.indexOf('[string]::IsNullOrWhiteSpace($env:E2E_GREP)')).toBeLessThan(
+      commands.indexOf('npm run test:e2e --')
+    )
+  })
+
+  it('runs lossless file identity and preview transport regressions on Windows', () => {
+    const step = workflow.jobs.windows_core.steps?.find(
+      ({ name }) => name === 'Test Windows-specific behavior'
+    )
+    for (const file of [
+      'bounded-file-io',
+      'managed-preview-resources',
+      'managed-preview-ipc',
+      'managed-preview-protocol'
+    ]) {
+      expect(step?.run).toContain(`src/main/${file}.test.ts`)
+    }
+    expect(step?.run).not.toContain('--testNamePattern')
+  })
+
+  it('budgets the complete Windows E2E path beyond dependency and build setup', () => {
+    expect(workflow.jobs.windows_e2e['timeout-minutes']).toBe(35)
+  })
+
+  it('budgets the combined macOS builds and all four E2E groups', () => {
+    expect(workflow.jobs.macos_e2e['timeout-minutes']).toBe(30)
+  })
+
+  it('runs affected Windows mainlines on one isolated desktop with the stable aggregate gate', () => {
+    const job = workflow.jobs.windows_e2e
+    expect(job.strategy).toBeUndefined()
+    expect(workflow.jobs.windows_e2e_setup).toBeUndefined()
+    expect(job.needs).toEqual(['preflight', 'windows_notebook_runtime'])
+    expect(job.steps?.filter(({ run }) => run === 'npm run build:e2e')).toHaveLength(1)
+    expect(job.steps?.some(({ run }) => run?.includes('e2e-setup-snapshot'))).toBe(false)
+    expect(job.steps?.find(({ id }) => id === 'e2e_functional_windows')).toMatchObject({
+      if: "${{ steps.setup.outcome == 'success' }}",
+      run: expect.stringContaining(
+        'npm run test:e2e -- --workers=1 --global-timeout=900000 --grep "$env:E2E_GREP"'
+      )
+    })
+    expect(job.steps?.find(({ id }) => id === 'renderer_layout')).toBeUndefined()
+    expect(job.steps?.find(({ id }) => id === 'e2e_workspace_windows')).toBeUndefined()
+    expect(workflow.jobs.gate.needs).toContain('windows_e2e')
+  })
+
+  it.skipIf(process.platform === 'win32').each(['true', 'false'])(
+    'retains unique static checks when dedicated tests are %s',
+    (runDedicatedTests) => {
+      const directory = mkdtempSync(join(tmpdir(), 'pr-gate-static-'))
+      try {
+        for (const command of ['npm', 'npx']) {
+          writeFileSync(
+            join(directory, command),
+            `#!/bin/sh\nprintf '%s\\n' '${command}'" $*" >> "$COMMAND_LOG"\n`,
+            { mode: 0o755 }
+          )
+        }
+        for (const id of ['interface_contracts', 'cli_sdk']) {
+          const step = workflow.jobs[id === 'cli_sdk' ? 'runtime_checks' : 'static'].steps?.find(
+            (step) => step.id === id
+          )
+          expect(step?.env?.RUN_DEDICATED_TESTS).toBe(
+            "${{ fromJSON(needs.preflight.outputs.plan).mode != 'full' || !contains(fromJSON(needs.preflight.outputs.plan).bundles, 'unit') || fromJSON(needs.preflight.outputs.plan).unitFloor == true }}"
+          )
+          const log = join(directory, id)
+          const run = spawnSync('bash', ['-e', '-c', step!.run!], {
+            env: {
+              ...process.env,
+              PATH: `${directory}:${process.env.PATH}`,
+              COMMAND_LOG: log,
+              RUN_DEDICATED_TESTS: runDedicatedTests
+            },
+            encoding: 'utf8'
+          })
+          expect(run.status, run.stderr).toBe(0)
+          const commands = readFileSync(log, 'utf8')
+          expect(commands).toContain(
+            id === 'interface_contracts' ? 'npm run check:web-api-map' : 'npm run check:cli-package'
+          )
+          expect(commands.includes('npx vitest run')).toBe(runDedicatedTests === 'true')
+        }
+      } finally {
+        rmSync(directory, { recursive: true, force: true })
+      }
+    }
+  )
+
+  it.skipIf(process.platform === 'win32').each([
+    [
+      'windows-e2e',
+      ['policy', 'windows_e2e'],
+      ['policy', 'e2e_functional_windows', 'e2e_workspace_windows', 'e2e_browser_windows']
+    ],
+    [
+      'windows-e2e-mainline',
+      ['policy', 'windows_e2e'],
+      ['policy', 'e2e_functional_windows', 'e2e_workspace_windows', 'e2e_browser_windows']
+    ],
+    ['windows-process', ['policy', 'windows_core'], ['policy', 'windows_runtime']],
+    ['windows-notebook-runtime', ['policy', 'windows_core'], ['policy', 'windows_runtime']],
+    ['linux-notebook-isolation', ['policy', 'linux_runtime'], ['policy', 'linux_runtime']]
+  ])(
+    'executes the focused %s plan through the real preflight script',
+    (dryRunMode, bundles, lanes) => {
+      const directory = mkdtempSync(join(tmpdir(), 'pr-gate-windows-'))
+      try {
+        const output = join(directory, 'output')
+        const classify = workflow.jobs.preflight.steps?.find(({ id }) => id === 'classify')
+        const run = spawnSync('bash', ['-e', '-c', classify!.run!], {
+          env: {
+            ...process.env,
+            EVENT_NAME: 'workflow_dispatch',
+            DRY_RUN_MODE: dryRunMode,
+            GITHUB_OUTPUT: output,
+            GITHUB_STEP_SUMMARY: join(directory, 'summary')
+          },
+          encoding: 'utf8'
+        })
+        expect(run.status, run.stderr).toBe(0)
+        const planLine = readFileSync(output, 'utf8')
+          .split('\n')
+          .find((line) => line.startsWith('plan='))!
+        expect(JSON.parse(planLine.slice(5))).toMatchObject({
+          mode: 'selective',
+          bundles,
+          lanes
+        })
+      } finally {
+        rmSync(directory, { recursive: true, force: true })
+      }
+    }
+  )
+
+  it('runs the native typechecker on Windows without expanding the process dry-run', () => {
+    const steps = workflow.jobs.windows_core.steps ?? []
+    const install = steps.find(({ name }) => name === 'Install dependencies')
+    const typecheck = steps.find(({ name }) => name === 'Typecheck sandbox on Windows')
+
+    expect(typecheck?.run).toBe('npm run typecheck:sandbox')
+    expect(typecheck?.if).toBe("${{ inputs.dry_run != 'windows-process' }}")
+    expect(typecheck?.['continue-on-error']).not.toBe(true)
+    expect(steps.indexOf(install!)).toBeLessThan(steps.indexOf(typecheck!))
+  })
+
+  it('rebuilds the Windows sandbox host before the native lifecycle smoke', () => {
+    const steps = workflow.jobs.windows_core.steps ?? []
+    const rustTest = steps.find(({ name }) => name === 'Test Windows sandbox native source')
+    const build = steps.find(({ name }) => name === 'Build Windows sandbox native host')
+    const smoke = steps.find(
+      ({ name }) => name === 'Test Windows AppContainer ownership and removal lifecycle'
+    )
+
+    expect(rustTest?.run).toBe(
+      'cargo test --locked --manifest-path packages/notebook-network-sandbox/vendor/windows-src/Cargo.toml'
+    )
+    expect(build?.run).toBe('node packages/notebook-network-sandbox/vendor/windows/build.mjs x64')
+    expect(steps.indexOf(rustTest!)).toBeLessThan(steps.indexOf(build!))
+    expect(steps.indexOf(build!)).toBeLessThan(steps.indexOf(smoke!))
+    expect(smoke?.run).toContain('-AfterSetup')
+    expect(smoke?.run).toContain("$env:RUN_WINDOWS_NOTEBOOK_RUNTIME = '1'")
+    expect(smoke?.run).toContain('$env:OPEN_SCIENCE_TEST_SANDBOX_INSTALLATION_ID = $installationId')
+    expect(smoke?.run).toContain('$env:OPEN_SCIENCE_TEST_SANDBOX_OWNERSHIP_ROOT = $ownershipRoot')
+    expect(smoke?.run).toContain('src/windows-notebook-runtime.integration.test.ts')
+    expect(smoke?.run).toContain(
+      '--testNamePattern "imports from Node|rejects a .* package config|retains readable .* workspace package|executes .* at the requested workspace"'
+    )
+    expect(smoke?.run).toContain('if ($LASTEXITCODE -ne 0) { throw')
+  })
+
+  it('carries no dead Windows accessibility lane in the workflow', () => {
+    expect(manifest.laneOrder).not.toContain('e2e_accessibility_windows')
+    expect(workflowText).not.toContain('e2e_accessibility_windows')
+    expect(workflowText).not.toContain('pre-migration classifier')
+    for (const step of workflow.jobs.windows_e2e.steps ?? []) {
+      // Every lane-gated Windows E2E step must reference a declared lane.
+      for (const lane of step.if?.match(/lanes, '([^']+)'/g)?.map((m) => m.slice(8, -1)) ?? []) {
+        expect(manifest.laneOrder, `${step.name} gates on unknown lane ${lane}`).toContain(lane)
+      }
+    }
+  })
+
+  it('publishes accessibility diagnostics for both advisory and infrastructure outcomes', () => {
+    const upload = workflow.jobs.macos_e2e.steps?.find(
+      ({ name }) => name === 'Upload accessibility diagnostics'
+    )
+
+    expect(upload).toMatchObject({
+      if: "${{ steps.e2e_accessibility_macos.outcome != 'skipped' }}",
+      'continue-on-error': true,
+      with: {
+        name: 'accessibility-macos-${{ matrix.group }}-diagnostics',
+        path: 'playwright-report/\ntest-results/\n'
+      }
+    })
+  })
+
+  it('runs complete accessibility collection in the macOS PR lane', () => {
+    const macosStep = workflow.jobs.macos_e2e.steps?.find(
+      ({ id }) => id === 'e2e_accessibility_macos'
+    )
+
+    expect(macosStep?.run).toBe('npm run test:e2e:accessibility:signal')
+  })
+
+  it('retains focused real-Darwin coverage in full plans without another macOS job', () => {
+    const native = workflow.jobs.macos_e2e.steps?.find(({ id }) => id === 'unit_macos_native')
+    const enforce = workflow.jobs.macos_e2e.steps?.find(
+      ({ name }) => name === 'Enforce selected macOS checks'
+    )
+
+    expect(native).toMatchObject({
+      'continue-on-error': true,
+      if: expect.stringContaining("macosProfile == 'expanded'")
+    })
+    for (const testFile of [
+      'packages/notebook-network-sandbox/src/filesystem-enforcement.integration.test.ts',
+      'packages/notebook-network-sandbox/src/network-enforcement.integration.test.ts',
+      'src/main/net/network-info.test.ts',
+      'src/main/notebook/kernel-executor.test.ts',
+      'src/main/notebook/managed-runtime-guard.test.ts',
+      'src/main/process-tree-darwin-recovery.test.ts',
+      'src/main/process-tree-evidence.macos.integration.test.ts'
+    ]) {
+      expect(native?.run).toContain(testFile)
+    }
+    const unfilteredNative = native?.run?.split(
+      'npx vitest run src/main/notebook/kernel-executor.test.ts'
+    )[0]
+    expect(unfilteredNative).toContain(
+      'src/main/notebook/network-sandbox-owner.macos-isolation.integration.test.ts'
+    )
+    expect(unfilteredNative).toContain('node scripts/ci/run-notebook-isolation.mjs')
+    expect(unfilteredNative).not.toContain(
+      'src/main/notebook/runtime-service.macos-isolation.integration.test.ts'
+    )
+    expect(unfilteredNative).not.toContain('-t ')
+    expect(unfilteredNative).toContain('set -euo pipefail')
+    expect(unfilteredNative).toContain(
+      `OPEN_SCIENCE_TEST_PY_ENV="$(python3 -c 'import sys; print(sys.executable)')"`
+    )
+    expect(unfilteredNative).toContain('test -x "$OPEN_SCIENCE_TEST_PY_ENV"')
+    expect(unfilteredNative).toContain('export OPEN_SCIENCE_TEST_PY_ENV')
+    expect(native?.run).toContain(
+      "-t 'executes the repl loop through the production network sandbox|recovers cross-session REPL|keeps folder authority'"
+    )
+    expect(enforce?.env).toMatchObject({
+      UNIT_MACOS_NATIVE_OUTCOME: '${{ steps.unit_macos_native.outcome }}'
+    })
+    expect(enforce?.run).toContain('check unit_macos_native "$UNIT_MACOS_NATIVE_OUTCOME"')
+  })
+
+  it('collects independent bundle failures before failing the shared runner', () => {
+    for (const bundle of [
+      'static',
+      'unit',
+      'unit_shard',
+      'windows_core',
+      'macos_e2e',
+      'windows_e2e'
+    ]) {
+      const enforce = workflow.jobs[bundle].steps?.find(({ name }) => name?.startsWith('Enforce'))
+      expect(enforce, `${bundle} must enforce collected step outcomes`).toMatchObject({
+        if: '${{ always() }}'
+      })
+      expect(enforce?.run).toContain(bundle === 'windows_e2e' ? 'exit 1' : 'exit "$failed"')
+    }
+
+    for (const bundle of ['macos_e2e', 'windows_e2e']) {
+      for (const upload of workflow.jobs[bundle].steps?.filter(({ name }) =>
+        name?.startsWith('Upload')
+      ) ?? []) {
+        expect(upload['continue-on-error'], `${upload.name} must not stop later E2E checks`).toBe(
+          true
+        )
+      }
+    }
+
+    const related = workflow.jobs.unit.steps?.find(({ name }) => name === 'Test affected Modules')
+    const full = workflow.jobs.unit.steps?.find(
+      ({ name }) => name === 'Merge full-suite reports and coverage'
+    )
+    const enforceUnit = workflow.jobs.unit.steps?.find(
+      ({ name }) => name === 'Enforce selected unit checks'
+    )
+    expect(related?.['continue-on-error']).toBe(true)
+    expect(full?.['continue-on-error']).toBe(true)
+    expect(enforceUnit?.env).toEqual({
+      UNIT_MACOS_FULL_OUTCOME: '${{ steps.unit_macos_full.outcome }}',
+      UNIT_MACOS_RELATED_OUTCOME: '${{ steps.unit_macos_related.outcome }}',
+      UNIT_MACOS_RELATED_MERGE_OUTCOME: '${{ steps.unit_macos_related_merge.outcome }}',
+      UNIT_MACOS_SHARDS_RESULT: '${{ needs.unit_shard.result }}'
+    })
+    expect(enforceUnit?.run).toContain('check unit_macos_related "$UNIT_MACOS_RELATED_OUTCOME"')
+    expect(enforceUnit?.run).toContain('check unit_macos_full "$UNIT_MACOS_FULL_OUTCOME"')
+    expect(enforceUnit?.run).toContain('check unit_macos_shards "$UNIT_MACOS_SHARDS_RESULT"')
+    expect(enforceUnit?.run).toContain(
+      '[[ "$UNIT_MACOS_RELATED_OUTCOME" == "skipped" && "$UNIT_MACOS_FULL_OUTCOME" == "skipped" && "$UNIT_MACOS_RELATED_MERGE_OUTCOME" == "skipped" ]]'
+    )
+    expect(enforceUnit?.run).toContain('Selected unit bundle did not execute a Module-test path')
+  })
+
+  it('preserves the complete portable suite and hard Windows contracts', () => {
+    const portable = workflow.jobs.unit.steps?.find(
+      ({ name }) => name === 'Merge full-suite reports and coverage'
+    )
+    expect(portable).toMatchObject({
+      'continue-on-error': true,
+      run: 'npx vitest run --merge-reports=vitest-reports --coverage --passWithNoTests'
+    })
+
+    expect(workflow.jobs.linux_runtime).toMatchObject({
+      'runs-on': 'ubuntu-latest',
+      'timeout-minutes': 15
+    })
+    expect(workflow.jobs.linux_runtime.if).toBe(
+      "${{ needs.preflight.result == 'success' && contains(fromJSON(needs.preflight.outputs.plan).bundles, 'linux_runtime') }}"
+    )
+    const linuxDependencies = workflow.jobs.linux_runtime.steps?.find(
+      ({ name }) => name === 'Install Linux sandbox dependency'
+    )
+    expect(linuxDependencies?.env?.DEBIAN_FRONTEND).toBe('noninteractive')
+    expect(linuxDependencies?.run).toContain('if ! command -v bwrap')
+    expect(linuxDependencies?.run).toContain('! command -v apparmor_parser')
+    expect(linuxDependencies?.run).toContain(
+      'apt-get install --reinstall --yes --no-install-recommends apparmor bubblewrap'
+    )
+    expect(linuxDependencies?.run).toContain('bwrap-userns-restrict')
+    expect(linuxDependencies?.run).toContain('scripts/ci/bwrap-userns-restrict')
+    expect(linuxDependencies?.run).toContain('bwrap --unshare-all')
+    expect(linuxDependencies?.run).not.toContain('apparmor_restrict_unprivileged_userns=0')
+    expect(
+      workflow.jobs.linux_runtime.steps?.find(
+        ({ name }) => name === 'Test real Linux filesystem and network isolation'
+      )?.run
+    ).toContain('filesystem-enforcement.integration.test.ts')
+    expect(
+      workflow.jobs.linux_runtime.steps?.find(
+        ({ name }) => name === 'Test real Linux filesystem and network isolation'
+      )?.run
+    ).toContain('src/main/notebook/shell-cell-session.integration.test.ts')
+    const folderAuthority = workflow.jobs.linux_runtime.steps?.find(
+      ({ name }) => name === 'Test Linux Folder authority across kernel restart'
+    )
+    expect(
+      workflow.jobs.linux_runtime.steps?.find(
+        ({ name }) => name === 'Test real Linux filesystem and network isolation'
+      )?.run
+    ).toContain('packages/notebook-network-sandbox/src/wsl2-isolation.integration.test.ts')
+    expect(
+      workflow.jobs.linux_runtime.steps?.find(
+        ({ name }) => name === 'Test WSL guest launch arguments'
+      )?.run
+    ).toContain('packages/notebook-network-sandbox/src/wsl2-isolation.test.ts')
+    expect(folderAuthority?.run).toContain('src/main/notebook/kernel-executor.test.ts')
+    expect(folderAuthority?.run).toContain("-t 'keeps folder authority'")
+    expect(workflow.jobs.linux_runtime.env?.VITEST_PORTABLE_CI).not.toBe('1')
+
+    expect(workflow.jobs.windows_core).toMatchObject({
+      'runs-on': 'windows-latest',
+      'timeout-minutes': 30
+    })
+    const runtime = workflow.jobs.windows_core.steps?.find(
+      ({ name }) => name === 'Test Windows-specific behavior'
+    )
+    expect(runtime?.run).not.toContain('\n')
+    for (const testFile of [
+      'scripts/windows-updater-certification.test.ts',
+      'src/main/windows.test.ts',
+      'src/main/windows-icon-assets.test.ts',
+      'src/main/windows-powershell.test.ts',
+      'src/main/delegation/acp-execution.test.ts',
+      'src/main/delegation/production-framework-runtime.test.ts',
+      'src/main/file-save.test.ts',
+      'src/main/notebook/file-evidence-publication.integration.test.ts',
+      'src/main/compute/compute-submission-evidence-recovery.integration.test.ts',
+      'packages/specialists/src/repository.test.ts',
+      'packages/environment/src/micromamba-cache-powershell.test.ts',
+      'packages/environment/src/micromamba-cache-acl.integration.test.ts'
+    ]) {
+      expect(runtime?.run).toContain(testFile)
+      expect(existsSync(testFile), `Missing Windows test: ${testFile}`).toBe(true)
+    }
+
+    const nativeMac = workflow.jobs.macos_e2e.steps?.find(
+      ({ name }) => name === 'Test macOS-native behavior'
+    )
+    for (const testFile of [
+      'src/main/delegation/acp-execution.test.ts',
+      'src/main/delegation/production-framework-runtime.test.ts'
+    ])
+      expect(nativeMac?.run).toContain(testFile)
+
+    const wheelEvidence = workflow.jobs.windows_core.steps?.find(
+      ({ name }) => name === 'Test Windows wheel evidence recovery'
+    )
+    const enforceWindowsCore = workflow.jobs.windows_core.steps?.find(
+      ({ name }) => name === 'Enforce selected Windows core checks'
+    )
+    expect(wheelEvidence?.id).toBe('windows_wheel_evidence')
+    expect(wheelEvidence?.if).toContain("'windows_runtime'")
+    expect(wheelEvidence?.if).toContain("inputs.dry_run != 'windows-process'")
+    expect(wheelEvidence?.env).toMatchObject({ RUN_KERNEL: '1' })
+    expect(wheelEvidence?.run).toContain('OPEN_SCIENCE_TEST_PYTHON')
+    expect(wheelEvidence?.run).toContain('pip-wheel-evidence.test.ts')
+    expect(wheelEvidence?.run).toContain('pip-install-evidence.test.ts')
+    // Collected like its siblings so a wheel failure cannot short-circuit later Windows checks.
+    expect(wheelEvidence?.['continue-on-error']).toBe(true)
+    expect(enforceWindowsCore?.env).toMatchObject({
+      WINDOWS_WHEEL_EVIDENCE_OUTCOME: '${{ steps.windows_wheel_evidence.outcome }}'
+    })
+    expect(enforceWindowsCore?.run).toContain(
+      'check windows_wheel_evidence "$WINDOWS_WHEEL_EVIDENCE_OUTCOME"'
+    )
+    for (const step of workflow.jobs.windows_core.steps ?? []) {
+      // Every lane-gated Windows core test step is collected by the enforce step.
+      if (!step.run || !step.if?.includes("'windows_runtime'") || !step.id) continue
+      expect(step['continue-on-error'], `${step.name} must not short-circuit siblings`).toBe(true)
+      expect(enforceWindowsCore?.run).toContain(`check ${step.id} `)
+    }
+    const wheelResult = spawnSync('bash', ['-c', enforceWindowsCore!.run!], {
+      env: {
+        ...process.env,
+        ...Object.fromEntries(
+          Object.keys(enforceWindowsCore?.env ?? {}).map((key) => [key, 'success'])
+        ),
+        WINDOWS_CORE_CHECKS: 'null',
+        WINDOWS_RUNTIME_SELECTED: 'true',
+        WINDOWS_PATH_SELECTED: 'true',
+        WINDOWS_PROCESS_ONLY: 'false',
+        WINDOWS_WHEEL_EVIDENCE_OUTCOME: 'failure'
+      },
+      encoding: 'utf8'
+    })
+    expect(wheelResult.status).toBe(1)
+    expect(wheelResult.stderr).toContain('windows_wheel_evidence ended with failure')
+
+    const shell = workflow.jobs.windows_core.steps?.find(
+      ({ name }) => name === 'Test Windows notebook shell behavior'
+    )
+    const serviceTimeout = workflow.jobs.windows_core.steps?.find(
+      ({ name }) => name === 'Test Windows notebook shell service timeout'
+    )
+    for (const file of [
+      'src/main/notebook/windows-shell.integration.test.ts',
+      'src/main/notebook/package-process-sandbox.windows.integration.test.ts',
+      'src/main/notebook/powershell-search-parser.windows.integration.test.ts',
+      'src/main/notebook/shell-search-scope.test.ts'
+    ])
+      expect(shell?.run).toContain(file)
+    expect(serviceTimeout?.run).toContain('src/main/notebook/runtime-service.test.ts')
+    expect(serviceTimeout?.run).toContain('--testNamePattern')
+
+    const path = workflow.jobs.windows_core.steps?.find(
+      ({ name }) => name === 'Test Windows path portability'
+    )
+    for (const testFile of [
+      'src/main/acp/workspace-path.test.ts',
+      'src/main/file-save.test.ts',
+      'src/main/notebook/run-document-data-paths.test.ts',
+      'packages/environment/src/runtime-paths.test.ts',
+      'src/main/session-persistence/conversation-export.test.ts',
+      'src/main/session-persistence/data-path-roundtrip.test.ts',
+      'src/main/settings/notebook-runtime-settings.test.ts',
+      'src/main/settings/preferences.test.ts',
+      'src/main/settings/shell-path.test.ts',
+      'packages/specialists/src/repository.test.ts',
+      'src/main/storage/data-path.test.ts',
+      'src/main/storage/normalize-legacy-paths.test.ts',
+      'src/main/storage/path-presence.test.ts'
+    ]) {
+      expect(path?.run).toContain(testFile)
+      expect(existsSync(testFile), `Missing Windows test: ${testFile}`).toBe(true)
+    }
+    expect(path?.run).toContain('--maxWorkers=1')
+    expect(path?.run).toContain('--testTimeout=30000')
+    expect(path?.run).toContain('--hookTimeout=30000')
+  })
+
+  it('checks only changed files for formatting', () => {
+    const checkout = workflow.jobs.static.steps?.find(({ name }) => name === 'Checkout')
+    const docs = workflow.jobs.static.steps?.find(
+      ({ name }) => name === 'Check Markdown formatting'
+    )
+    const format = workflow.jobs.static.steps?.find(({ name }) => name === 'Check formatting')
+
+    expect(checkout?.with?.['fetch-depth']).toBe(0)
+    expect(docs).toMatchObject({
+      env: {
+        BASE_SHA: '${{ needs.preflight.outputs.base }}',
+        HEAD_SHA: '${{ needs.preflight.outputs.head }}'
+      },
+      run: 'node scripts/ci/check-changed-format.mjs --base "$BASE_SHA" --head "$HEAD_SHA" --kind markdown'
+    })
+    expect(format).toMatchObject({
+      env: {
+        BASE_SHA: '${{ needs.preflight.outputs.base }}',
+        HEAD_SHA: '${{ needs.preflight.outputs.head }}'
+      },
+      run: 'node scripts/ci/check-changed-format.mjs --base "$BASE_SHA" --head "$HEAD_SHA" --kind non-markdown'
+    })
+  })
+
+  it('covers both root CLI and publishable SDK tests in the narrow lane', () => {
+    const testStep = workflow.jobs.runtime_checks.steps?.find(
+      ({ name }) => name === 'Test CLI and SDK'
+    )
+
+    expect(testStep?.run).toContain('npx vitest run cli packages/open-science')
+    expect(testStep?.run).toContain('npm run check:cli-package')
+  })
+
+  it('keeps Node 22 CLI compatibility blocking even when Node 24 shards cover the full plan', () => {
+    const steps = workflow.jobs.runtime_checks.steps ?? []
+    const setup = steps.find(({ name }) => name === 'Setup Node 22 for CLI compatibility')
+    const compatibility = steps.find(({ id }) => id === 'cli_node22')
+    const enforce = steps.find(({ name }) => name === 'Enforce selected runtime checks')!
+
+    expect(readFileSync(join(process.cwd(), '.nvmrc'), 'utf8').trim()).toBe('24')
+    expect(steps.find(({ name }) => name === 'Setup Node')?.with?.['node-version']).toBe(24)
+    expect(setup?.with?.['node-version']).toBe(22)
+    expect(setup?.if).toBe(compatibility?.if)
+    expect(compatibility?.if).toBe(
+      "${{ contains(fromJSON(needs.preflight.outputs.plan).lanes, 'cli_sdk') }}"
+    )
+    expect(compatibility?.env ?? {}).not.toHaveProperty('RUN_DEDICATED_TESTS')
+    expect(compatibility?.run).toContain('npx vitest run cli packages/open-science')
+    expect(compatibility?.run).toContain('npm run check:cli-package')
+    expect(steps.indexOf(setup!)).toBeLessThan(steps.indexOf(compatibility!))
+    expect(steps.indexOf(compatibility!)).toBeLessThan(steps.indexOf(enforce))
+    expect(enforce.env?.CLI_NODE22_OUTCOME).toBe('${{ steps.cli_node22.outcome }}')
+
+    for (const outcome of ['success', 'failure', 'cancelled', 'skipped', '']) {
+      const result = spawnSync('bash', ['-c', enforce.run!], {
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          ...Object.fromEntries(Object.keys(enforce.env ?? {}).map((key) => [key, 'success'])),
+          CLI_REQUIRED: 'true',
+          BUNDLE_REQUIRED: 'true',
+          CLI_NODE22_OUTCOME: outcome
+        }
+      })
+      expect(result.status, result.stderr).toBe(outcome === 'success' ? 0 : 1)
+    }
+  })
+
+  it('labels the existing cross-process checks as a shadow baseline', () => {
+    const step = workflow.jobs.static.steps?.find(
+      ({ name }) => name === 'Check interface contract baseline (shadow)'
+    )
+
+    expect(step).toBeDefined()
+    for (const testFile of [
+      'src/preload/index.test.ts',
+      'src/preload/electron-renderer-contract-adapter.test.ts',
+      'src/shared/renderer-contract.test.ts',
+      'src/shared/renderer-contract-catalog.test.ts',
+      'src/shared/renderer-surface-inventory.test.ts',
+      'src/shared/renderer-surface-matrix.test.ts',
+      'src/shared/web-rpc-contract.test.ts'
+    ]) {
+      expect(step?.run).toContain(testFile)
+    }
+    expect(manifest.laneOrder).not.toContain('unit_preload_contracts')
+    expect(workflow.jobs).not.toHaveProperty('preload_contracts')
+  })
+})
+
+describe('E2E throughput contracts', () => {
+  it('dispatches the real E2E bundles with a valid focused plan', () => {
+    const classify = workflow.jobs.preflight.steps?.find(({ id }) => id === 'classify')
+    const dir = mkdtempSync(join(tmpdir(), 'e2e-plan-'))
+    try {
+      const output = join(dir, 'output')
+      const run = spawnSync('bash', ['-eu', '-c', classify!.run!], {
+        env: {
+          ...process.env,
+          EVENT_NAME: 'workflow_dispatch',
+          DRY_RUN_MODE: 'e2e',
+          GITHUB_OUTPUT: output
+        },
+        encoding: 'utf8'
+      })
+      expect(run.status, run.stderr).toBe(0)
+      const line = readFileSync(output, 'utf8')
+        .split('\n')
+        .find((line) => line.startsWith('plan='))!
+      const plan = JSON.parse(line.slice(5))
+      expect(plan.bundles).toEqual(['policy', 'macos_e2e', 'windows_e2e'])
+      expect([...new Set(plan.lanes.map((lane: string) => manifest.laneBundles[lane]))]).toEqual(
+        plan.bundles
+      )
+      expect(plan.lanes).toContain('e2e_browser_windows')
+      // Only the groups owning selected lanes may run; the trusted evaluator checks equality.
+      expect(plan.macosGroups).toEqual(['journeys', 'presentation'])
+      expect(plan.macosGroups).toEqual(macosGroupsForPlan(plan))
+      const conclusions = { preflight: 'success', policy: 'success', macos_e2e: 'success' }
+      expect(
+        evaluatePrGate(
+          plan,
+          { ...conclusions, windows_e2e: 'success' },
+          { executionMode: 'bundles' }
+        ).ok
+      ).toBe(true)
+      expect(
+        evaluatePrGate(
+          plan,
+          { ...conclusions, windows_e2e: 'skipped' },
+          { executionMode: 'bundles' }
+        ).ok
+      ).toBe(false)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('installs the headless browser before macOS browser journeys and presentation tests', () => {
+    const steps = workflow.jobs.macos_e2e.steps!
+    const browser = steps.findIndex(({ name }) => name === 'Install headless Chromium')
+    expect(browser).toBeGreaterThan(steps.findIndex(({ id }) => id === 'setup'))
+    // Electron-only smoke/workspace lanes do not need Playwright's browser fixture.
+    expect(steps[browser].if).toBe(
+      "${{ matrix.group == 'presentation' || (matrix.group == 'journeys' && steps.setup.outcome == 'success' && contains(fromJSON(needs.preflight.outputs.plan).lanes, 'e2e_functional_macos')) }}"
+    )
+    expect(steps[browser]['continue-on-error']).not.toBe(true)
+    for (const id of ['e2e_functional_macos', 'e2e_workspace_macos', 'renderer_layout'])
+      expect(browser).toBeLessThan(steps.findIndex((step) => step.id === id))
+    expect(steps[browser].run).toBe('npx playwright install chromium --only-shell')
+  })
+
+  it('partitions macOS groups while preserving the stable aggregate gate', () => {
+    const job = workflow.jobs.macos_e2e
+    expect(typeof job.strategy?.matrix === 'object' ? job.strategy.matrix.group : undefined).toBe(
+      `\${{ fromJSON(needs.preflight.outputs.plan).macosGroups || fromJSON('["journeys","presentation","regressions","delegation"]') }}`
+    )
+    for (const [id, group] of [
+      ['e2e_functional_macos', 'journeys'],
+      ['e2e_workspace_macos', 'journeys'],
+      ['e2e_accessibility_macos', 'presentation'],
+      ['e2e_visual_macos', 'presentation'],
+      ['renderer_layout', 'presentation']
+    ]) {
+      expect(job.steps?.find((step) => step.id === id)?.if).toContain(`matrix.group == '${group}'`)
+    }
+    expect(workflow.jobs.gate.needs).toContain('macos_e2e')
+    const enforce = job.steps?.find(({ name }) => name === 'Enforce selected macOS checks')
+    const run = spawnSync('bash', ['-c', enforce!.run!], {
+      env: { ...process.env, RENDERER_LAYOUT_OUTCOME: 'failure' },
+      encoding: 'utf8'
+    })
+    expect(run.status).toBe(1)
+    expect(run.stderr).toContain('renderer_layout ended with failure')
+  })
+})
+
+it('uses one selected plan without rollout stage or separate legacy coverage', () => {
+  const raw = readFileSync('.github/workflows/pr-gate.yml', 'utf8')
+  expect(raw).not.toContain('PR_GATE_MERGE_QUEUE_ENABLED')
+  expect(raw).not.toContain('outputs.stage')
+  expect(raw).not.toContain('coverage_macos')
+  const related = workflow.jobs.unit.steps?.find(({ id }) => id === 'unit_macos_related')
+  expect(related?.env?.VITEST_PORTABLE_CI).toContain("macosProfile == 'smoke'")
+  expect(related?.run).toContain('--coverage-changed "$BASE_SHA"')
+})
+
+it('runs short Mac setup and tests in one job without web build or snapshot transfer', () => {
+  const mac = workflow.jobs.macos_e2e
+  const install = mac.steps?.find(({ name }) => name === 'Install short Mac dependencies')
+  const build = mac.steps?.find(({ id }) => id === 'smoke_build')
+  expect(install).toMatchObject({
+    if: "${{ (fromJSON(needs.preflight.outputs.plan).macosProfile == 'smoke' || (fromJSON(needs.preflight.outputs.plan).macosProfile == 'expanded' && contains(fromJSON(needs.preflight.outputs.plan).lanes, 'e2e_smoke_macos'))) }}",
+    run: 'node scripts/ci/npm-ci.mjs'
+  })
+  expect(build).toMatchObject({ if: install?.if, run: 'npm run build:e2e' })
+  expect(mac.steps?.some(({ run }) => run === 'npm run build:web')).toBe(false)
+  for (const name of ['Download E2E setup', 'Restore E2E setup']) {
+    expect(mac.steps?.find((step) => step.name === name)?.if).toContain(
+      "!(fromJSON(needs.preflight.outputs.plan).macosProfile == 'smoke' || (fromJSON(needs.preflight.outputs.plan).macosProfile == 'expanded' && contains(fromJSON(needs.preflight.outputs.plan).lanes, 'e2e_smoke_macos')))"
+    )
+  }
+  const core = mac.steps?.find(({ id }) => id === 'e2e_smoke_macos')
+  expect(core?.if).toContain("steps.smoke_build.outcome == 'success'")
+  expect(mac.if).toContain('!cancelled()')
+  expect(mac.if).toContain("needs.preflight.result == 'success'")
+})
+
+it('provides a focused manual plan that exercises the same single-runner Mac job', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'macos-smoke-plan-'))
+  try {
+    const output = join(dir, 'output')
+    const classify = workflow.jobs.preflight.steps?.find(
+      ({ name }) => name === 'Classify change impact'
+    )
+    if (!classify?.run) throw new Error('Missing classifier')
+    const result = spawnSync('bash', ['-c', classify.run], {
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        EVENT_NAME: 'workflow_dispatch',
+        DRY_RUN_MODE: 'macos-smoke',
+        GITHUB_OUTPUT: output,
+        GITHUB_STEP_SUMMARY: join(dir, 'summary')
+      }
+    })
+    expect(result.status, result.stderr).toBe(0)
+    const line = readFileSync(output, 'utf8')
+      .split('\n')
+      .find((line) => line.startsWith('plan='))!
+    const plan = JSON.parse(line.slice(5))
+    expect(plan).toMatchObject({
+      macosProfile: 'smoke',
+      macosGroups: ['journeys'],
+      bundles: ['policy', 'macos_e2e']
+    })
+    expect(
+      evaluatePrGate(
+        plan,
+        { preflight: 'success', policy: 'success', macos_e2e: 'success' },
+        { executionMode: 'bundles' }
+      ).ok
+    ).toBe(true)
+    expect(
+      evaluatePrGate(
+        plan,
+        { preflight: 'success', policy: 'success', macos_e2e: 'skipped' },
+        { executionMode: 'bundles' }
+      ).ok
+    ).toBe(false)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+it('keeps the platform policy explicit and keeps automated portable tests off macOS for both event types', () => {
+  const classify = workflow.jobs.preflight.steps?.find(({ id }) => id === 'classify')
+  expect(classify?.env?.PR_GATE_PLATFORM_POLICY).toBe('risk-v1')
+  const gate = workflow.jobs.gate.steps?.find(
+    ({ name }) => name === 'Evaluate deterministic gate from trusted base'
+  )
+  expect(gate?.env?.PR_GATE_PLATFORM_POLICY).toBe('risk-v1')
+  const related = workflow.jobs.unit.steps?.find(({ id }) => id === 'unit_macos_related')
+  for (const event of ['pull_request', 'merge_group']) {
+    expect(workflow.jobs.unit['runs-on']).toContain(`github.event_name == '${event}'`)
+    expect(related?.env?.VITEST_PORTABLE_CI).toContain(`github.event_name == '${event}'`)
+  }
+})
+
+it('derives Ubuntu package exclusions from trusted policy before either test mode', () => {
+  const steps = workflow.jobs.unit_shard.steps!
+  const policy = steps.find(
+    (step) => step.name === 'Select independent package tests from trusted policy'
+  )!
+  expect(policy.uses).toBe('./.github/actions/select-package-tests')
+  expect(policy.with).toMatchObject({
+    'trusted-base': '${{ needs.preflight.outputs.trusted_base }}',
+    enabled: "${{ github.event_name == 'pull_request' || github.event_name == 'merge_group' }}"
+  })
+  expect(policy['continue-on-error']).toBeUndefined()
+  expect(steps.indexOf(policy)).toBeLessThan(
+    steps.findIndex((step) => step.name === 'Test complete suite shard')
+  )
+  expect(steps.indexOf(policy)).toBeLessThan(
+    steps.findIndex((step) => step.name === 'Test affected Module shard')
+  )
+})
+
+it('verifies installed packages only in the queue and skips installation for an empty trusted selection', () => {
+  expect(workflow.jobs.static.steps?.some((step) => step.run?.includes('check:packages'))).toBe(
+    false
+  )
+  const job = workflow.jobs.package_verification
+  expect(job.if).toBe(
+    "${{ needs.preflight.result == 'success' && github.event_name == 'merge_group' }}"
+  )
+  const selector = job.steps!.find(
+    (step) => step.uses === './.github/actions/select-package-tests'
+  )!
+  expect(selector.with).toMatchObject({
+    verification: 'true',
+    'trusted-base': '${{ needs.preflight.outputs.trusted_base }}'
+  })
+  const check = job.steps!.find((step) => step.uses === './.github/actions/verify-packages')!
+  expect(check.if).toBe("${{ env.OPEN_SCIENCE_CI_SELECTED_PACKAGE_ROOTS != '[]' }}")
+  expect(check.with).toEqual({ selection: 'ci', 'source-tests': 'false' })
+  const sources = workflow.jobs.package_source
+  expect(sources.if).toBe(
+    "${{ needs.preflight.result == 'success' && needs.preflight.outputs.package_sources == 'true' }}"
+  )
+  expect(sources).toMatchObject({
+    strategy: { 'fail-fast': false, matrix: { shard: [1, 2] } },
+    env: { VITEST_PORTABLE_CI: '1', OPEN_SCIENCE_CI_PORTABLE_SCOPE: 'packages' }
+  })
+  expect(
+    sources.steps!.find((step) => step.uses === './.github/actions/select-package-tests')?.with
+  ).toMatchObject({ 'trusted-base': '${{ needs.preflight.outputs.trusted_base }}' })
+  expect(
+    sources.steps!.find((step) => step.name === 'Test selected package sources')?.run
+  ).toContain('vitest run --shard=${{ matrix.shard }}/2')
+  expect(workflow.jobs.gate.needs).toContain('package_source')
+
+  expect(job.steps!.indexOf(selector)).toBeLessThan(job.steps!.indexOf(check))
+  expect(workflow.jobs.gate.needs).toEqual(
+    expect.arrayContaining(['runtime_checks', 'package_verification'])
+  )
+})
+
+it.each(['failure', 'cancelled', 'skipped', ''])(
+  'blocks missing or unsuccessful split executions before an older evaluator: %s',
+  (outcome) => {
+    const step = workflow.jobs.gate.steps!.find(
+      (step) => step.name === 'Evaluate deterministic gate from trusted base'
+    )!
+    // The existing trusted evaluator has no knowledge of these new jobs. Exercise the actual
+    // workflow prefix, stopping immediately before it dispatches to that evaluator.
+    const prefix = step.run!.split('if [[ -f scripts/ci/evaluate-pr-gate.mjs ]]')[0]
+    const run = (extra: Record<string, string>): number | null =>
+      spawnSync('bash', ['-c', prefix], {
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          PREFLIGHT_RESULT: 'success',
+          REGISTRATION_RESULT: 'success',
+          EVENT_NAME: 'merge_group',
+          RUNTIME_REQUIRED: 'true',
+          RUNTIME_RESULT: 'success',
+          PACKAGE_RESULT: 'success',
+          PACKAGE_SOURCE_REQUIRED: 'true',
+          PACKAGE_SOURCE_RESULT: 'success',
+          ...extra
+        }
+      }).status
+    expect(run({})).toBe(0)
+    expect(run({ RUNTIME_RESULT: outcome })).toBe(1)
+    expect(run({ PACKAGE_RESULT: outcome })).toBe(1)
+    expect(run({ PACKAGE_SOURCE_RESULT: outcome })).toBe(1)
+    expect(run({ PACKAGE_SOURCE_REQUIRED: 'false', PACKAGE_SOURCE_RESULT: 'skipped' })).toBe(0)
+    expect(
+      run({
+        EVENT_NAME: 'pull_request',
+        RUNTIME_REQUIRED: 'false',
+        RUNTIME_RESULT: 'skipped',
+        PACKAGE_RESULT: 'skipped'
+      })
+    ).toBe(0)
+    expect(step.env?.RUNTIME_REQUIRED).toBe(
+      workflow.jobs.runtime_checks.if?.replace("needs.preflight.result == 'success' && ", '')
+    )
+    expect(step.env?.PR_GATE_NEEDS).toContain('needs.runtime_checks.result')
+    expect(step.env?.PR_GATE_NEEDS).toContain('needs.package_verification.result')
+  }
+)
+
+it('uses the PR tier only for pull requests, and the same tier for execution and report merging', () => {
+  const steps = Object.values(workflow.jobs)
+    .flatMap((job) => job.steps ?? [])
+    .filter((step) => step.run?.includes('npm run test:affected'))
+  expect(steps).toHaveLength(3)
+  for (const step of steps) {
+    expect(step.env?.TEST_TIER).toBe(
+      "${{ github.event_name == 'pull_request' && 'pr' || 'queue' }}"
+    )
+    expect(step.run).toContain('--tier "$TEST_TIER"')
+  }
+  expect(workflow.on).toHaveProperty('merge_group')
+})

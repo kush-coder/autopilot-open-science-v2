@@ -1,0 +1,1100 @@
+import { HARNESS_OWNER } from '../harness-acp/config'
+import type { AcpSpecialistResolutionContext } from './runtime-contract'
+import {
+  recordMainAgentContext,
+  PreviousAgentContextUnavailableError
+} from './main-agent-process-ownership'
+import * as acp from '@agentclientprotocol/sdk'
+import type { ActiveSession, ClientConnection, SessionConfigOption } from '@agentclientprotocol/sdk'
+import { resolve } from 'node:path'
+import type {
+  AcpCreateSessionResponse,
+  AcpResumeSessionRequest,
+  AcpRuntimeEventInput
+} from '../../shared/acp'
+import {
+  DEFAULT_PERMISSION_PROFILE,
+  normalizePermissionProfile,
+  type SessionPermissionProfileState
+} from '../../shared/permission-profiles'
+import type { EffectiveSpecialistSkills } from '@aipoch/specialists'
+import {
+  createLogger,
+  diagnosticErrorFields,
+  startDiagnosticOperation
+} from '@aipoch/diagnostics/node'
+import type { AcpBackendGenerationView } from './backend-generation-owner'
+import type { AcpProviderSessionAdopter } from './provider-session-adopter'
+import {
+  type AcpSessionCapabilityOwner,
+  type SessionCapabilityPolicy,
+  type SessionCapabilityProvision
+} from './session-capability-owner'
+import type { AcpSessionConfigurator } from './session-configurator'
+import {
+  AcpSessionPresentationPolicy,
+  type AcpSessionSetupPresentation
+} from './session-presentation-policy'
+import type {
+  AcpPrimarySessionIdentityReservation,
+  AcpPrimarySessionIdentityReservationResult,
+  AcpSessionAttachment,
+  AcpSessionRegistry
+} from './session-registry'
+import { AcpSessionResumePolicy } from './session-resume-policy'
+
+const log = createLogger('acp')
+
+type SessionAttachmentResponse = {
+  sessionId: string
+  modes?: ActiveSession['modes'] | null
+  configOptions?: unknown
+  _meta?: unknown
+}
+
+type ClientContextSessionAttacher = {
+  attachSession: (response: SessionAttachmentResponse) => ActiveSession
+}
+
+type ResumeEvent = AcpRuntimeEventInput
+
+type AcpProviderSessionResumerDependencies = Readonly<{
+  defaultCwd: string
+  defaultProjectId: string
+  currentCwd: () => string | undefined
+  currentConnection: () => ClientConnection | undefined
+  ensureConnected: (cwd: string) => Promise<ClientConnection>
+  assertCurrentConnection: (connection: ClientConnection) => void
+  assertResumeAllowed?: (frameworkId: string, providerSessionId: string) => Promise<void>
+  disconnectTimedOutConnection: () => Promise<void>
+  resumeCapabilityAdvertised: () => boolean
+  supportsSessionClose: () => boolean
+  currentBackend: () => AcpBackendGenerationView
+  registry: AcpSessionRegistry
+  reserveIdentity: (sessionId: string) => AcpPrimarySessionIdentityReservationResult
+  capabilities: Pick<AcpSessionCapabilityOwner, 'provision'> &
+    Partial<Pick<AcpSessionCapabilityOwner, 'isWslSetupSession'>>
+  capabilityPolicy: SessionCapabilityPolicy
+  configurator: Pick<AcpSessionConfigurator, 'configure' | 'configurePermissionProfile'>
+  adopter: Pick<AcpProviderSessionAdopter, 'adopt'>
+  setLivePermissionProfile: (sessionId: string, profile: SessionPermissionProfileState) => void
+  invalidatePermissionProfile: (sessionId: string) => void
+  resolveSpecialistIdentity?: (
+    specialistId: string,
+    frameworkId: string
+  ) => Promise<{ append: string; prefix: string } | undefined>
+  resolveSpecialistSkills?: (
+    specialistId: string,
+    context?: AcpSpecialistResolutionContext
+  ) => Promise<EffectiveSpecialistSkills>
+  registerSessionSpecialist?: (sessionId: string, specialistId: string | undefined) => void
+  // The ACP projectId carries the Project id (see workspace-conversation-controller). Returns
+  // undefined when the project has no Agent Context or the lookup fails; failures never block
+  // session resume.
+  resolveProjectAgentContext?: (projectId: string) => Promise<string | undefined>
+  updateCwd: (cwd: string) => void
+  pushEvent: (event: ResumeEvent) => void
+  emitState: () => void
+  resumeTimeoutMs: number
+  setTimer: (fn: () => void, ms: number) => ReturnType<typeof setTimeout>
+  clearTimer: (handle: ReturnType<typeof setTimeout>) => void
+  diagnosticContext: () => Readonly<Record<string, unknown>>
+}>
+
+// In-process transfer receipt; identity survives retries, release validity ends on reacquisition.
+export type AcpSessionWriterTransfer = {
+  providerSessionId: string
+  writerReleased: boolean
+}
+
+export class AcpProviderSessionResumer {
+  private readonly policy = new AcpSessionResumePolicy()
+  private readonly presentation = new AcpSessionPresentationPolicy()
+  private readonly writerReleases = new Map<
+    string,
+    { attachment: AcpSessionAttachment; operation: Promise<string | undefined> }
+  >()
+  private readonly pendingResumeTransfers = new Map<string, AcpSessionWriterTransfer>()
+  private readonly progressObservers = new Map<string, Set<() => void>>()
+
+  constructor(private readonly deps: AcpProviderSessionResumerDependencies) {}
+
+  observeProgress(providerSessionId: string): void {
+    const observers = this.progressObservers.get(providerSessionId)
+    if (!observers) return
+    for (const observer of observers) observer()
+  }
+
+  async resume(
+    request: AcpResumeSessionRequest,
+    writerTransfer?: AcpSessionWriterTransfer,
+    isPermissionCurrent: () => boolean = () => true,
+    onSessionReady?: () => void
+  ): Promise<AcpCreateSessionResponse> {
+    if (this.writerReleases.has(request.sessionId)) {
+      const providerSessionId = await this.releaseForTransfer(request.sessionId)
+      if (providerSessionId) {
+        request = { ...request, providerSessionId }
+        writerTransfer = { providerSessionId, writerReleased: true }
+        this.pendingResumeTransfers.set(request.sessionId, writerTransfer)
+      }
+    }
+    const attached = this.deps.registry.lookup(request.sessionId)?.attachment
+    if (attached) {
+      this.pendingResumeTransfers.delete(request.sessionId)
+      const response = await this.resumeAttached(request, attached, isPermissionCurrent)
+      onSessionReady?.()
+      return response
+    }
+    writerTransfer ??= this.pendingResumeTransfers.get(request.sessionId)
+    if (writerTransfer)
+      request = { ...request, providerSessionId: writerTransfer.providerSessionId }
+    const response = await this.resumeDetached(
+      request,
+      false,
+      writerTransfer,
+      undefined,
+      onSessionReady
+    )
+    this.pendingResumeTransfers.delete(request.sessionId)
+    return response
+  }
+
+  hasPendingWriterRelease(sessionId: string): boolean {
+    return this.writerReleases.has(sessionId)
+  }
+
+  async releaseForTransfer(sessionId: string): Promise<string | undefined> {
+    let release = this.writerReleases.get(sessionId)
+    if (!release) {
+      const attachment = this.deps.registry.lookup(sessionId)?.attachment
+      if (!attachment) return undefined
+      release = { attachment, operation: this.releaseWriter(sessionId) }
+      this.writerReleases.set(sessionId, release)
+      const current = release
+      void release.operation.catch(() => {
+        if (this.writerReleases.get(sessionId) === current) this.writerReleases.delete(sessionId)
+      })
+    }
+    // Keep ownership discoverable after a caller timeout. Only a caller consuming the confirmed
+    // release may detach it; otherwise sibling state updates could discard the retry identity.
+    const providerSessionId = await this.withTimeout(() => release.operation, [], {
+      preserveConnection: true
+    })
+    const current = this.deps.registry.lookup(sessionId)?.attachment
+    if (current === release.attachment) {
+      if (!this.deps.registry.detach(release.attachment, 'connection')) {
+        throw new Error('ACP session transfer was superseded.')
+      }
+      release.attachment.session.dispose()
+    } else if (current) {
+      if (this.writerReleases.get(sessionId) === release) this.writerReleases.delete(sessionId)
+      throw new Error('ACP session transfer was superseded.')
+    }
+    if (this.writerReleases.get(sessionId) === release) this.writerReleases.delete(sessionId)
+    return providerSessionId
+  }
+
+  private async releaseWriter(sessionId: string): Promise<string | undefined> {
+    const entry = this.deps.registry.lookup(sessionId)
+    const attachment = entry?.attachment
+    if (!attachment) return undefined
+    const connection = this.deps.currentConnection()
+    if (!connection || !this.deps.supportsSessionClose()) {
+      throw new Error('The provider cannot release this Session for a model change.')
+    }
+    // Close only this writer, preserving provider history and sibling Sessions. A failed close
+    // must not allow another generation to resume the same thread.
+    await connection.agent.request(
+      acp.methods.agent.session.close,
+      { sessionId: attachment.providerSessionId },
+      { cancellationSignal: new AbortController().signal }
+    )
+    this.deps.assertCurrentConnection(connection)
+    return attachment.providerSessionId
+  }
+
+  async reconfigure(request: AcpResumeSessionRequest): Promise<AcpCreateSessionResponse> {
+    this.assertNoPendingWriterRelease(request.sessionId)
+    const entry = this.deps.registry.lookup(request.sessionId)
+    const attachment = entry?.attachment
+    const snapshot = entry?.aggregate.snapshot()
+    const providerSessionId = attachment?.providerSessionId ?? request.providerSessionId
+    if (!attachment) {
+      return this.resumeDetached(
+        { ...request, ...(providerSessionId ? { providerSessionId } : {}) },
+        true
+      )
+    }
+    this.assertSkillScopeRefreshSupported(request.sessionId)
+    const knownWriterConnection = this.deps.currentConnection()
+    this.deps.registry.detach(attachment, 'provider')
+    try {
+      const result = await this.resumeDetached(
+        { ...request, providerSessionId: attachment.providerSessionId },
+        true,
+        undefined,
+        knownWriterConnection
+      )
+      attachment.session.dispose()
+      return result
+    } catch (error) {
+      if (
+        this.deps.currentBackend().framework.id === 'codex' &&
+        this.deps.currentBackend().session.options?.openScienceSkillRuntime
+      ) {
+        // Its native thread may already have been closed to refresh MCP. Do not republish a
+        // stale attachment after failed reconfiguration; the next startup must resume afresh.
+        attachment.session.dispose()
+        throw error
+      }
+      if (
+        snapshot?.cwd &&
+        snapshot.projectId &&
+        snapshot.frameworkId &&
+        snapshot.permissionProfile
+      ) {
+        const restored = this.deps.registry.reserve({
+          sessionIds: [request.sessionId, attachment.providerSessionId],
+          blockStartup: false
+        })
+        if (!restored.collision) {
+          try {
+            this.deps.registry.publish(restored.reservation, request.sessionId, {
+              session: attachment.session,
+              cwd: snapshot.cwd,
+              projectId: snapshot.projectId,
+              frameworkId: snapshot.frameworkId,
+              ...(snapshot.backendId ? { backendId: snapshot.backendId } : {}),
+              permissionProfile: {
+                ...snapshot.permissionProfile,
+                availableModeIds: [...snapshot.permissionProfile.availableModeIds]
+              },
+              ...(snapshot.appliedModel ? { appliedModel: snapshot.appliedModel } : {}),
+              ...(snapshot.configOptions
+                ? {
+                    configOptions: structuredClone(snapshot.configOptions) as SessionConfigOption[]
+                  }
+                : {})
+            })
+          } finally {
+            restored.reservation.release()
+          }
+        }
+      }
+      throw error
+    }
+  }
+
+  private async resumeDetached(
+    request: AcpResumeSessionRequest,
+    compatibleOnly: boolean,
+    writerTransfer?: AcpSessionWriterTransfer,
+    knownWriterConnection?: ClientConnection,
+    onSessionReady?: () => void
+  ): Promise<AcpCreateSessionResponse> {
+    const cwd = resolve(request.cwd || this.deps.currentCwd() || this.deps.defaultCwd)
+    const projectId = request.projectId?.trim() || this.deps.defaultProjectId
+    const reserved = this.deps.reserveIdentity(request.sessionId)
+    if (reserved.collision) throw reserved.collision
+    const identity = reserved.reservation
+
+    try {
+      const connection = await this.withTimeout(() => this.deps.ensureConnected(cwd))
+      this.deps.assertCurrentConnection(connection)
+      identity.renew()
+      const response = await this.withTimeout(
+        (cancellationSignal) =>
+          this.resumeConnected(
+            request,
+            connection,
+            cwd,
+            projectId,
+            identity,
+            compatibleOnly,
+            cancellationSignal,
+            writerTransfer,
+            knownWriterConnection
+          ),
+        this.progressSessionIds(request)
+      )
+      // Hand off protection synchronously before releasing the original resume reservation.
+      onSessionReady?.()
+      return response
+    } finally {
+      identity.release()
+    }
+  }
+
+  private async resumeAttached(
+    request: AcpResumeSessionRequest,
+    attachment: AcpSessionAttachment,
+    isPermissionCurrent: () => boolean
+  ): Promise<AcpCreateSessionResponse> {
+    // Refreshing an attachment must not tear down its running turn. Unrelated prompt progress
+    // cannot extend this wait, and cancellation prevents late refresh results from committing.
+    let permissionUpdateStarted = false
+    const initialConnection = this.deps.currentConnection()
+    const initialProfile = this.deps.registry
+      .lookup(request.sessionId)
+      ?.aggregate.snapshot().permissionProfile
+    return this.withTimeout(
+      async (cancellationSignal) => {
+        if (request.specialistBindingPending === true) {
+          throw new Error(
+            'A pending Specialist binding cannot be reconciled through an already attached provider session.'
+          )
+        }
+        if (!isPermissionCurrent()) throw new Error('Permission profile refresh was superseded.')
+        const entry = this.deps.registry.lookup(request.sessionId)
+        if (!entry) throw new Error(`ACP session is not registered: ${request.sessionId}`)
+        const connection = this.deps.currentConnection()
+        if (!connection) throw new Error('ACP connection is not available.')
+
+        const cwd = resolve(request.cwd || this.deps.currentCwd() || this.deps.defaultCwd)
+        const projectId = request.projectId?.trim() || this.deps.defaultProjectId
+        const backend = this.deps.currentBackend()
+        if (
+          backend.framework.id === 'codex' &&
+          backend.session.options?.openScienceSkillRuntime &&
+          request.specialistId &&
+          request.specialistId !== entry.aggregate.snapshot().specialistId
+        ) {
+          throw new Error(
+            'Use Specialist switching to change the Skill scope of an attached Codex session.'
+          )
+        }
+        const wslSetup =
+          (await this.deps.capabilities.isWslSetupSession?.(request.sessionId)) === true
+        cancellationSignal.throwIfAborted()
+        const previousProfile = entry.aggregate.snapshot().permissionProfile
+        permissionUpdateStarted = true
+        this.deps.invalidatePermissionProfile(request.sessionId)
+        const permissionProfile = await this.deps.configurator
+          .configurePermissionProfile({
+            backend,
+            connection,
+            session: attachment.session,
+            cancellationSignal,
+            permissionProfile: normalizePermissionProfile(
+              request.permissionProfile ??
+                entry.aggregate.snapshot().permissionProfile?.selectedProfile ??
+                DEFAULT_PERMISSION_PROFILE
+            )
+          })
+          .catch((error) => {
+            // A timeout has an unknown provider outcome: stay revoked until an explicit retry.
+            if (
+              !cancellationSignal.aborted &&
+              isPermissionCurrent() &&
+              previousProfile &&
+              this.deps.currentConnection() === connection &&
+              this.deps.registry.lookup(request.sessionId)?.attachment === attachment
+            ) {
+              this.deps.setLivePermissionProfile(request.sessionId, {
+                ...previousProfile,
+                availableModeIds: [...previousProfile.availableModeIds]
+              })
+            }
+            throw error
+          })
+        cancellationSignal.throwIfAborted()
+        if (!isPermissionCurrent()) throw new Error('Permission profile refresh was superseded.')
+        const current = this.deps.registry.lookup(request.sessionId)
+        if (
+          current?.attachment?.generation !== attachment.generation ||
+          current.attachment.session !== attachment.session
+        ) {
+          throw new Error('ACP session startup was superseded.')
+        }
+        this.deps.assertCurrentConnection(connection)
+        if (request.specialistId) current.aggregate.setSpecialistId(request.specialistId)
+        current.aggregate.setPermissionProfile(structuredClone(permissionProfile))
+        this.deps.setLivePermissionProfile(request.sessionId, permissionProfile)
+        this.deps.registry.select(request.sessionId)
+        this.deps.updateCwd(cwd)
+        current.aggregate.updateLocation(cwd, projectId)
+        this.registerSessionSpecialist(request.sessionId)
+        this.deps.emitState()
+
+        const responseBackend = this.deps.currentBackend()
+        return {
+          sessionId: request.sessionId,
+          providerSessionId: attachment.providerSessionId,
+          ...(responseBackend.providerContinuityToken
+            ? { providerContinuityToken: responseBackend.providerContinuityToken }
+            : {}),
+          cwd,
+          frameworkId: responseBackend.framework.id,
+          ...(responseBackend.backendId ? { backendId: responseBackend.backendId } : {}),
+          ...(wslSetup ? { wslSetup: true as const } : {})
+        }
+      },
+      [],
+      {
+        preserveConnection: true,
+        timeoutMessage: () =>
+          'ACP attached session refresh timed out. The existing session remains attached. ' +
+          (permissionUpdateStarted
+            ? 'The permission update outcome is unknown.'
+            : 'No permission update was attempted.')
+      }
+    ).catch((error) => {
+      if (
+        !permissionUpdateStarted &&
+        isPermissionCurrent() &&
+        initialProfile &&
+        this.deps.currentConnection() === initialConnection &&
+        this.deps.registry.lookup(request.sessionId)?.attachment === attachment
+      ) {
+        this.deps.setLivePermissionProfile(request.sessionId, {
+          ...initialProfile,
+          availableModeIds: [...initialProfile.availableModeIds]
+        })
+      }
+      throw error
+    })
+  }
+
+  private async withTimeout<Result>(
+    operation: (cancellationSignal: AbortSignal) => Promise<Result>,
+    progressSessionIds: readonly string[] = [],
+    options: { preserveConnection?: boolean; timeoutMessage?: () => string } = {}
+  ): Promise<Result> {
+    const cancellation = new AbortController()
+    let timer: ReturnType<typeof setTimeout> | undefined
+    let timedOut = false
+    let settled = false
+    let rejectTimeout!: (error: Error) => void
+    const timeout = new Promise<never>((_resolve, reject) => {
+      rejectTimeout = reject
+    })
+    const renewTimeout = (): void => {
+      if (settled || timedOut) return
+      if (timer !== undefined) this.deps.clearTimer(timer)
+      timer = this.deps.setTimer(() => {
+        timedOut = true
+        const error = new Error(options.timeoutMessage?.() ?? 'ACP session resume timed out.')
+        cancellation.abort(error)
+        rejectTimeout(error)
+      }, this.deps.resumeTimeoutMs)
+    }
+    const unsubscribe = this.subscribeToProgress(progressSessionIds, renewTimeout)
+    renewTimeout()
+
+    try {
+      return await Promise.race([operation(cancellation.signal), timeout])
+    } catch (error) {
+      if (timedOut && !options.preserveConnection) await this.deps.disconnectTimedOutConnection()
+      throw error
+    } finally {
+      settled = true
+      unsubscribe()
+      if (timer !== undefined) this.deps.clearTimer(timer)
+    }
+  }
+
+  private progressSessionIds(request: AcpResumeSessionRequest): string[] {
+    const registeredProviderSessionId = this.deps.registry
+      .lookup(request.sessionId)
+      ?.aggregate.snapshot().providerSessionId
+    return [request.sessionId, request.providerSessionId, registeredProviderSessionId].filter(
+      (sessionId): sessionId is string => typeof sessionId === 'string' && sessionId.length > 0
+    )
+  }
+
+  private subscribeToProgress(sessionIds: readonly string[], observer: () => void): () => void {
+    const subscribedIds = [...new Set(sessionIds)]
+    for (const sessionId of subscribedIds) {
+      const observers = this.progressObservers.get(sessionId) ?? new Set<() => void>()
+      observers.add(observer)
+      this.progressObservers.set(sessionId, observers)
+    }
+    return () => {
+      for (const sessionId of subscribedIds) {
+        const observers = this.progressObservers.get(sessionId)
+        if (!observers) continue
+        observers.delete(observer)
+        if (observers.size === 0) this.progressObservers.delete(sessionId)
+      }
+    }
+  }
+
+  private async resumeConnected(
+    request: AcpResumeSessionRequest,
+    connection: ClientConnection,
+    cwd: string,
+    projectId: string,
+    identity: AcpPrimarySessionIdentityReservation,
+    compatibleOnly: boolean,
+    cancellationSignal: AbortSignal,
+    writerTransfer?: AcpSessionWriterTransfer,
+    knownWriterConnection?: ClientConnection
+  ): Promise<AcpCreateSessionResponse> {
+    const affinity = this.deps.registry.lookup(request.sessionId)?.aggregate.snapshot()
+    const persistedProviderSessionId = affinity?.providerSessionId ?? request.providerSessionId
+    const backend = this.deps.currentBackend()
+    if (request.specialistBindingPending === true) {
+      if (compatibleOnly) {
+        throw new Error('ACP capability reconfiguration requires a compatible provider resume.')
+      }
+      log.info('adopting fresh provider context for pending Specialist binding', {
+        sessionId: request.sessionId,
+        ...this.deps.diagnosticContext()
+      })
+      return this.adopt(request, connection, cwd, projectId, identity)
+    }
+    if (compatibleOnly && persistedProviderSessionId) {
+      return this.resumeCompatible(
+        request,
+        connection,
+        cwd,
+        projectId,
+        identity,
+        persistedProviderSessionId,
+        true,
+        true,
+        cancellationSignal,
+        writerTransfer,
+        knownWriterConnection
+      )
+    }
+    const decision = this.policy.decide({
+      appSessionId: request.sessionId,
+      providerSessionId: persistedProviderSessionId ?? request.sessionId,
+      previousFrameworkId: affinity?.frameworkId ?? request.previousFrameworkId,
+      currentFrameworkId: backend.framework.id,
+      previousBackendId: affinity?.backendId ?? request.previousBackendId,
+      currentBackendId: backend.backendId,
+      currentModelRoute: backend.modelRoute,
+      previousProviderContinuityToken: request.providerContinuityToken,
+      currentProviderContinuityToken: backend.providerContinuityToken,
+      resumeCapabilityAdvertised: this.deps.resumeCapabilityAdvertised()
+    })
+
+    if (decision.action === 'adopt') {
+      if (compatibleOnly) {
+        throw new Error(
+          `ACP capability reconfiguration cannot replace provider context (${decision.reason}).`
+        )
+      }
+      log.info('skipping incompatible provider resume; adopting a fresh session', {
+        sessionId: request.sessionId,
+        reason: decision.reason,
+        ...this.deps.diagnosticContext()
+      })
+      return this.adopt(request, connection, cwd, projectId, identity)
+    }
+    return this.resumeCompatible(
+      request,
+      connection,
+      cwd,
+      projectId,
+      identity,
+      decision.providerSessionId,
+      persistedProviderSessionId !== undefined,
+      compatibleOnly,
+      cancellationSignal,
+      writerTransfer,
+      knownWriterConnection
+    )
+  }
+
+  private async resumeCompatible(
+    request: AcpResumeSessionRequest,
+    connection: ClientConnection,
+    cwd: string,
+    projectId: string,
+    identity: AcpPrimarySessionIdentityReservation,
+    providerSessionId: string,
+    providerSessionIdPersisted: boolean,
+    compatibleOnly: boolean,
+    cancellationSignal: AbortSignal,
+    writerTransfer?: AcpSessionWriterTransfer,
+    knownWriterConnection?: ClientConnection
+  ): Promise<AcpCreateSessionResponse> {
+    let capability: SessionCapabilityProvision | undefined
+    let provisionalSession: ActiveSession | undefined
+    try {
+      let backend = this.deps.currentBackend()
+      this.assertSkillScopeRefreshSupported(request.sessionId)
+      const ownsCurrentWriter = knownWriterConnection === connection
+      const releasedWriter =
+        writerTransfer?.writerReleased && writerTransfer.providerSessionId === providerSessionId
+      if (!ownsCurrentWriter && !releasedWriter) {
+        try {
+          await this.deps.assertResumeAllowed?.(backend.framework.id, providerSessionId)
+        } catch (error) {
+          if (!(error instanceof PreviousAgentContextUnavailableError) || compatibleOnly)
+            throw error
+          cancellationSignal.throwIfAborted()
+          this.deps.assertCurrentConnection(connection)
+          identity.assertCurrent()
+          return this.adopt(request, connection, cwd, projectId, identity)
+        }
+      }
+      recordMainAgentContext(connection, providerSessionId)
+      cancellationSignal.throwIfAborted()
+      this.deps.assertCurrentConnection(connection)
+      identity.assertCurrent()
+      capability = await this.deps.capabilities.provision({
+        stableAppSessionId: request.sessionId,
+        framework: backend.framework,
+        nativeMcpEnabled: backend.adapter.nativeMcpEnabled,
+        bridgeMcpAliasesEnabled: backend.adapter.bridgeMcpAliasesEnabled,
+        policy: this.deps.capabilityPolicy,
+        sessionCwd: cwd,
+        projectId,
+        memoryEnabled: request.memoryEnabled
+      })
+      const capabilityDescriptor = capability.descriptor
+      const wslSetup = capability.wslSetup === true
+      const shellRuntimeAgentContract = capability.shellRuntimeAgentContract
+      const existingAggregate = this.deps.registry.lookup(request.sessionId)?.aggregate
+      let specialistBindingRevision = existingAggregate?.specialistBindingRevision() ?? 0
+      let specialistId = request.specialistId ?? existingAggregate?.snapshot().specialistId
+      let bindingSource = request.specialistId !== undefined ? 'request' : 'registry'
+      const projectContextAppend = await this.resolveProjectAgentContext(projectId)
+      const resolveSpecialistProjection = async (
+        currentSpecialistId: string | undefined,
+        currentBackend: AcpBackendGenerationView
+      ): Promise<{
+        identity: { append: string; prefix: string } | undefined
+        setup: AcpSessionSetupPresentation
+      }> => {
+        if (currentSpecialistId)
+          log.info('bound specialist resolution started', {
+            operation: 'specialist-resolution',
+            mode: 'resume',
+            phase: 'profile',
+            sessionId: request.sessionId,
+            specialistId: currentSpecialistId,
+            frameworkId: currentBackend.framework.id,
+            modelRoute: currentBackend.modelRoute,
+            bindingSource,
+            bindingRevision: specialistBindingRevision
+          })
+        const [identity, skills] = await Promise.all([
+          this.resolveSpecialistIdentity(currentSpecialistId, currentBackend, request.sessionId),
+          this.resolveSpecialistSkills(currentSpecialistId, currentBackend, request.sessionId)
+        ])
+        if (currentSpecialistId)
+          log.info('bound specialist resolution finished', {
+            operation: 'specialist-resolution',
+            mode: 'resume',
+            phase: 'identity',
+            sessionId: request.sessionId,
+            specialistId: currentSpecialistId,
+            frameworkId: currentBackend.framework.id,
+            modelRoute: currentBackend.modelRoute,
+            outcome: skills?.kind === 'unavailable' ? 'unavailable' : 'resolved'
+          })
+        return {
+          identity,
+          setup: this.presentation.buildSessionSetup({
+            framework: currentBackend.framework,
+            tooling: {
+              artifacts: capabilityDescriptor.capabilities.includes('artifacts'),
+              notebook: capabilityDescriptor.capabilities.includes('notebook'),
+              skillImport: capabilityDescriptor.capabilities.includes('skill-import')
+            },
+            role: capabilityDescriptor.role,
+            shellRuntimeAgentContract,
+            backendSystemPromptAppends: currentBackend.prompt.systemPromptAppends,
+            extraSystemPromptAppends: [projectContextAppend, identity?.append].filter(
+              (append): append is string => Boolean(append)
+            ),
+            persistentSystemPrompt: currentBackend.prompt.persistentSystemPrompt,
+            sessionOptions: currentBackend.session.options,
+            specialistSkills: skills
+          })
+        }
+      }
+      let specialistProjection = await resolveSpecialistProjection(specialistId, backend)
+      const sessionCapabilities = capability.includeFrameworkMcpServers(
+        specialistProjection.setup.mcpServers ?? []
+      )
+
+      if (
+        backend.framework.id === 'codex' &&
+        backend.session.options?.openScienceSkillRuntime &&
+        !(writerTransfer?.writerReleased && writerTransfer.providerSessionId === providerSessionId)
+      ) {
+        // Codex reuses the MCP processes of an already loaded thread on resume. Closing the live
+        // thread first applies the new scope without deleting its persisted history or replaying it.
+        await connection.agent.request(
+          acp.methods.agent.session.close,
+          { sessionId: providerSessionId },
+          { cancellationSignal }
+        )
+        if (writerTransfer?.providerSessionId === providerSessionId)
+          writerTransfer.writerReleased = true
+      }
+
+      let resumeResponse: unknown
+      try {
+        resumeResponse = await connection.agent.request(
+          acp.methods.agent.session.resume,
+          {
+            sessionId: providerSessionId,
+            cwd,
+            mcpServers: sessionCapabilities.mcpServers,
+            ...specialistProjection.setup.metaArg,
+            ...(backend.framework.id === 'open-science-agent'
+              ? {
+                  _meta: {
+                    ...specialistProjection.setup.metaArg._meta,
+                    [HARNESS_OWNER]: { projectId, sessionId: request.sessionId }
+                  }
+                }
+              : {})
+          },
+          { cancellationSignal }
+        )
+      } catch (error) {
+        const failure = this.policy.classifyFailure(error, {
+          currentFrameworkId: backend.framework.id,
+          currentModelRoute: backend.modelRoute,
+          providerSessionIdPersisted
+        })
+        startDiagnosticOperation(log, {
+          operation: 'acp-provider-resume-rejection',
+          fields: {
+            sessionId: request.sessionId,
+            frameworkId: backend.framework.id,
+            modelRoute: backend.modelRoute,
+            reason: failure.reason,
+            disposition: failure.disposition,
+            contextReplacementAllowed: !compatibleOnly
+          }
+        }).fail(error)
+        if (failure.disposition !== 'adoptable' || compatibleOnly) throw error
+        try {
+          identity.assertCurrent()
+        } catch (supersededError) {
+          capability.release({ ownsStableIdentity: false })
+          capability = undefined
+          throw supersededError
+        }
+        capability.release({ ownsStableIdentity: true })
+        capability = undefined
+        log.info('resumed session adopted after unrecoverable resume error', {
+          sessionId: request.sessionId,
+          reason: failure.reason,
+          ...diagnosticErrorFields(error)
+        })
+        // Adoption now owns cleanup and releases identity even on failure. Do not catch its
+        // rejection below: checking that released reservation would mask the provider error as
+        // a superseded startup. resumeDetached still awaits this promise before final release.
+        return this.adopt(request, connection, cwd, projectId, identity)
+      }
+
+      // A successful resume has reacquired the writer even if local configuration fails below.
+      if (writerTransfer?.providerSessionId === providerSessionId)
+        writerTransfer.writerReleased = false
+      provisionalSession = (
+        connection.agent as unknown as ClientContextSessionAttacher
+      ).attachSession({ sessionId: providerSessionId, ...(resumeResponse as object) })
+      const resumedProviderSessionId = provisionalSession.sessionId
+      const extended = this.deps.registry.reserve({
+        reservation: identity,
+        sessionIds: [provisionalSession.sessionId]
+      })
+      if (extended.collision) {
+        this.disposeProvisional(provisionalSession, 'primary collision session disposal failed')
+        provisionalSession = undefined
+        throw extended.collision
+      }
+
+      const permission = normalizePermissionProfile(request.permissionProfile)
+      let configuration = await this.deps.configurator.configure({
+        backend,
+        connection,
+        session: provisionalSession,
+        permissionProfile: permission
+      })
+      for (;;) {
+        const currentBackend = this.deps.currentBackend()
+        if (currentBackend !== backend) {
+          backend = currentBackend
+          configuration = await this.deps.configurator.configure({
+            backend,
+            connection,
+            session: provisionalSession,
+            permissionProfile: permission
+          })
+          specialistProjection = await resolveSpecialistProjection(specialistId, backend)
+          continue
+        }
+        identity.assertCurrent()
+        const currentSpecialistBindingRevision =
+          this.deps.registry.lookup(request.sessionId)?.aggregate.specialistBindingRevision() ?? 0
+        if (currentSpecialistBindingRevision !== specialistBindingRevision) {
+          // Prefix-only backends can reconcile locally. A mounted Skill loader has already captured
+          // its scope, including an empty scope with no server, so reject startup before publication.
+          if (
+            backend.framework.id === 'claude-code' ||
+            (backend.framework.id === 'codex' && backend.session.options?.openScienceSkillRuntime)
+          ) {
+            throw new Error('ACP session startup was superseded.')
+          }
+          const currentAggregate = this.deps.registry.lookup(request.sessionId)?.aggregate
+          specialistBindingRevision = currentAggregate?.specialistBindingRevision() ?? 0
+          specialistId = currentAggregate?.snapshot().specialistId
+          bindingSource = 'registry'
+          specialistProjection = await resolveSpecialistProjection(specialistId, backend)
+          continue
+        }
+        const { aggregate } = this.deps.registry.publish(identity, request.sessionId, {
+          session: provisionalSession,
+          cwd,
+          projectId,
+          frameworkId: backend.framework.id,
+          backendId: backend.backendId,
+          permissionProfile: structuredClone(configuration.permissionProfile),
+          memoryEnabled: request.memoryEnabled !== false,
+          appliedModel: configuration.appliedModel,
+          configOptions: structuredClone(configuration.configOptions)
+        })
+        aggregate.setSessionSetupPromptPrefix(specialistProjection.setup.promptPrefix)
+        aggregate.setSpecialistPrefix(specialistProjection.identity?.prefix || undefined)
+        aggregate.setSpecialistId(specialistId)
+        capability.commit(request.sessionId)
+        capability.registerBridgeMcpSession?.(request.sessionId, resumedProviderSessionId)
+        capability = undefined
+        provisionalSession = undefined
+        identity.release()
+        this.publish(request.sessionId, cwd)
+        return {
+          sessionId: request.sessionId,
+          providerSessionId: resumedProviderSessionId,
+          ...(backend.providerContinuityToken
+            ? { providerContinuityToken: backend.providerContinuityToken }
+            : {}),
+          cwd,
+          frameworkId: backend.framework.id,
+          ...(backend.backendId ? { backendId: backend.backendId } : {}),
+          ...(wslSetup ? { wslSetup: true as const } : {})
+        }
+      }
+    } catch (caught) {
+      let startupError = caught
+      let ownsStableIdentity = true
+      try {
+        identity.assertCurrent()
+      } catch (supersededError) {
+        startupError = supersededError
+        ownsStableIdentity = false
+      }
+      capability?.release({ ownsStableIdentity })
+      if (
+        ownsStableIdentity &&
+        provisionalSession &&
+        writerTransfer?.providerSessionId === providerSessionId
+      ) {
+        // A failed local configuration must release the newly acquired writer before retirement or
+        // retry. Keep sibling Sessions connected and retain the original provider failure.
+        try {
+          this.deps.assertCurrentConnection(connection)
+          await this.withTimeout(
+            async (cleanupSignal) => {
+              await connection.agent.request(
+                acp.methods.agent.session.close,
+                { sessionId: provisionalSession!.sessionId },
+                { cancellationSignal: cleanupSignal }
+              )
+              cleanupSignal.throwIfAborted()
+              this.deps.assertCurrentConnection(connection)
+              writerTransfer.writerReleased = true
+            },
+            [],
+            { preserveConnection: true }
+          )
+        } catch (cleanupError) {
+          this.safeLogError('transferred writer cleanup failed', cleanupError, providerSessionId)
+        }
+      }
+      this.disposeProvisional(provisionalSession, 'resumed startup session disposal failed')
+      throw startupError
+    }
+  }
+
+  private adopt(
+    request: AcpResumeSessionRequest,
+    connection: ClientConnection,
+    cwd: string,
+    projectId: string,
+    identity: AcpPrimarySessionIdentityReservation
+  ): Promise<AcpCreateSessionResponse> {
+    return this.deps.adopter.adopt(request.sessionId, {
+      connection,
+      cwd,
+      projectId,
+      identity,
+      permissionProfile: request.permissionProfile,
+      specialistId: request.specialistId,
+      specialistBindingPending: request.specialistBindingPending,
+      memoryEnabled: request.memoryEnabled
+    })
+  }
+
+  private assertNoPendingWriterRelease(sessionId: string): void {
+    // A timed-out close can still terminate its writer. Only resume consumes its release receipt.
+    if (this.writerReleases.has(sessionId)) {
+      throw new Error(
+        'Cannot reconfigure a Session while its writer release is pending. Resume the Session first.'
+      )
+    }
+  }
+
+  assertSkillScopeRefreshSupported(sessionId: string): void {
+    this.assertNoPendingWriterRelease(sessionId)
+    const backend = this.deps.currentBackend()
+    if (backend.framework.id === 'codex' && backend.session.options?.openScienceSkillRuntime) {
+      const missingMethod = !this.deps.supportsSessionClose()
+        ? 'session/close'
+        : !this.deps.resumeCapabilityAdvertised()
+          ? 'session/resume'
+          : undefined
+      if (!missingMethod) return
+      // A plain resume can keep the previous loader alive. Do not guess support or silently
+      // replace persisted context when this runtime cannot refresh the thread's MCP processes.
+      throw new Error(
+        `The Codex runtime does not support ${missingMethod}; cannot safely refresh the Skill scope. Update the Codex runtime and retry.`
+      )
+    }
+  }
+
+  private async resolveProjectAgentContext(projectId: string): Promise<string | undefined> {
+    if (!this.deps.resolveProjectAgentContext) return undefined
+    const context = await this.deps.resolveProjectAgentContext(projectId)
+    return this.presentation.projectAgentContext(context)
+  }
+
+  private async resolveSpecialistSkills(
+    specialistId: string | undefined,
+    backend: AcpBackendGenerationView,
+    sessionId: string
+  ): Promise<EffectiveSpecialistSkills | undefined> {
+    if (!specialistId || !this.deps.resolveSpecialistSkills) return undefined
+    try {
+      return await this.deps.resolveSpecialistSkills(specialistId, {
+        sessionId,
+        frameworkId: backend.framework.id,
+        modelRoute: backend.modelRoute
+      })
+    } catch (error) {
+      log.warn('bound specialist capability resolution failed', {
+        operation: 'specialist-resolution',
+        mode: 'resume',
+        phase: 'skills',
+        reason: 'resolver-threw',
+        sessionId,
+        specialistId,
+        frameworkId: backend.framework.id,
+        modelRoute: backend.modelRoute,
+        ...diagnosticErrorFields(error)
+      })
+      return { kind: 'unavailable', reason: 'The bound specialist is unavailable.' }
+    }
+  }
+
+  private async resolveSpecialistIdentity(
+    specialistId: string | undefined,
+    backend: AcpBackendGenerationView,
+    sessionId: string
+  ): Promise<{ append: string; prefix: string } | undefined> {
+    if (!specialistId) return undefined
+    const context = {
+      operation: 'specialist-resolution',
+      mode: 'resume',
+      phase: 'identity',
+      sessionId,
+      specialistId,
+      frameworkId: backend.framework.id,
+      backendId: backend.backendId,
+      modelRoute: backend.modelRoute
+    }
+    if (!this.deps.resolveSpecialistIdentity) {
+      log.warn('bound specialist identity resolution failed', {
+        ...context,
+        reason: 'resolver-missing'
+      })
+      throw new Error('The bound specialist is unavailable.')
+    }
+    let identity
+    try {
+      identity = await this.deps.resolveSpecialistIdentity(specialistId, backend.framework.id)
+    } catch (error) {
+      log.warn('bound specialist identity resolution failed', {
+        ...context,
+        reason: 'resolver-threw',
+        ...diagnosticErrorFields(error)
+      })
+      throw new Error('The bound specialist is unavailable.')
+    }
+    if (!identity) {
+      log.warn('bound specialist identity resolution failed', { ...context, reason: 'unavailable' })
+      throw new Error('The bound specialist is unavailable.')
+    }
+    return identity
+  }
+
+  private registerSessionSpecialist(sessionId: string): void {
+    try {
+      this.deps.registerSessionSpecialist?.(
+        sessionId,
+        this.deps.registry.lookup(sessionId)?.aggregate.snapshot().specialistId
+      )
+    } catch (error) {
+      this.safeLogError('register resumed session specialist failed', error, sessionId)
+    }
+  }
+
+  private publish(sessionId: string, cwd: string): void {
+    this.registerSessionSpecialist(sessionId)
+    this.deps.updateCwd(cwd)
+    try {
+      this.deps.pushEvent({
+        kind: 'system',
+        level: 'info',
+        sessionId,
+        title: 'Session resumed',
+        text: cwd
+      })
+    } catch (error) {
+      this.safeLogError('session resumed event callback failed', error, sessionId)
+    }
+    try {
+      this.deps.emitState()
+    } catch (error) {
+      this.safeLogError('session resumed state callback failed', error, sessionId)
+    }
+  }
+
+  private disposeProvisional(session: ActiveSession | undefined, message: string): void {
+    if (!session) return
+    try {
+      session.dispose()
+    } catch (error) {
+      this.safeLogError(message, error, session.sessionId, false)
+    }
+  }
+
+  private safeLogError(
+    message: string,
+    error: unknown,
+    sessionId: string,
+    includeContext = true
+  ): void {
+    try {
+      log.error(message, {
+        ...diagnosticErrorFields(error),
+        ...(includeContext ? this.deps.diagnosticContext() : {}),
+        sessionId
+      })
+    } catch {
+      // Diagnostics must never replace provider, cleanup, or observer outcomes.
+    }
+  }
+}

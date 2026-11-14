@@ -1,0 +1,292 @@
+import { execFileSync } from 'node:child_process'
+import { existsSync, readFileSync } from 'node:fs'
+import { basename, resolve } from 'node:path'
+import { describe, expect, it } from 'vitest'
+
+import { loadModuleImpactManifest } from './load-module-impact.mjs'
+import { auditModuleOwnership, auditModuleRouting } from './audit-module-ownership.mjs'
+import {
+  createAffectedTestPlan,
+  createModuleTestPlan,
+  modulesForPath
+} from './module-test-impact.mjs'
+import { isModuleOwnershipPath } from './module-ownership-paths.mjs'
+import { createPackageTestPlan } from './package-test-impact.mjs'
+import { classifyChanges } from './classify-pr-changes.mjs'
+
+const manifest = loadModuleImpactManifest(resolve('scripts/ci/module-impact.json'))
+const files = [
+  ...new Set(
+    execFileSync('git', ['ls-files', '--cached', '--others', '--exclude-standard', '-z'], {
+      encoding: 'utf8',
+      maxBuffer: 128 * 1024 * 1024
+    })
+      .split('\0')
+      .filter((path) => Boolean(path) && existsSync(path))
+  )
+]
+const packageRegistry = JSON.parse(readFileSync('scripts/ci/package-test-boundaries.json', 'utf8'))
+const graph = { status: 'unavailable-manifest-only', testFiles: [] }
+
+describe('complete module ownership', () => {
+  it.each([
+    'tsconfig.json',
+    'tsconfig.dev.json',
+    'tsconfig.test.json',
+    'package.json',
+    'package-lock.json'
+  ])('exempts package-root %s from inventory without skipping test selection', (name) => {
+    const path = `packages/unregistered/${name}`
+    expect(isModuleOwnershipPath(path)).toBe(false)
+    expect(auditModuleOwnership(manifest, [...files, path]).missing).toEqual([])
+    const changes = [{ path, status: 'added' }]
+    expect(classifyChanges(changes)).toMatchObject({ mode: 'full' })
+    expect(createAffectedTestPlan(changes, graph)).toMatchObject({ mode: 'full' })
+  })
+
+  it('covers existing JSONL regression readers without registering individual fixtures', () => {
+    const fixtures = files.filter(
+      (path) => path.startsWith('test/fixtures/pdf-translation/') && path.endsWith('.jsonl')
+    )
+    const plan = createAffectedTestPlan(
+      [{ path: 'test/fixtures/pdf-translation/new-case.jsonl', status: 'added' }],
+      graph
+    )
+    const fixtureNames = new Set(fixtures.map((path) => basename(path)))
+    const readers = files.filter((path) => {
+      if (!/\.(test|spec)\.[cm]?[jt]sx?$/.test(path) || path.startsWith('scripts/ci/')) return false
+      const source = readFileSync(path, 'utf8')
+      return [...source.matchAll(/['"]([^'"\r\n]+\.jsonl)['"]/g)].some(([, name]) =>
+        fixtureNames.has(name)
+      )
+    })
+    expect(readers.length).toBeGreaterThan(20)
+    expect(plan.testFiles).toEqual(expect.arrayContaining(readers))
+    expect(plan.modules).toEqual([])
+    expect(classifyChanges([{ path: fixtures[0], status: 'modified' }]).bundles).toEqual([
+      'policy',
+      'static',
+      'unit'
+    ])
+  })
+
+  it('does not route regression fixtures or non-test scripts through owner registrations', () => {
+    expect(
+      modulesForPath(manifest, 'test/fixtures/pdf-translation/compact-cjk-table-header-fit.jsonl')
+    ).toEqual([])
+    expect(modulesForPath(manifest, 'scripts/build-backend.mjs')).toEqual([])
+    // A script test can still be selected directly through its declared testFiles evidence.
+    expect(modulesForPath(manifest, 'scripts/pdf-translation-corpus.test.ts')).toContain(
+      'main_pdf_translation'
+    )
+  })
+
+  it('routes every declared portable test without an unknown-path fallback', () => {
+    const tests = new Set(
+      Object.values(manifest.modules).flatMap((module) => Object.values(module.testFiles).flat())
+    )
+    const unknown = [...tests].filter((path) => {
+      const plan = classifyChanges([{ path, status: 'modified' }])
+      return plan.mode === 'full' && !plan.roots.includes('global_gate_input')
+    })
+    expect(unknown).toEqual([])
+  })
+
+  it.each(Object.entries(manifest.modules))(
+    'bounds implementation selection for %s while retaining declared evidence',
+    (id, module) => {
+      const path = module.interfacePaths.find(
+        (path) => module.ownerPaths.includes(path) && !/\.(test|spec)\./.test(path)
+      )!
+      expect(path, `${id} must expose an owned production interface`).toBeDefined()
+      const plan = createAffectedTestPlan([{ path, status: 'modified' }], graph)
+      expect(plan.mode, `${id}: ${plan.reasonChains.join('; ')}`).toBe(
+        module.fullTestReason ? 'full' : 'selective'
+      )
+      if (!module.fullTestReason) {
+        expect(plan.modules).toContain(id)
+        expect(plan.testFiles).toEqual(
+          expect.arrayContaining(
+            Object.values(module.testFiles)
+              .flat()
+              .filter(
+                (test) =>
+                  !createPackageTestPlan([path], packageRegistry).excluded.some((root) =>
+                    test.startsWith(root + '/')
+                  )
+              )
+          )
+        )
+      }
+    }
+  )
+
+  it('requires an exact owner for every tracked source, test and runtime helper', () => {
+    const result = auditModuleOwnership(manifest, files)
+    expect(result.missing).toEqual([])
+    expect(auditModuleRouting(manifest)).toEqual([])
+    expect(result.owned).toBe(result.files)
+    expect(result.fullModules.map(({ id }) => id)).toEqual(
+      expect.arrayContaining([
+        'diagnostics_package',
+        'shared_application_contracts',
+        'shared_conversation_contracts',
+        'shared_workspace_contracts'
+      ])
+    )
+  })
+
+  it.each([
+    'ts',
+    'tsx',
+    'cjs',
+    'mjs',
+    'cc',
+    'cpp',
+    'h',
+    'rs',
+    'cs',
+    'py',
+    'R',
+    'sh',
+    'ps1',
+    'css',
+    'html',
+    'json',
+    'jsonl',
+    'svg',
+    'new-extension'
+  ])(
+    'detects an unregistered historical .%s file, even without a changed-file diff',
+    (extension) => {
+      const path = `packages/legacy/unregistered.${extension}`
+      expect(isModuleOwnershipPath(path)).toBe(true)
+      expect(auditModuleOwnership(manifest, [...files, path]).missing).toEqual([path])
+    }
+  )
+
+  it('does not count consumer membership or colocated inference as explicit ownership', () => {
+    const changed = structuredClone(manifest)
+    const path = 'src/main/reviewer/correction.ts'
+    changed.modules.reviewer_orchestrator.ownerPaths =
+      changed.modules.reviewer_orchestrator.ownerPaths.filter((value: string) => value !== path)
+    expect(auditModuleOwnership(changed, files).missing).toContain(path)
+  })
+
+  it('gives exact ownership precedence over test membership in other modules', () => {
+    expect(modulesForPath(manifest, 'src/main/reviewer/correction-owner.test.ts')).toEqual([
+      'reviewer_orchestrator'
+    ])
+  })
+
+  it('runs a changed registered test directly without expanding its source consumers', () => {
+    const path = 'src/main/reviewer/correction-owner.test.ts'
+    const plan = createAffectedTestPlan([{ path, status: 'modified' }], graph)
+    expect(plan.mode).toBe('selective')
+    expect(plan.testFiles).toEqual([path])
+    expect(plan.modules).toEqual(['reviewer_orchestrator'])
+  })
+
+  it('keeps source consumers in mixed source and test changes', () => {
+    const test = 'src/main/reviewer/correction-owner.test.ts'
+    const path = 'packages/connector-core/src/engine.ts'
+    const sourcePlan = createAffectedTestPlan([{ path, status: 'modified' }], graph)
+    const mixed = createAffectedTestPlan(
+      [
+        { path, status: 'modified' },
+        { path: test, status: 'modified' }
+      ],
+      graph
+    )
+    expect(sourcePlan.mode).toBe('selective')
+    expect(mixed.mode).toBe('selective')
+    expect(mixed.testFiles).toEqual([...new Set([...sourcePlan.testFiles, test])].sort())
+  })
+
+  it('keeps unknown test files on full fallback', () => {
+    expect(
+      createAffectedTestPlan([{ path: 'src/main/new.test.ts', status: 'added' }], graph).mode
+    ).toBe('full')
+  })
+
+  it('executes explicitly owned shared contracts with an explained full plan', () => {
+    const path = 'src/shared/reviewer.ts'
+    const plan = createAffectedTestPlan([{ path, status: 'modified' }], graph)
+    expect(plan.mode).toBe('full')
+    expect(plan.reasonChains.join('\n')).toContain(
+      loadModuleImpactManifest().modules.shared_conversation_contracts.fullTestReason
+    )
+    expect(plan.reasonChains.join('\n')).not.toContain('unknown module owner')
+    expect(createModuleTestPlan('shared_conversation_contracts').mode).toBe('full')
+  })
+
+  it('keeps locale data separate from the shared translation runtime', () => {
+    const catalog = createAffectedTestPlan(
+      [{ path: 'src/shared/i18n/locales/zh-Hans.json', status: 'modified' }],
+      graph
+    )
+    expect(catalog.testFiles).toEqual([
+      'scripts/build-backend.integration.test.ts',
+      'src/main/locale/owner.test.ts',
+      'src/renderer/src/i18n/resources.test.ts'
+    ])
+    const runtime = createAffectedTestPlan(
+      [{ path: 'src/shared/i18n/core.ts', status: 'modified' }],
+      graph
+    )
+    expect(runtime.modules).toContain('i18n_shared_runtime')
+    expect(runtime.testFiles).toContain(
+      'src/renderer/src/pages/settings/SkillsPanel.render.test.tsx'
+    )
+  })
+})
+
+it.each(['certification-contract', 'execution-contract'])(
+  'expands consumers of the shared Delegation %s test contract',
+  (name) => {
+    const path = `src/main/delegation/${name}.test.ts`
+    const changes = [{ path, status: 'modified' }]
+    const guarded = createAffectedTestPlan(changes, graph)
+    expect(guarded.mode).toBe('full')
+    expect(guarded.reasonChains.join('\n')).toContain(
+      manifest.modules.main_delegation.fullTestReason
+    )
+    // Keep checking contract expansion independently of Pi's temporary full-validation boundary.
+    const reviewed = structuredClone(manifest)
+    delete reviewed.modules.main_delegation.fullTestReason
+    const plan = createAffectedTestPlan(changes, graph, reviewed)
+    expect(plan.mode).toBe('selective')
+    expect(plan.testFiles).toContain(path)
+    expect(plan.testFiles).toContain('src/main/delegation/acp-execution.test.ts')
+  }
+)
+
+it.each([
+  'shared_application_contracts',
+  'shared_conversation_contracts',
+  'shared_workspace_contracts'
+])('retains intentional full validation for edited tests in %s', (moduleId) => {
+  const module = manifest.modules[moduleId]
+  const path = module.ownerPaths.find(
+    (path: string) => /\.test\.tsx?$/.test(path) && !module.interfacePaths.includes(path)
+  )
+  expect(path).toBeDefined()
+  const plan = createAffectedTestPlan([{ path, status: 'modified' }], graph)
+  expect(plan.mode).toBe('full')
+  expect(plan.reasonChains.join('\n')).toContain(module.fullTestReason)
+})
+
+it.each([
+  'packages/process-tree-native/src/process_tree_native.cc',
+  'packages/process-tree-native/index.cjs',
+  'packages/process-tree-native/index.d.ts'
+])('retains dynamic native loading coverage for %s', (path) => {
+  const test = 'src/main/process-tree-native-loading.macos.integration.test.ts'
+  const edges = JSON.parse(
+    readFileSync(resolve('scripts/ci/module-runtime-consumers.json'), 'utf8')
+  )
+  expect(edges['packages/process-tree-native/index.cjs']).toContain(test)
+  const plan = createAffectedTestPlan([{ path, status: 'modified' }], graph)
+  expect(plan.mode).toBe('selective')
+  expect(plan.testFiles).toContain(test)
+})

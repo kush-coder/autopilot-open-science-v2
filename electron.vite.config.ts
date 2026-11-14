@@ -1,0 +1,157 @@
+import { buildMacosServiceLauncher } from './scripts/build-macos-service-launcher.mjs'
+import { windowsSigningBuildDefines } from './scripts/windows-signing-policy.mjs'
+import { createRequire } from 'node:module'
+import { resolve } from 'path'
+import { nativeLocaleAssets } from './scripts/native-locale-assets'
+import { electronHostDependencyGuard } from './scripts/electron-host-dependencies.mjs'
+import { devBuildWatch } from './scripts/dev-build-watch.mjs'
+import { defineConfig } from 'electron-vite'
+import { normalizePath } from 'vite'
+import { fileViewerRenderers } from '@file-viewer/vite-plugin'
+import react from '@vitejs/plugin-react'
+import tailwindcss from '@tailwindcss/vite'
+import { wsl2BuildDefines } from './scripts/wsl2-build-flags.mjs'
+
+// Supported packages are built on native runners because they carry platform-native dependencies,
+// so the build host is also the package target. Keep non-Windows bundles disabled independently of
+// renderer visibility and the main-process runtime gate.
+export { resolveWsl2BashPreviewBuildEnabled } from './scripts/wsl2-build-flags.mjs'
+
+export default defineConfig(({ command }) => ({
+  main: {
+    plugins: [
+      nativeLocaleAssets(),
+      electronHostDependencyGuard(process.cwd()),
+      process.platform === 'darwin' && {
+        name: 'macos-service-launcher',
+        buildStart() {
+          this.addWatchFile(resolve('build/macos-service-launcher.c'))
+          buildMacosServiceLauncher(resolve('out/desktop-service-launcher'))
+        }
+      }
+    ],
+    define: {
+      __OPEN_SCIENCE_NATIVE_LOCALE_DIRECTORY__: JSON.stringify('native-locales'),
+      ...windowsSigningBuildDefines(process.env),
+      ...wsl2BuildDefines(process.platform, command === 'serve', process.env)
+    },
+    build: {
+      // This workspace package is TypeScript source, not a separately built runtime dependency.
+      // Bundle it into the Electron main process so development and packaged builds never ask
+      // Electron's CommonJS loader to resolve the package directly.
+      externalizeDeps: {
+        // The recovery diagnostics worker runs in the Electron-owned bundle while the backend is
+        // unavailable. Keep its archive writer inside the emitted worker chunk instead of making
+        // the Electron host depend on the backend-only tar package at runtime.
+        exclude: ['@aipoch/notebook-network-sandbox', '@aipoch/research-film', 'tar']
+      }
+    }
+  },
+  preload: {
+    plugins: [electronHostDependencyGuard(process.cwd())],
+    build: {
+      // Local npm packages resolve outside node_modules through their file: links.
+      commonjsOptions: {
+        include: [
+          /node_modules/,
+          /packages[\\/](?:connector-(?:core|mcp-client)|compute|diagnostics|providers|durable-files|resilient-download|skills|specialists)[\\/]dist/,
+          /packages[\\/](?:notebook-analysis|environment|reproducibility)[\\/]dist/
+        ]
+      },
+      rollupOptions: {
+        input: {
+          index: resolve('src/preload/index.ts'),
+          'find-overlay': resolve('src/preload/find-overlay.ts'),
+          'installation-assistant': resolve('src/preload/installation-assistant.ts')
+        }
+      }
+    }
+  },
+  renderer: {
+    // Dev scanning must reach lazy Workers before their first use triggers a dependency reload.
+    // This prepares dependencies without executing Workers or changing production build entries.
+    optimizeDeps:
+      command === 'serve'
+        ? {
+            // Regenerate lazy chunks so a persisted Electron page cannot request stale hashes.
+            force: true,
+            // file: links resolve outside node_modules and need explicit CJS prebundling.
+            include: [
+              '@aipoch/connector-mcp-client/oauth-redirect',
+              '@aipoch/compute',
+              '@aipoch/diagnostics',
+              '@aipoch/providers',
+              '@aipoch/providers/errors',
+              '@aipoch/providers/transport',
+              '@aipoch/skills/document',
+              '@aipoch/notebook-analysis/contracts',
+              '@aipoch/environment/contracts',
+              '@aipoch/specialists',
+              '@aipoch/reproducibility/contracts',
+              '@aipoch/reproducibility/comparison',
+              '@aipoch/reproducibility/execution-context'
+            ],
+            entries: [
+              '*.html',
+              'src/**/*.worker.ts',
+              'src/**/*-worker.ts',
+              normalizePath(
+                createRequire(import.meta.url).resolve(
+                  '@file-viewer/renderer-spreadsheet/worker/sheetjs/sheet.worker'
+                )
+              )
+            ]
+          }
+        : undefined,
+    // Spreadsheet parsing now splits Worker modules; Vite's default IIFE format cannot emit chunks.
+    worker: { format: 'es' },
+    resolve: {
+      alias: {
+        // The decoder's browser entry requires document; its default/worker entry is DOM-free.
+        'decode-named-character-reference': createRequire(import.meta.url).resolve(
+          'decode-named-character-reference'
+        ),
+        '@': resolve('src/renderer/src'),
+        '@renderer': resolve('src/renderer/src')
+      }
+    },
+    server: {
+      // Electron-vite uses the resolved server host in ELECTRON_RENDERER_URL. Explicit IPv4
+      // avoids localhost resolving to ::1 in restricted environments where IPv6 loopback cannot
+      // bind, which otherwise leaves the isolated dev window without a renderer page.
+      host: '127.0.0.1',
+      // Don't watch git worktrees under .claude/worktrees — full source copies would trigger
+      // needless rescans/HMR churn during dev.
+      watch: { ignored: ['**/.claude/**', `${normalizePath(resolve('.worktree'))}/**`] }
+    },
+    plugins: [
+      devBuildWatch(),
+      // Apply upstream CJS interop for the spreadsheet Worker without injecting renderer presets.
+      fileViewerRenderers({
+        formats: ['xls', 'xlsx'],
+        inject: false,
+        chunkStrategy: 'none'
+      }),
+      react(),
+      tailwindcss()
+    ],
+    build: {
+      // Local npm packages resolve outside node_modules through their file: links.
+      commonjsOptions: {
+        include: [
+          /node_modules/,
+          /packages[\\/](?:connector-(?:core|mcp-client)|compute|diagnostics|providers|durable-files|resilient-download|skills|specialists)[\\/]dist/,
+          /packages[\\/](?:notebook-analysis|environment|reproducibility)[\\/]dist/
+        ]
+      },
+      rollupOptions: {
+        input: {
+          index: resolve('src/renderer/index.html'),
+          'installation-assistant': resolve('src/renderer/installation-assistant.html'),
+          'office-preview': resolve('src/renderer/office-preview.html'),
+          'reviewer-paged-preview': resolve('src/renderer/reviewer-paged-preview.html')
+        }
+      }
+    }
+  }
+}))

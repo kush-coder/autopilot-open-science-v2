@@ -1,0 +1,2569 @@
+import { strictNetworkRuleMatches } from '@aipoch/notebook-network-sandbox/network-address'
+import type { NetworkApprovalRecordStatus } from '../../shared/sandbox-network-approval'
+import {
+  destinationGrantAllows,
+  type NetworkBlockEvidence
+} from '../../shared/network-destination-grants'
+import { NotebookNetworkSandbox, wslUncDistro } from '@aipoch/notebook-network-sandbox'
+import { execFile } from 'node:child_process'
+import { promisify } from 'node:util'
+import { existsSync, realpathSync, type Stats } from 'node:fs'
+import { createHash, randomUUID } from 'node:crypto'
+import {
+  lstat,
+  mkdir,
+  mkdtemp,
+  open,
+  readFile,
+  readdir,
+  realpath,
+  rm,
+  writeFile
+} from 'node:fs/promises'
+import { homedir, tmpdir } from 'node:os'
+import { isAbsolute, join, resolve, sep } from 'node:path'
+import { performance } from 'node:perf_hooks'
+import { setTimeout as delay } from 'node:timers/promises'
+import { assertProcessTreeSupport, terminateProcessTree } from '../process-tree'
+import { defaultSpawn } from './environment-process'
+import { WindowsNotebookRuntimeManager } from './windows-runtime-manager'
+import { managedSkillReadRoots } from './managed-skill-read-roots'
+import {
+  configureWindowsNotebookRuntime,
+  type WindowsNotebookRuntime
+} from './windows-notebook-runtime'
+import { probeWindowsRuntimeComponent } from './windows-runtime-probe'
+import type { ShellRuntimeBinding } from '../../shared/notebook'
+
+import {
+  formatNetworkHostname,
+  requiresNetworkException,
+  type NotebookNetworkSettings
+} from '../../shared/notebook-network-settings'
+import {
+  buildNotebookNetworkPolicy,
+  normalizeNetworkHostname,
+  normalizeNotebookNetworkSettings,
+  validateCustomAllowedDomain,
+  type NotebookNetworkStatus,
+  type NotebookNetworkStatusReason
+} from '../../shared/notebook-network'
+import { NotebookRuntimeAccessCancelledError } from './process-sandbox'
+import { isMigrationInProgress, withDataRootWrite } from '../storage/migration-state'
+import type {
+  NotebookProcessSandbox,
+  NotebookRuntimeAccessAdmission,
+  NotebookNetworkAccessDecisionRequest,
+  NotebookNetworkAccessDecisionResult,
+  NotebookSandboxCleanupReason,
+  NotebookSandboxCleanupResult,
+  NotebookSandboxProcessOutcome,
+  NotebookSandboxTarget,
+  NotebookSandboxedSpawn,
+  NotebookSandboxInvocation
+} from './process-sandbox'
+import { startDiagnosticOperation } from '@aipoch/diagnostics/node'
+import { createLogger, diagnosticErrorFields, type Logger } from '@aipoch/diagnostics/node'
+import {
+  buildNotebookKernelEnvironment,
+  normalizeRProcessLocale,
+  environmentPathRoots,
+  notebookTrustBundleEnvironment
+} from '@aipoch/environment'
+import {
+  notebookTrustBundleStatus,
+  resolveNotebookTrustBundle,
+  type NotebookTrustBundle,
+  type NotebookTrustBundleStatus
+} from './trust-bundle'
+import { getAppClaudeConfigDir } from '../settings/provider-env'
+import type { GrantedLocalRoot, GrantedLocalRootAccess } from '../../shared/local-fs'
+import { kernelExecutableReadRoot } from './kernel-executor'
+import { windowsCondaPrefixForR } from '@aipoch/environment'
+import { rKernelProtocolProbe } from '@aipoch/environment'
+import { runtimeChildProcessErrorFields } from '@aipoch/diagnostics/node'
+import {
+  condaActivatedPath,
+  DEFAULT_R_ENV,
+  envPrefix,
+  legacyDefaultEnvPrefix
+} from '@aipoch/environment'
+
+export type NotebookNetworkDecision =
+  'deny' | 'allowOnce' | 'alwaysAllow' | 'unavailable' | 'retryRequired'
+
+type NotebookNetworkDecisionRequest = Readonly<{
+  sessionId: string
+  projectId: string
+  hostname: string
+  port?: number
+  protocol?: 'http' | 'https'
+  runtime?: NotebookSandboxInvocation['runtime']
+  reason?: string
+  allowOnce: boolean
+  evidence?: NetworkBlockEvidence
+  onOnceGrant?: (addresses: readonly string[]) => void
+  executionId?: string
+  commandFingerprint?: string
+  canResume?: () => boolean
+  signal: AbortSignal
+}>
+
+type PendingCommandCleanup = Readonly<{
+  target: NotebookSandboxTarget
+  retry: () => Promise<NotebookSandboxCleanupResult>
+}>
+
+const sameCleanupDomain = (left: NotebookSandboxTarget, right: NotebookSandboxTarget): boolean => {
+  if (left.kind !== right.kind) return false
+  if (left.kind === 'native') return true
+  return right.kind === 'wsl2' && left.distro === right.distro && left.user === right.user
+}
+
+const cleanupComplete = (result: NotebookSandboxCleanupResult): boolean =>
+  result.processesTerminated && result.networkClosed && result.temporaryResourcesRemoved
+
+export const runRAccessProbe = async (
+  invocation: NotebookSandboxedSpawn,
+  cwd: string,
+  timeoutMs = 60_000
+): Promise<{ stdout: string; stderr: string }> => {
+  const result = await defaultSpawn(
+    invocation.executable,
+    [...invocation.args],
+    invocation.env,
+    undefined,
+    undefined,
+    false,
+    cwd,
+    { timeoutMs },
+    async (child) => {
+      if (await invocation.confirmProcessTreeTermination?.().catch(() => false))
+        return { reaped: true }
+      // The native owner must reap its Job and restore temporary ACLs before exiting.
+      // execFile's timeout kills that owner before it can publish cleanup evidence.
+      if (await invocation.requestProcessTreeTermination?.().catch(() => false))
+        return { reaped: true }
+      const outcome = await terminateProcessTree(child)
+      return invocation.confirmProcessTreeTermination ? { reaped: false } : outcome
+    },
+    process.platform,
+    invocation.confirmProcessTreeTermination
+  )
+  if (result.code !== 0)
+    throw Object.assign(
+      new Error(
+        `R runtime verification exited with code ${result.code}.\n${result.stderr.slice(-4096)}`
+      ),
+      { code: result.code, stdout: result.stdout, stderr: result.stderr }
+    )
+  return result
+}
+
+const annotateRTemporaryDirectoryError = (text: string): string =>
+  text.includes("Fatal error: 'R_TempDir' contains space")
+    ? `${text}\nR could not use the selected temporary directory. Set TMPDIR to a writable directory without spaces and restart Open-Science.`
+    : text
+
+// A required runtime root can fail before the contained probe starts when Windows refuses the
+// AppContainer ACL grant. That is the point at which the interactive elevated repair is needed.
+// Keep this narrow: cleanup failures and arbitrary child-process errors must remain fail-closed.
+const isWindowsRuntimeAccessPermissionError = (error: unknown): boolean => {
+  const seen = new Set<unknown>()
+  let current: unknown = error
+  while (current instanceof Error && !seen.has(current)) {
+    seen.add(current)
+    const message = current.message.toLowerCase()
+    if (
+      message.includes('grant appcontainer access') &&
+      /\bwindows_acl_access_denied:\s/i.test(message)
+    )
+      return true
+    current = current.cause
+  }
+  return false
+}
+
+const WINDOWS_PROBE_DIRECTORY_LOCK_CODES = new Set([
+  'EBUSY',
+  'EPERM',
+  'EACCES',
+  'ENOTEMPTY',
+  'EAGAIN',
+  'EMFILE',
+  'ENFILE'
+])
+
+const removeDirectoryAfterWindowsProbeLock = async (path: string): Promise<void> => {
+  let lastError: unknown
+  for (let attempt = 0; attempt < 16; attempt++) {
+    try {
+      await rm(path, { recursive: true, force: true })
+      return
+    } catch (error) {
+      lastError = error
+      const code = (error as NodeJS.ErrnoException).code
+      if (!code || !WINDOWS_PROBE_DIRECTORY_LOCK_CODES.has(code)) throw error
+      await new Promise((resolve) => setTimeout(resolve, 50 * (attempt + 1)))
+    }
+  }
+  throw lastError
+}
+
+const statusLogFields = (status: NotebookNetworkStatus): Record<string, unknown> => {
+  switch (status.kind) {
+    case 'ready':
+      return { kind: status.kind, warningCount: status.warnings.length, warnings: status.warnings }
+    case 'setupRequired':
+      return {
+        kind: status.kind,
+        platform: status.platform,
+        reasonCount: status.reasons.length,
+        reasons: status.reasons
+      }
+    case 'unsupported':
+      return { kind: status.kind, platform: status.platform }
+    case 'error':
+      return { kind: status.kind, reason: status.reason }
+    default:
+      return { kind: status.kind }
+  }
+}
+
+const statusLogLevel = (status: NotebookNetworkStatus): 'error' | 'info' | 'warn' => {
+  if (status.kind === 'error') return 'error'
+  if (status.kind === 'ready') return 'info'
+  return 'warn'
+}
+
+type NotebookCommandRuntime = NotebookSandboxInvocation['runtime']
+
+const executionGrantKey = (sessionId: string, runtime: NotebookCommandRuntime): string =>
+  `${sessionId}\0${runtime}`
+
+const commandGrantKey = (
+  sessionId: string,
+  runtime: NotebookCommandRuntime,
+  commandText: string
+): string => `${executionGrantKey(sessionId, runtime)}\0${commandText}`
+
+const blockedDestinationKey = (
+  sessionId: string,
+  hostname: string,
+  port = 443,
+  protocol: 'http' | 'https' = 'https'
+): string => `${sessionId}\0${protocol}://${formatNetworkHostname(hostname)}:${port}`
+
+type NotebookNetworkSandboxOwnerOptions = Readonly<{
+  configRoot?: string
+  windowsRuntimeRoot?: string
+  packaged?: boolean
+  resourceRoot: string
+  allowRuntimeAccessPrompt?: boolean
+  getSettings: () => Promise<NotebookNetworkSettings | undefined>
+  recordStatus?: (
+    projectId: string,
+    sessionId: string,
+    recordId: string
+  ) => Promise<NetworkApprovalRecordStatus | undefined>
+  hasFullAccess?: (sessionId: string) => boolean
+  subscribeFullAccess?: (sessionId: string, listener: (allowed: boolean) => void) => () => void
+  getFolderRestrictionEnabled?: () => Promise<boolean>
+  persistAlwaysAllow: (hostname: string) => Promise<NotebookNetworkSettings>
+  requestDecision: (request: NotebookNetworkDecisionRequest) => Promise<NotebookNetworkDecision>
+  getParentProxy?: () => Promise<
+    Readonly<{ http?: string; https?: string; noProxy?: string }> | undefined
+  >
+  getCaBundlePath?: () => Promise<string | undefined>
+  getGrantedLocalRoots?: () => Promise<readonly GrantedLocalRoot[]>
+  platform?: NodeJS.Platform
+  logger?: Logger
+  temporaryRoot?: string
+}>
+
+type RetainedCommandRoot = {
+  parent: Stats
+  root?: Stats
+  receipt?: Stats
+  content?: string
+  debt: boolean
+  blocked: boolean
+  preparationCleanupReady: boolean
+  recovered: boolean
+}
+
+const sameFileIdentity = (left: Stats, right: Stats): boolean =>
+  left.dev === right.dev && left.ino === right.ino && left.birthtimeMs === right.birthtimeMs
+
+const COMMAND_TEMP_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u
+
+const completedPreparationCleanupCause = (error: unknown): unknown | undefined => {
+  if (
+    !(error instanceof Error) ||
+    error.name !== 'NotebookSandboxPreparationError' ||
+    !('cleanupComplete' in error) ||
+    error.cleanupComplete !== true
+  ) {
+    return undefined
+  }
+  return error.cause ?? error
+}
+
+const quotePosix = (value: string): string => `'${value.replaceAll("'", `'"'"'`)}'`
+const quotePowerShell = (value: string): string => `'${value.replaceAll("'", "''")}'`
+
+const protectedWriteRoots = (readWriteRoots: readonly string[]): string[] =>
+  [
+    join(homedir(), '.bash_profile'),
+    join(homedir(), '.bashrc'),
+    join(homedir(), '.profile'),
+    join(homedir(), '.zprofile'),
+    join(homedir(), '.zshrc'),
+    join(homedir(), '.gitconfig'),
+    join(homedir(), '.ssh'),
+    join(homedir(), '.aws'),
+    join(homedir(), '.config', 'git'),
+    ...readWriteRoots.map((root) => join(root, '.git'))
+  ].filter(existsSync)
+
+// Application authority that must never be writable from a broad or nested grant. Grant-time and
+// execution-time planning must keep these write boundaries consistent.
+const authorityWriteDenyRoots = (configRoot: string | undefined): string[] =>
+  configRoot ? [join(configRoot, 'settings.json'), join(configRoot, 'sessions')] : []
+
+const dependencyReason = (message: string): NotebookNetworkStatusReason => {
+  if (message.includes('bubblewrap')) return 'linuxBubblewrapMissing'
+  if (message.includes('Seatbelt')) return 'macSeatbeltUnavailable'
+  if (message.includes('host not executable')) return 'windowsHostMissing'
+  if (message.includes('gateway port')) return 'windowsGatewayPortUnavailable'
+  if (message.includes('profile is not installed')) return 'windowsProfileMissing'
+  if (message.includes('loopback access is not installed')) return 'windowsLoopbackMissing'
+  if (message.includes('loopback network fence is not installed'))
+    return 'windowsNetworkFenceMissing'
+  if (message.includes('ownership')) return 'windowsOwnershipMissing'
+  return 'runtimeFailure'
+}
+
+const presentStatus = (
+  status: Awaited<ReturnType<NotebookNetworkSandbox['status']>>
+): NotebookNetworkStatus => {
+  if (status.kind === 'ready') {
+    return { kind: 'ready', warnings: status.warnings.map(dependencyReason) }
+  }
+  if (status.kind === 'setupRequired') {
+    return {
+      kind: 'setupRequired',
+      platform: status.platform,
+      reasons: status.reasons.map(dependencyReason)
+    }
+  }
+  if (status.kind === 'error') return { kind: 'error', reason: 'runtimeFailure' }
+  return status
+}
+
+const commandLine = (
+  invocation: Pick<NotebookSandboxInvocation, 'executable' | 'args'>,
+  platform: NodeJS.Platform
+): string => {
+  const quote = platform === 'win32' ? quotePowerShell : quotePosix
+  const serialized = [invocation.executable, ...invocation.args].map(quote).join(' ')
+  return platform === 'win32' ? `& ${serialized}` : serialized
+}
+
+class NotebookNetworkSandboxOwner implements NotebookProcessSandbox {
+  private readonly blockedRecords = new Map<
+    string,
+    {
+      projectId: string
+      sessionId: string
+      hostname: string
+      port: number
+      protocol: 'http' | 'https'
+      evidence: NetworkBlockEvidence
+      result: Promise<NotebookNetworkDecision>
+    }
+  >()
+  private sandbox: NotebookNetworkSandbox | undefined
+  private initializePromise: Promise<void> | undefined
+  private initialized = false
+  private policyAbort = new AbortController()
+  private settings: NotebookNetworkSettings | undefined
+  private trustBundle: NotebookTrustBundle | undefined
+  private readonly nextExecutionGrants = new Map<string, Set<string>>()
+  private readonly blockedDestinationCommands = new Map<
+    string,
+    Map<NotebookCommandRuntime, Set<string>>
+  >()
+  private readonly pendingTemporaryRoots = new Map<string, string>()
+  private readonly retainedCommandRoots = new Map<string, RetainedCommandRoot>()
+  private commandCreationQueue: Promise<void> = Promise.resolve()
+  private commandRootsScanned = false
+  private commandParentIdentity: Stats | undefined
+  private readonly pendingCommandCleanups = new Set<PendingCommandCleanup>()
+  private readonly platform: NodeJS.Platform
+  private readonly log: Logger
+  private lastStatusSignature: string | undefined
+  private runtimeAccessQueue: Promise<void> = Promise.resolve()
+  private runtimeAccessRevision = 0
+  private pendingRuntimeAccessChanges = 0
+  private readonly cancelledRuntimeAccess = new Set<string>()
+  private readonly windowsRuntime?: WindowsNotebookRuntimeManager
+  private readonly releaseWindowsRuntime?: () => void
+  private preparingWindowsRuntime = false
+  private windowsSetupController?: AbortController
+  private windowsSetupCancelled = false
+  private windowsSetupFailure?: WindowsNotebookRuntimeManager['failure']
+
+  constructor(private readonly options: NotebookNetworkSandboxOwnerOptions) {
+    this.platform = options.platform ?? process.platform
+    this.log = options.logger ?? createLogger('notebook:network-sandbox')
+    if (this.platform === 'win32' && options.windowsRuntimeRoot) {
+      this.windowsRuntime = new WindowsNotebookRuntimeManager(
+        options.windowsRuntimeRoot,
+        (selection, signal) =>
+          probeWindowsRuntimeComponent(
+            selection,
+            // Compatibility checks need their fixture and runtime, not user or Skill folders.
+            (request) => this.prepare(request, false),
+            signal,
+            (message) => this.log.warn(message)
+          )
+      )
+      this.releaseWindowsRuntime = configureWindowsNotebookRuntime(() => this.windowsRuntime!.get())
+    }
+  }
+
+  async windowsProtectionConfigured(): Promise<boolean> {
+    return this.platform === 'win32' && this.getOrCreateSandbox().isWindowsProtectionConfigured()
+  }
+
+  async windowsProtectionReady(): Promise<boolean> {
+    if (!(await this.windowsProtectionConfigured())) return false
+    if ((await this.getOrCreateSandbox().status('win32')).kind !== 'ready')
+      throw new Error('Prepare Notebook protection in Settings before protected execution.')
+    if (this.windowsRuntime) await this.windowsRuntime.prepare(false)
+    return true
+  }
+
+  async preflightGrantedRoot(
+    path: string,
+    access: GrantedLocalRootAccess,
+    requestedPath?: string
+  ): Promise<void> {
+    if (this.platform !== 'win32') return
+    // WSL2 grants use guest-side bubblewrap and must not depend on native helper readiness.
+    if (wslUncDistro(path)) return
+    if (!(await this.windowsProtectionConfigured())) return
+    const filesystem = {
+      readOnlyRoots: [path],
+      readWriteRoots: access === 'rw' ? [path] : [],
+      deniedReadRoots: this.options.configRoot
+        ? [getAppClaudeConfigDir(this.options.configRoot)]
+        : [],
+      deniedWriteRoots: [
+        ...(this.options.configRoot ? await managedSkillReadRoots(this.options.configRoot) : []),
+        ...authorityWriteDenyRoots(this.options.configRoot),
+        ...protectedWriteRoots(access === 'rw' ? [path] : [])
+      ]
+    }
+    await this.getOrCreateSandbox().preflightGrantedRoot(path, access, requestedPath, {
+      filesystem,
+      // A grant is persisted once; report protected descendants now rather than on every command.
+      scope: 'tree'
+    })
+  }
+
+  async resolveWindowsRuntime(request: {
+    runtime: 'repl' | 'bash'
+    binding?: ShellRuntimeBinding
+    signal?: AbortSignal
+  }): Promise<WindowsNotebookRuntime | null | undefined> {
+    if (!this.windowsRuntime) return undefined
+    const protectedMode = await this.windowsProtectionConfigured()
+    if (
+      request.binding?.kind === 'powershell' &&
+      request.binding.version !== (protectedMode ? '7.6' : '5.1')
+    ) {
+      throw new Error(
+        'Notebook protection changed. Retry in the same conversation after the Shell capability refresh completes.'
+      )
+    }
+    if (!protectedMode) return null
+    // Executing a cell never starts a download. Setup is the only download-authorized entry point.
+    return this.windowsRuntime.prepare(false, request.signal)
+  }
+
+  async status(): Promise<NotebookNetworkStatus> {
+    if (this.windowsSetupController || this.preparingWindowsRuntime)
+      return this.recordStatus({
+        kind: 'checking',
+        runtimePreparation: this.windowsRuntime?.progress
+      })
+    if (this.initializePromise) return this.recordStatus({ kind: 'checking' })
+    try {
+      await resolveNotebookTrustBundle(await this.options.getCaBundlePath?.())
+    } catch (error) {
+      return this.recordStatus(
+        { kind: 'error', reason: 'trustBundleInvalid' },
+        diagnosticErrorFields(error)
+      )
+    }
+    try {
+      assertProcessTreeSupport(this.platform)
+      const status = presentStatus(await this.getOrCreateSandbox().status(this.platform))
+      if (
+        this.windowsRuntime &&
+        status.kind === 'setupRequired' &&
+        (await this.windowsProtectionConfigured())
+      ) {
+        return this.recordStatus({ kind: 'error', reason: status.reasons[0] ?? 'runtimeFailure' })
+      }
+      if (status.kind === 'ready' && this.windowsRuntime) {
+        try {
+          this.windowsRuntime.get()
+        } catch {
+          try {
+            await this.windowsRuntime.prepare(false)
+          } catch {
+            return this.recordStatus({
+              kind: 'error',
+              reason: 'runtimeFailure'
+            })
+          }
+        }
+      }
+      return this.recordStatus(status)
+    } catch (error) {
+      return this.recordStatus(
+        { kind: 'error', reason: 'runtimeFailure' },
+        diagnosticErrorFields(error)
+      )
+    }
+  }
+
+  async initialize(): Promise<void> {
+    if (this.initialized) return
+    if (this.initializePromise) return this.initializePromise
+    this.initializePromise = this.initializeInternal()
+    try {
+      await this.initializePromise
+    } finally {
+      this.initializePromise = undefined
+    }
+  }
+
+  async wrap(invocation: NotebookSandboxInvocation): Promise<NotebookSandboxedSpawn> {
+    return this.wrapInvocation(invocation, true)
+  }
+
+  private async wrapInvocation(
+    invocation: NotebookSandboxInvocation,
+    includeExecutionRoots: boolean
+  ): Promise<NotebookSandboxedSpawn> {
+    if (
+      this.platform === 'win32' &&
+      invocation.target?.kind !== 'wsl2' &&
+      invocation.windowsProtectionRequired === undefined
+    ) {
+      // Capture mode before validating interpreter identity, and keep it through launch.
+      invocation = {
+        ...invocation,
+        windowsProtectionRequired: await this.windowsProtectionConfigured()
+      }
+    }
+    if (
+      this.windowsRuntime &&
+      invocation.target?.kind !== 'wsl2' &&
+      invocation.windowsProtectionRequired
+    ) {
+      if (invocation.runtime === 'bash' || invocation.runtime === 'repl') {
+        const runtime = this.windowsRuntime.get()
+        const expected = invocation.runtime === 'bash' ? runtime.powershell : runtime.node
+        if (invocation.executable.toLowerCase() !== expected.toLowerCase()) {
+          throw new Error(
+            'The selected interpreter does not match the prepared protected runtime. Prepare protection in Settings, then retry after the Shell capability refresh.'
+          )
+        }
+      }
+    }
+    try {
+      return await this.prepare(invocation, includeExecutionRoots)
+    } catch (error) {
+      if (
+        error instanceof Error &&
+        (error.name === 'NotebookSandboxPreparationCleanupError' ||
+          error.message === 'SHELL_CLEANUP_INCOMPLETE: Retained command cleanup is unverified.' ||
+          error.message ===
+            'SHELL_CLEANUP_INCOMPLETE: Previous shell cleanup could not be reconciled.')
+      ) {
+        const target = invocation.target ?? { kind: 'native' as const }
+        // Retain only the original cleanup capabilities. Admission of another command is not
+        // proof that these resources were reaped (notably on macOS).
+        const pending = [...this.pendingCommandCleanups].filter((cleanup) =>
+          sameCleanupDomain(cleanup.target, target)
+        )
+        if (pending.length > 0) {
+          Object.assign(error, {
+            retryCleanup: async (): Promise<boolean> => {
+              const results = await Promise.all(pending.map((cleanup) => cleanup.retry()))
+              if (!results.every(cleanupComplete)) return false
+              await this.reconcilePendingCommandCleanups(target)
+              return true
+            }
+          })
+        }
+      }
+      throw error
+    }
+  }
+
+  private async prepare(
+    invocation: NotebookSandboxInvocation,
+    includeExecutionRoots: boolean
+  ): Promise<NotebookSandboxedSpawn> {
+    const preparationStartedAt = performance.now()
+    const nativeWindows = this.platform === 'win32' && invocation.target?.kind !== 'wsl2'
+    const windowsProtectionRequired = nativeWindows
+      ? invocation.windowsProtectionRequired
+      : undefined
+    const restrictFolders = nativeWindows
+      ? windowsProtectionRequired
+      : (await this.options.getFolderRestrictionEnabled?.()) !== false
+    if (
+      invocation.windowsProtectionRequired === true &&
+      this.platform === 'win32' &&
+      invocation.target?.kind !== 'wsl2' &&
+      !(await this.windowsProtectionConfigured())
+    ) {
+      throw new Error(
+        'Notebook folder restrictions require Windows protected mode. Prepare protection in Settings before running code.'
+      )
+    }
+    assertProcessTreeSupport(this.platform)
+    const runtimeAccessRevision = this.runtimeAccessRevision
+    await this.initialize()
+    const target = invocation.target ?? { kind: 'native' as const }
+    await this.reconcilePendingCommandCleanups(target)
+    await this.updateTrustBundle()
+    const grantedRoots = includeExecutionRoots
+      ? ((await this.options.getGrantedLocalRoots?.()) ?? [])
+      : []
+    // Directories under \\wsl.localhost (or \\wsl$) belong to one guest. Native protected
+    // execution cannot use them, and another distro must not map them to its own guest paths.
+    const applicableGrantedRoots = grantedRoots.filter((root) => {
+      const distro = wslUncDistro(root.path)
+      if (!distro) return true
+      if (target.kind === 'wsl2') return distro.toLowerCase() === target.distro.toLowerCase()
+      return !(nativeWindows && windowsProtectionRequired === true)
+    })
+    // Broad writable ancestors must never make application authority or its future staging
+    // files writable. Keep explicit descendant workspaces and caches usable.
+    const physicalPath = (path: string): string => {
+      try {
+        return realpathSync.native(path)
+      } catch {
+        return resolve(path)
+      }
+    }
+    const authorityRoot = this.options.configRoot
+      ? physicalPath(this.options.configRoot)
+      : undefined
+    const coversAuthority = (path: string): boolean => {
+      const root = physicalPath(path)
+      return Boolean(
+        authorityRoot &&
+        (authorityRoot === root || authorityRoot.startsWith(root.endsWith(sep) ? root : root + sep))
+      )
+    }
+
+    const skillReadRoots =
+      includeExecutionRoots && this.options.configRoot
+        ? await managedSkillReadRoots(this.options.configRoot)
+        : []
+    const { commandTempRoot, receipt, retained } = await this.createCommandTemporaryRoot(
+      target,
+      invocation.runtime
+    )
+    this.pendingTemporaryRoots.set(commandTempRoot, receipt)
+    const env = {
+      ...invocation.env,
+      ...notebookTrustBundleEnvironment(this.trustBundle?.path),
+      TMPDIR: commandTempRoot,
+      TEMP: commandTempRoot,
+      TMP: commandTempRoot
+    }
+    let activeExecutionGrants: ReadonlySet<string> = new Set()
+    let unsubscribeFullAccess: (() => void) | undefined
+    let executionActive = false
+    let activeCommandText = invocation.commandText
+    let activeExecutionId = invocation.executionReference
+    let activeSignal = invocation.signal
+    let executionGeneration = 0
+    let executionWaitListener: ((waiting: boolean) => void) | undefined
+    const waitListeners = new Set<(waiting: boolean) => void>()
+    const decisions = new Map<string, Promise<boolean>>()
+    const exactExecutionGrants = new Map<string, readonly string[]>()
+    const executionRecordIds = new Set<string>()
+    const connections = new Map<string, Set<() => boolean>>()
+    let retryRequired = false
+    const pendingDecisions = new Set<Promise<boolean>>()
+    const notifyWait = (): void => {
+      const waiting = pendingDecisions.size > 0
+      executionWaitListener?.(waiting)
+      for (const listener of waitListeners) listener(waiting)
+    }
+    const waitForNetworkApprovals = async (): Promise<void> => {
+      await Promise.allSettled([...pendingDecisions])
+    }
+    const allowedNetworkHosts = new Set(
+      (invocation.allowedNetworkHosts ?? []).flatMap((host) => {
+        const normalized = validateCustomAllowedDomain(host)
+        return normalized.ok ? [normalized.hostname] : []
+      })
+    )
+    let wrapped: Awaited<ReturnType<NotebookNetworkSandbox['wrap']>> | undefined
+    try {
+      wrapped = await this.sandbox!.wrap({
+        target,
+        command: commandLine(
+          invocation,
+          invocation.target?.kind === 'wsl2' ? 'linux' : this.platform
+        ),
+        ...(this.platform === 'win32' && invocation.target?.kind !== 'wsl2'
+          ? { executable: invocation.executable, args: invocation.args }
+          : {}),
+        ...(invocation.electronAsNode ? { electronAsNode: true } : {}),
+        windowsProtectionRequired,
+        windowsRuntimeAccessRequired: invocation.windowsRuntimeAccessRequired,
+        cwd: invocation.cwd,
+        env,
+        ...(invocation.pathEnvironment ? { pathEnvironment: invocation.pathEnvironment } : {}),
+        ...(invocation.localRpcSocketPath
+          ? { localRpcSocketPath: invocation.localRpcSocketPath }
+          : {}),
+        ...(invocation.inheritedFileDescriptorCount
+          ? { inheritedFileDescriptorCount: invocation.inheritedFileDescriptorCount }
+          : {}),
+        ...(invocation.superviseProcessTree ? { superviseProcessTree: true } : {}),
+        ...(invocation.windowsShellControlPipe
+          ? { windowsShellControlPipe: invocation.windowsShellControlPipe }
+          : {}),
+        filesystem: {
+          restrictFolders,
+          privateRoot: homedir(),
+          readOnlyRoots: [
+            ...invocation.filesystem.readOnlyRoots,
+            ...(authorityRoot && restrictFolders !== true ? [authorityRoot] : []),
+            ...skillReadRoots,
+            ...(invocation.target?.kind === 'wsl2' || this.platform === 'win32'
+              ? []
+              : environmentPathRoots(env, this.platform)),
+            ...(nativeWindows ? [] : applicableGrantedRoots.map((root) => root.path)),
+            ...(this.trustBundle ? [this.trustBundle.path] : [])
+          ],
+          ...(nativeWindows
+            ? {
+                optionalReadOnlyRoots: [
+                  ...(invocation.filesystem.optionalReadOnlyRoots ?? []),
+                  ...applicableGrantedRoots.map((root) => root.path),
+                  ...environmentPathRoots(env, this.platform)
+                ],
+                optionalReadWriteRoots: [
+                  ...(invocation.filesystem.optionalReadWriteRoots ?? []),
+                  ...applicableGrantedRoots
+                    .filter((root) => root.access === 'rw')
+                    .map((root) => root.path)
+                ].filter((path) => !coversAuthority(path))
+              }
+            : {}),
+          readWriteRoots: [
+            ...invocation.filesystem.readWriteRoots,
+            commandTempRoot,
+            ...(nativeWindows
+              ? []
+              : applicableGrantedRoots
+                  .filter((root) => root.access === 'rw')
+                  .map((root) => root.path))
+          ].filter((path) => !coversAuthority(path)),
+          deniedReadRoots: invocation.filesystem.deniedReadRoots,
+          deniedWriteRoots: [
+            ...invocation.filesystem.deniedWriteRoots,
+            ...authorityWriteDenyRoots(this.options.configRoot),
+            ...skillReadRoots,
+            ...protectedWriteRoots([
+              ...invocation.filesystem.readWriteRoots,
+              ...(invocation.filesystem.optionalReadWriteRoots ?? []),
+              ...applicableGrantedRoots
+                .filter((root) => root.access === 'rw')
+                .map((root) => root.path)
+            ]),
+            ...(this.trustBundle ? [this.trustBundle.path] : [])
+          ]
+        },
+        ...(invocation.signal ? { signal: invocation.signal } : {}),
+        onNetworkAccessRequest: async (request) => {
+          if (activeSignal?.aborted) return false
+          const policySignal = this.policyAbort.signal
+          const liveSettings =
+            this.settings ?? normalizeNotebookNetworkSettings(await this.options.getSettings())
+          if (policySignal.aborted) return false
+          if (liveSettings.mode === 'strict')
+            return strictNetworkRuleMatches(
+              liveSettings.strictWhitelist ?? [],
+              request.host,
+              request.port ?? 443,
+              request.protocol ?? 'https'
+            )
+          if (request.addresses) {
+            if (!executionActive || !activeExecutionId || request.signal.aborted) return false
+            // This snapshot is emitted by the trusted gateway, never parsed from process output.
+            const hostname = normalizeNetworkHostname(request.host)
+            if (!hostname) return false
+            const port = request.port ?? 443
+            const protocol = request.protocol ?? 'https'
+            const addresses = [...request.addresses]
+            if (!addresses.length) return false
+            if (this.options.hasFullAccess?.(invocation.sessionId)) return true
+            const settings =
+              this.settings ?? normalizeNotebookNetworkSettings(await this.options.getSettings())
+            const grants = settings.destinationGrants ?? []
+            if (
+              grants.some((grant) =>
+                destinationGrantAllows(
+                  grant,
+                  invocation.projectId,
+                  hostname,
+                  port,
+                  addresses,
+                  protocol
+                )
+              )
+            )
+              return true
+            if (
+              settings.trustedPrivateDestinations?.some(
+                (grant) =>
+                  !grant.managedGrantId &&
+                  grant.hostname === hostname &&
+                  grant.port === port &&
+                  (grant.protocol ?? 'https') === protocol
+              )
+            )
+              return true
+            if (!requiresNetworkException(hostname, protocol)) return true
+            const destinationKey = JSON.stringify([formatNetworkHostname(hostname), port, protocol])
+            const once = exactExecutionGrants.get(destinationKey)
+            if (once) return true
+            const key = JSON.stringify([
+              executionGeneration,
+              formatNetworkHostname(hostname),
+              port,
+              protocol
+            ])
+            const previous = decisions.get(key)
+            if (previous) return previous
+            if (request.purpose === 'probe') return false
+            const evidence: NetworkBlockEvidence = {
+              recordId: randomUUID(),
+              revision: 0,
+              addresses,
+              risks: [],
+              blockReason: request.reason ?? 'approval-required'
+            }
+            const signal = AbortSignal.any([
+              policySignal,
+              request.signal,
+              ...(activeSignal ? [activeSignal] : [])
+            ])
+            let approvedOnceAddresses: readonly string[] = addresses
+            const result = this.options.requestDecision({
+              onOnceGrant: (approved) => {
+                approvedOnceAddresses = approved
+              },
+              sessionId: invocation.sessionId,
+              projectId: invocation.projectId,
+              hostname,
+              port,
+              protocol,
+              runtime: invocation.runtime,
+              allowOnce: true,
+              executionId: activeExecutionId,
+              commandFingerprint: createHash('sha256').update(activeCommandText).digest('hex'),
+              evidence,
+              canResume: () => false,
+              signal
+            })
+            executionRecordIds.add(evidence.recordId)
+            this.blockedRecords.set(evidence.recordId, {
+              projectId: invocation.projectId,
+              sessionId: invocation.sessionId,
+              hostname,
+              port,
+              protocol,
+              evidence,
+              result
+            })
+            // Bound trusted history; pending records remain authoritative in session persistence.
+            if (this.blockedRecords.size > 1024)
+              this.blockedRecords.delete(this.blockedRecords.keys().next().value!)
+            const generation = executionGeneration
+            const decision = result.then(
+              (choice) => {
+                if (
+                  choice === 'retryRequired' &&
+                  generation === executionGeneration &&
+                  !signal.aborted
+                )
+                  retryRequired = true
+                const allowed =
+                  choice === 'allowOnce' &&
+                  generation === executionGeneration &&
+                  executionActive &&
+                  !signal.aborted
+                if (allowed) exactExecutionGrants.set(destinationKey, approvedOnceAddresses)
+                return allowed
+              },
+              () => false
+            )
+            decisions.set(key, decision)
+            pendingDecisions.add(decision)
+            notifyWait()
+            void decision.finally(() => {
+              pendingDecisions.delete(decision)
+              notifyWait()
+            })
+            return decision
+          }
+          if (
+            await this.isCommandGrantAllowed(
+              invocation.sessionId,
+              invocation.runtime,
+              activeCommandText,
+              executionActive,
+              activeExecutionGrants,
+              allowedNetworkHosts,
+              request
+            )
+          )
+            return true
+          // Only a running Shell execution with a durable Run identity may originate an automatic
+          // approval. Startup probes and other runtimes keep their explicit access workflow.
+          if (
+            !executionActive ||
+            invocation.runtime !== 'bash' ||
+            !activeExecutionId ||
+            request.signal.aborted ||
+            activeSignal?.aborted
+          )
+            return false
+          const normalized = validateCustomAllowedDomain(request.host)
+          if (!normalized.ok) return false
+          const hostname = normalized.hostname
+          const port = request.port ?? 443
+          const protocol = request.protocol ?? 'https'
+          const generation = executionGeneration
+          const key = `${generation}:${protocol}://${formatNetworkHostname(hostname)}:${port}`
+          const existing = decisions.get(key)
+          if (request.purpose === 'probe' && !existing) return false
+          const existingConnections = connections.get(key) ?? new Set<() => boolean>()
+          existingConnections.add(request.canResume ?? (() => !request.signal.aborted))
+          connections.set(key, existingConnections)
+          if (existing) return existing
+          const signal = AbortSignal.any([
+            policySignal,
+            request.signal,
+            ...(activeSignal ? [activeSignal] : [])
+          ])
+          const canResume = (): boolean =>
+            executionActive &&
+            generation === executionGeneration &&
+            !signal.aborted &&
+            [...existingConnections].some((alive) => alive())
+          const decision = this.options
+            .requestDecision({
+              sessionId: invocation.sessionId,
+              projectId: invocation.projectId,
+              hostname,
+              port,
+              runtime: 'bash',
+              allowOnce: true,
+              executionId: activeExecutionId,
+              commandFingerprint: createHash('sha256').update(activeCommandText).digest('hex'),
+              canResume,
+              signal
+            })
+            .then(
+              (choice) => {
+                const allowed = choice === 'allowOnce' || choice === 'alwaysAllow'
+                const live = canResume() && !request.signal.aborted
+                if (allowed && !live && !signal.aborted) retryRequired = true
+                return live && allowed
+              },
+              () => false
+            )
+          decisions.set(key, decision)
+          pendingDecisions.add(decision)
+          notifyWait()
+          void decision.finally(() => {
+            pendingDecisions.delete(decision)
+            notifyWait()
+          })
+          return decision
+        }
+      })
+      if (target.kind === 'wsl2') {
+        // Returning from the runtime certifies guest-receipt reconciliation for this exact profile.
+        // Host temp recovery must stay behind that stop-before-remove boundary.
+        await this.reconcileCommandTemporaryRoots(target)
+      }
+      this.log.info('sandbox process prepared', {
+        executionReference: invocation.executionReference,
+        phase: 'sandbox-prepare',
+        result: 'complete',
+        durationMs: Math.round(performance.now() - preparationStartedAt),
+        platform: this.platform,
+        target: invocation.target?.kind ?? 'native',
+        runtime: invocation.runtime
+      })
+    } catch (error) {
+      const preparationDurationMs = Math.round(performance.now() - preparationStartedAt)
+      if (retained) {
+        retained.debt = true
+        retained.blocked = true
+      }
+      if (wrapped) {
+        const cleanup = await wrapped
+          .cleanup('spawn-failed', {
+            processesTerminated: true,
+            processState: 'never-started'
+          })
+          .catch(() => undefined)
+        if (!cleanup || !cleanupComplete(cleanup)) {
+          throw new Error(
+            'SHELL_CLEANUP_INCOMPLETE: Shell preparation cleanup could not be verified.',
+            { cause: error }
+          )
+        }
+        if (retained) {
+          retained.blocked = cleanup.admission !== 'independent-command-allowed'
+          retained.preparationCleanupReady = true
+        }
+        try {
+          await this.removeCommandTemporaryRoot(commandTempRoot, receipt, retained)
+          this.pendingTemporaryRoots.delete(commandTempRoot)
+        } catch (cleanupError) {
+          throw new Error(
+            'SHELL_CLEANUP_INCOMPLETE: Command temporary cleanup could not be verified.',
+            { cause: cleanupError }
+          )
+        }
+      }
+      if (
+        !wrapped &&
+        error instanceof Error &&
+        error.name === 'NotebookSandboxPreparationCleanupError' &&
+        'retryCleanup' in error &&
+        typeof error.retryCleanup === 'function'
+      ) {
+        const retryCleanup = error.retryCleanup as () => Promise<NotebookSandboxCleanupResult>
+        let retryPromise: Promise<NotebookSandboxCleanupResult> | undefined
+        const pendingCleanup: PendingCommandCleanup = {
+          target,
+          retry: () => {
+            retryPromise ??= (async () => {
+              const result = await retryCleanup()
+              // Preparation debt requires complete proof; it cannot use independent-command admission.
+              if (!cleanupComplete(result)) return { ...result, admission: 'blocked' as const }
+              if (retained) retained.preparationCleanupReady = true
+              await this.removeCommandTemporaryRoot(commandTempRoot, receipt, retained)
+              this.pendingTemporaryRoots.delete(commandTempRoot)
+              this.pendingCommandCleanups.delete(pendingCleanup)
+              return result
+            })().finally(() => {
+              retryPromise = undefined
+            })
+            return retryPromise
+          }
+        }
+        this.pendingCommandCleanups.add(pendingCleanup)
+      }
+      const preparationCause = completedPreparationCleanupCause(error)
+      if (preparationCause !== undefined) {
+        if (retained) {
+          retained.blocked = true
+          retained.preparationCleanupReady = true
+        }
+        try {
+          await this.removeCommandTemporaryRoot(commandTempRoot, receipt, retained)
+          this.pendingTemporaryRoots.delete(commandTempRoot)
+        } catch (cleanupError) {
+          throw new Error(
+            'SHELL_CLEANUP_INCOMPLETE: Command temporary cleanup could not be verified.',
+            { cause: cleanupError }
+          )
+        }
+      }
+      this.log.error('sandbox process preparation failed', {
+        executionReference: invocation.executionReference,
+        phase: 'sandbox-prepare',
+        result: 'failed',
+        durationMs: preparationDurationMs,
+        platform: this.platform,
+        runtime: invocation.runtime,
+        ...diagnosticErrorFields(error)
+      })
+      throw preparationCause ?? error
+    }
+    if (!wrapped) throw new Error('Notebook network sandbox did not return a process.')
+    // The cleanup capability retains its original filesystem identity even after disposal
+    // removes the capacity index. A late retry must never fall back to deleting by path alone.
+    let cleanupPromise: Promise<NotebookSandboxCleanupResult> | undefined
+    let cleanupReason: NotebookSandboxCleanupReason | undefined
+    let cleanupOutcome: NotebookSandboxProcessOutcome | undefined
+    const pendingCleanup: PendingCommandCleanup = {
+      target,
+      retry: () => cleanup(cleanupReason!, cleanupOutcome!)
+    }
+    const cleanup: NotebookSandboxedSpawn['cleanup'] = (reason, processOutcome) => {
+      unsubscribeFullAccess?.()
+      unsubscribeFullAccess = undefined
+      cleanupReason ??= reason
+      cleanupOutcome ??= processOutcome
+      if (cleanupPromise) return cleanupPromise
+      if (retained) {
+        retained.debt = true
+        retained.blocked = true
+      }
+      activeExecutionGrants = new Set()
+      executionActive = false
+      cleanupPromise = (async () => {
+        const cleanupStartedAt = performance.now()
+        const sandboxCleanup = await Promise.resolve(
+          wrapped.cleanup(cleanupReason!, cleanupOutcome!)
+        ).then(
+          (value) => ({ status: 'fulfilled' as const, value }),
+          (error) => ({ status: 'rejected' as const, reason: error })
+        )
+        const backendComplete =
+          sandboxCleanup.status === 'fulfilled' && cleanupComplete(sandboxCleanup.value)
+        if (retained) {
+          retained.blocked = !(
+            sandboxCleanup.status === 'fulfilled' &&
+            sandboxCleanup.value.admission === 'independent-command-allowed'
+          )
+        }
+        const temporaryCleanup = backendComplete
+          ? await this.removeCommandTemporaryRoot(commandTempRoot, receipt, retained).then(
+              () => ({ status: 'fulfilled' as const }),
+              (error) => ({ status: 'rejected' as const, reason: error })
+            )
+          : { status: 'rejected' as const, reason: new Error('Backend cleanup incomplete.') }
+        if (temporaryCleanup.status === 'fulfilled') {
+          this.pendingTemporaryRoots.delete(commandTempRoot)
+        }
+        let admission: NotebookSandboxCleanupResult['admission']
+        if (retained && !retained.blocked && this.retainedCommandRoots.has(commandTempRoot)) {
+          try {
+            await this.validateRetainedCommandRoot(commandTempRoot, receipt, retained)
+            admission = 'independent-command-allowed'
+          } catch {
+            retained.blocked = true
+            admission = 'blocked'
+          }
+        }
+        const result: NotebookSandboxCleanupResult = {
+          ...(admission ? { admission } : {}),
+          ...(sandboxCleanup.status === 'fulfilled' && sandboxCleanup.value.processState
+            ? { processState: sandboxCleanup.value.processState }
+            : {}),
+          processesTerminated:
+            sandboxCleanup.status === 'fulfilled' && sandboxCleanup.value.processesTerminated,
+          networkClosed:
+            sandboxCleanup.status === 'fulfilled' && sandboxCleanup.value.networkClosed,
+          temporaryResourcesRemoved:
+            sandboxCleanup.status === 'fulfilled' &&
+            sandboxCleanup.value.temporaryResourcesRemoved &&
+            temporaryCleanup.status === 'fulfilled'
+        }
+        this.log.info('sandbox cleanup completed', {
+          executionReference: invocation.executionReference,
+          phase: 'sandbox-cleanup',
+          result: cleanupComplete(result) ? 'complete' : 'incomplete',
+          durationMs: Math.round(performance.now() - cleanupStartedAt),
+          platform: this.platform,
+          target: invocation.target?.kind ?? 'native',
+          runtime: invocation.runtime,
+          reason: cleanupReason,
+          ...result,
+          incompleteStageCount: Object.values(result).filter((complete) => !complete).length,
+          ...(backendComplete && temporaryCleanup.status === 'rejected'
+            ? {
+                temporaryCleanupErrorCode:
+                  (temporaryCleanup.reason as NodeJS.ErrnoException)?.code ?? 'unknown'
+              }
+            : {})
+        })
+        await waitForNetworkApprovals()
+        return result
+      })()
+      cleanupPromise = cleanupPromise.then(
+        (result) => {
+          if (cleanupComplete(result)) {
+            this.pendingCommandCleanups.delete(pendingCleanup)
+          } else {
+            this.pendingCommandCleanups.add(pendingCleanup)
+            cleanupPromise = undefined
+          }
+          return result
+        },
+        (error) => {
+          this.pendingCommandCleanups.add(pendingCleanup)
+          cleanupPromise = undefined
+          throw error
+        }
+      )
+      return cleanupPromise
+    }
+    const [executable, ...args] = wrapped.argv
+    if (!executable) {
+      await cleanup('spawn-failed', {
+        processesTerminated: true,
+        processState: 'never-started'
+      })
+      throw new Error('Notebook network sandbox returned an empty command.')
+    }
+    return {
+      executable,
+      args,
+      env: wrapped.env,
+      ...(wrapped.processTreeProof ? { processTreeProof: wrapped.processTreeProof } : {}),
+      ...(wrapped.confirmProcessTreeTermination
+        ? { confirmProcessTreeTermination: wrapped.confirmProcessTreeTermination }
+        : {}),
+      ...(wrapped.requestProcessTreeTermination
+        ? { requestProcessTreeTermination: wrapped.requestProcessTreeTermination }
+        : {}),
+      ...(wrapped.confirmProcessState ? { confirmProcessState: wrapped.confirmProcessState } : {}),
+      ...(windowsProtectionRequired !== undefined
+        ? {
+            beginSpawn: () => {
+              if (
+                this.pendingRuntimeAccessChanges > 0 ||
+                this.runtimeAccessRevision !== runtimeAccessRevision
+              ) {
+                throw new Error('R runtime access changed before startup. Retry the Notebook cell.')
+              }
+              return (
+                wrapped.beginSpawn?.() ?? { started: () => undefined, notStarted: () => undefined }
+              )
+            }
+          }
+        : wrapped.beginSpawn
+          ? { beginSpawn: wrapped.beginSpawn }
+          : {}),
+      beginExecution: (request) => {
+        // Cleanup can be retried, but the command can never execute again.
+        if (cleanupReason !== undefined) {
+          throw new Error('Notebook sandbox process is already closed.')
+        }
+        if (executionActive) throw new Error('Notebook sandbox execution is already active.')
+        wrapped.resetNetworkConnections()
+        unsubscribeFullAccess = this.options.subscribeFullAccess?.(
+          invocation.sessionId,
+          (allowed) => {
+            if (!allowed) wrapped.resetNetworkConnections()
+          }
+        )
+        executionActive = true
+        activeCommandText = request?.commandText ?? invocation.commandText
+        activeExecutionId = request?.executionReference ?? invocation.executionReference
+        activeSignal = request?.signal ?? invocation.signal
+        executionWaitListener = request?.onNetworkWaitChange
+        executionGeneration += 1
+        decisions.clear()
+        exactExecutionGrants.clear()
+        executionRecordIds.clear()
+        connections.clear()
+        retryRequired = false
+        wrapped.setExecutionActive(true)
+        const grantKey = commandGrantKey(
+          invocation.sessionId,
+          invocation.runtime,
+          activeCommandText
+        )
+        activeExecutionGrants = this.nextExecutionGrants.get(grantKey) ?? new Set()
+        this.nextExecutionGrants.delete(grantKey)
+        let ended = false
+        return () => {
+          if (ended) return
+          ended = true
+          activeExecutionGrants = new Set()
+          unsubscribeFullAccess?.()
+          unsubscribeFullAccess = undefined
+          executionActive = false
+          wrapped.setExecutionActive(false)
+          wrapped.resetNetworkConnections()
+        }
+      },
+      waitForNetworkApprovals,
+      networkApprovalRetryRequired: () => retryRequired,
+      onNetworkWaitChange: (listener) => {
+        waitListeners.add(listener)
+        listener(pendingDecisions.size > 0)
+        return () => {
+          waitListeners.delete(listener)
+        }
+      },
+      annotateStderr: (stderr, stdout) => {
+        const sandboxStderr = wrapped.annotateStderr(stderr, stdout)
+        const annotated =
+          nativeWindows && invocation.runtime === 'r'
+            ? annotateRTemporaryDirectoryError(sandboxStderr)
+            : sandboxStderr
+        const records = [...this.blockedRecords.values()].filter((entry) =>
+          executionRecordIds.has(entry.evidence.recordId)
+        )
+        const result = retryRequired
+          ? annotated +
+            '\nNETWORK_APPROVAL_RETRY_REQUIRED: Access approved. Check side effects and retry explicitly. No command was replayed.\n'
+          : annotated
+        return records.length
+          ? result +
+              '\n' +
+              records
+                .slice(-8)
+                .map(
+                  (entry) =>
+                    `OPEN_SCIENCE_NETWORK_BLOCK_RECORD: ${entry.evidence.recordId} ${entry.protocol}://${formatNetworkHostname(entry.hostname)}:${entry.port}`
+                )
+                .join('\n') +
+              '\n'
+          : result
+      },
+      cleanup
+    }
+  }
+
+  async requestNetworkAccess(
+    request: NotebookNetworkAccessDecisionRequest
+  ): Promise<NotebookNetworkAccessDecisionResult> {
+    if (request.signal?.aborted)
+      return this.networkAccessResult('', 'denied', request.runtime, {
+        decisionSource: 'aborted',
+        message: 'The network access request was cancelled. No access was granted.'
+      })
+    const policySignal = this.policyAbort.signal
+    const liveSettings =
+      this.settings ?? normalizeNotebookNetworkSettings(await this.options.getSettings())
+    if (liveSettings.mode === 'strict' || policySignal.aborted) {
+      return this.networkAccessResult('', 'blocked', request.runtime, {
+        message:
+          'Authorization is unavailable in strict mode. Add the destination manually to the whitelist.'
+      })
+    }
+    if (request.recordId) {
+      const record = this.blockedRecords.get(request.recordId)
+      if (
+        record &&
+        (record.projectId !== request.projectId || record.sessionId !== request.sessionId)
+      )
+        return this.networkAccessResult('', 'blocked', request.runtime, {
+          message: 'Unknown or foreign network block record. No access was granted.'
+        })
+      // A query issued before the user responds must observe the committed settings, not the
+      // intermediate continuing state in the session transaction.
+      const decision = record ? await record.result : undefined
+      if (request.signal?.aborted || policySignal.aborted)
+        return this.networkAccessResult('', 'denied', request.runtime, {
+          decisionSource: 'aborted'
+        })
+      const persisted = await this.options.recordStatus?.(
+        request.projectId,
+        request.sessionId,
+        request.recordId
+      )
+      const saved = normalizeNotebookNetworkSettings(
+        await this.options.getSettings()
+      ).destinationGrants?.find(
+        (grant) =>
+          grant.recordId === request.recordId &&
+          grant.projectId === request.projectId &&
+          grant.sessionId === request.sessionId
+      )
+      if (policySignal.aborted) return this.networkAccessResult('', 'blocked', request.runtime)
+      if (saved && persisted?.status !== 'pending')
+        return this.networkAccessResult(
+          saved.hostname,
+          saved.revokedAt !== undefined
+            ? 'denied'
+            : saved.scope === 'project'
+              ? 'projectAllowed'
+              : 'alwaysAllowed',
+          request.runtime,
+          {
+            port: saved.port,
+            protocol: saved.protocol ?? 'https',
+            scope: saved.scope,
+            message:
+              saved.revokedAt !== undefined
+                ? 'Access was revoked. Do not retry without new user approval.'
+                : 'Access was saved. Check side effects and retry explicitly; no command was replayed.'
+          }
+        )
+      // The durable owner knows whether a once grant was consumed. A cached resolved promise
+      // alone must never report a consumed/revoked authorization as usable.
+      const approved =
+        persisted?.status === 'approved' ||
+        (!this.options.recordStatus && (decision === 'allowOnce' || decision === 'retryRequired'))
+      return this.networkAccessResult(
+        persisted?.hostname ?? record?.hostname ?? '',
+        approved
+          ? 'allowedOnce'
+          : persisted?.status === 'denied' || decision === 'deny'
+            ? 'denied'
+            : 'blocked',
+        request.runtime,
+        {
+          port: persisted?.port ?? record?.port,
+          protocol: persisted?.protocol ?? record?.protocol,
+          scope: persisted?.scope ?? (approved ? 'once' : undefined),
+          message: approved
+            ? 'A single explicit retry was approved. Check side effects before retrying.'
+            : persisted?.status === 'pending'
+              ? 'User approval is still pending in this conversation. No access was granted.'
+              : 'Unknown, denied, revoked, or consumed network block record. No access was granted.'
+        }
+      )
+    }
+    const networkHostname = normalizeNetworkHostname(request.hostname)
+    const normalized = networkHostname
+      ? { ok: true as const, hostname: networkHostname }
+      : validateCustomAllowedDomain(request.hostname)
+    if (!normalized.ok) {
+      return this.networkAccessResult(request.hostname, 'blocked', request.runtime, {
+        validationReason: normalized.reason
+      })
+    }
+    const protocol = request.protocol ?? 'https'
+    const port = request.port ?? (protocol === 'http' ? 80 : 443)
+    if (!request.signal?.aborted && this.options.hasFullAccess?.(request.sessionId)) {
+      return this.networkAccessResult(normalized.hostname, 'alreadyAllowed', request.runtime, {
+        port,
+        protocol,
+        message:
+          'The current session allows public network access without approval. Explicit deny rules still apply.'
+      })
+    }
+    const settings = liveSettings
+    if (
+      settings.trustedPrivateDestinations?.some(
+        (grant) =>
+          grant.hostname === normalized.hostname &&
+          grant.port === port &&
+          (grant.protocol ?? 'https') === protocol
+      )
+    ) {
+      return this.networkAccessResult(normalized.hostname, 'alreadyAllowed', request.runtime, {
+        port,
+        protocol,
+        scope: 'global'
+      })
+    }
+    if (!requiresNetworkException(normalized.hostname, protocol)) {
+      return this.networkAccessResult(normalized.hostname, 'alreadyAllowed', request.runtime, {
+        port,
+        protocol,
+        message:
+          'HTTPS domain access does not require approval. Normal TLS validation still applies.'
+      })
+    }
+    const grant = settings.destinationGrants?.find((entry) =>
+      destinationGrantAllows(entry, request.projectId, normalized.hostname, port, [], protocol)
+    )
+    if (grant)
+      return this.networkAccessResult(normalized.hostname, 'alreadyAllowed', request.runtime, {
+        port,
+        protocol,
+        scope: grant.scope
+      })
+    return this.networkAccessResult(normalized.hostname, 'blocked', request.runtime, {
+      port,
+      protocol,
+      message:
+        'A trusted sandbox block record ID is required to authorize this destination. No access was granted.'
+    })
+  }
+
+  applySettings(settings: NotebookNetworkSettings): void {
+    const next = normalizeNotebookNetworkSettings(settings)
+    if (next.mode !== this.settings?.mode || next.mode === 'strict') {
+      this.policyAbort.abort()
+      this.policyAbort = new AbortController()
+    }
+    this.settings = next
+    try {
+      if (this.initialized) this.sandbox!.updatePolicy(buildNotebookNetworkPolicy(this.settings))
+      this.log.info('network policy applied', {
+        active: this.initialized,
+        customDomainCount: this.settings.allowedDomains.length,
+        disabledGroupCount: this.settings.disabledOpenScienceDomainGroups.length,
+        disabledDomainCount: this.settings.disabledOpenScienceDomains.length
+      })
+    } catch (error) {
+      this.log.error('network policy application failed', {
+        active: this.initialized,
+        ...diagnosticErrorFields(error)
+      })
+      throw error
+    }
+  }
+
+  async updateParentProxy(): Promise<void> {
+    if (!this.initialized || !this.options.getParentProxy) return
+    try {
+      const parentProxy = await this.options.getParentProxy()
+      this.sandbox!.updateConfiguration({ parentProxy: parentProxy ?? null })
+      this.log.info('parent proxy configuration applied', { configured: Boolean(parentProxy) })
+    } catch (error) {
+      this.log.error('parent proxy configuration failed', diagnosticErrorFields(error))
+      throw error
+    }
+  }
+
+  async updateTrustBundle(): Promise<NotebookTrustBundleStatus> {
+    let next: NotebookTrustBundle | undefined
+    try {
+      next = await resolveNotebookTrustBundle(await this.options.getCaBundlePath?.())
+    } catch (error) {
+      this.log.error('trust bundle configuration failed', diagnosticErrorFields(error))
+      throw error
+    }
+    const changed =
+      next?.path !== this.trustBundle?.path ||
+      next?.certificates.join('\n') !== this.trustBundle?.certificates.join('\n')
+    this.trustBundle = next
+    if (changed && this.initialized) {
+      this.sandbox!.updateConfiguration({
+        trustBundle: next ? { path: next.path, certificates: next.certificates } : null
+      })
+    }
+    if (changed) {
+      this.log.info('trust bundle configuration applied', {
+        active: this.initialized,
+        configured: Boolean(next),
+        certificateCount: next?.certificates.length ?? 0
+      })
+    }
+    return notebookTrustBundleStatus(next)
+  }
+
+  cancelWindowsSetup(): boolean {
+    if (
+      !this.preparingWindowsRuntime ||
+      !this.windowsSetupController ||
+      this.windowsSetupController.signal.aborted
+    )
+      return false
+    this.windowsSetupController.abort()
+    return true
+  }
+
+  async installWindows(): Promise<{ cancelled: boolean }> {
+    if (this.windowsSetupController)
+      throw new Error('Notebook protection setup is already running.')
+    const controller = new AbortController()
+    this.windowsSetupController = controller
+    this.windowsSetupCancelled = false
+    this.windowsSetupFailure = undefined
+    const operation = startDiagnosticOperation(this.log, {
+      operation: 'notebook-network-windows-setup',
+      fields: { platform: this.platform }
+    })
+    try {
+      const result = await this.getOrCreateSandbox().installWindows()
+      if (!result.cancelled && this.windowsRuntime) {
+        this.preparingWindowsRuntime = true
+        try {
+          await this.windowsRuntime.prepare(true, controller.signal)
+        } finally {
+          this.preparingWindowsRuntime = false
+        }
+      }
+      if (result.cancelled) operation.cancel()
+      else operation.complete()
+      return result
+    } catch (error) {
+      if (controller.signal.aborted && error === controller.signal.reason) {
+        this.windowsSetupCancelled = true
+        operation.cancel()
+        return { cancelled: true }
+      }
+      this.windowsSetupFailure = this.windowsRuntime?.failure
+      operation.fail(error)
+      throw error
+    } finally {
+      this.windowsSetupController = undefined
+    }
+  }
+
+  async removeWindows(): Promise<{ cancelled: boolean }> {
+    if (this.windowsSetupController)
+      throw new Error('Wait for Notebook protection setup to finish cancelling.')
+    const operation = startDiagnosticOperation(this.log, {
+      operation: 'notebook-network-windows-remove',
+      fields: { platform: this.platform }
+    })
+    try {
+      const result = await this.getOrCreateSandbox().removeWindows()
+      if (!result.cancelled) {
+        this.windowsSetupCancelled = false
+        this.windowsSetupFailure = undefined
+      }
+      if (result.cancelled) operation.cancel()
+      else operation.complete()
+      return result
+    } catch (error) {
+      operation.fail(error)
+      throw error
+    }
+  }
+
+  async ensureRuntimeAccess(
+    request: Pick<NotebookSandboxInvocation, 'runtime' | 'executable' | 'sessionId' | 'signal'>
+  ): Promise<NotebookRuntimeAccessAdmission | void> {
+    if (this.platform !== 'win32' || request.runtime !== 'r') return
+    if (request.signal?.aborted)
+      throw new NotebookRuntimeAccessCancelledError('R access preparation was cancelled.')
+    const key = request.sessionId + '\0' + request.executable.toLowerCase()
+    const operationId = randomUUID()
+    const diagnostic = startDiagnosticOperation(this.log, {
+      operation: 'r-runtime-access',
+      operationId,
+      fields: { source: 'notebook', runtime: 'r', sessionId: request.sessionId }
+    })
+    diagnostic.phase('queued')
+    let started = false
+    const operation = this.runtimeAccessQueue.then(async () => {
+      started = true
+      diagnostic.phase('access-status')
+      if (request.signal?.aborted)
+        throw new NotebookRuntimeAccessCancelledError('R access preparation was cancelled.')
+      const access = await this.getOrCreateSandbox().getWindowsRuntimeAccess(request.executable)
+      const configured = await this.getOrCreateSandbox().isWindowsProtectionConfigured()
+      if (request.signal?.aborted)
+        throw new NotebookRuntimeAccessCancelledError('R access preparation was cancelled.')
+      if (!configured)
+        return { windowsProtectionRequired: false, windowsRuntimeAccessRequired: false }
+      if (access.authorized) {
+        this.cancelledRuntimeAccess.delete(key)
+        return { windowsProtectionRequired: true, windowsRuntimeAccessRequired: true }
+      }
+      if (this.cancelledRuntimeAccess.has(key)) throw new NotebookRuntimeAccessCancelledError()
+      if (request.signal?.aborted)
+        throw new NotebookRuntimeAccessCancelledError('R access preparation was cancelled.')
+      if (isMigrationInProgress())
+        throw new Error(
+          'Open-Science is moving your data. Wait for the move to finish before running this.'
+        )
+      diagnostic.phase('data-root-write-wait')
+      const result = await withDataRootWrite(async () => {
+        diagnostic.phase('preflight')
+        if (request.signal?.aborted)
+          throw new NotebookRuntimeAccessCancelledError('R access preparation was cancelled.')
+        if ((await this.status()).kind !== 'ready')
+          throw new Error('Enable protected mode before authorizing R access.')
+        if (request.signal?.aborted)
+          throw new NotebookRuntimeAccessCancelledError('R access preparation was cancelled.')
+        let preflightVerified = false
+        try {
+          preflightVerified = await this.verifyWindowsRuntimeAccess(
+            request.executable,
+            true,
+            undefined,
+            operationId
+          )
+        } catch (error) {
+          // The preflight itself may need the same ACL that the interactive repair grants. Let the
+          // existing UAC flow handle only this explicit permission failure; every other failure,
+          // especially incomplete cleanup, remains a hard admission error.
+          if (
+            !this.options.allowRuntimeAccessPrompt ||
+            !isWindowsRuntimeAccessPermissionError(error)
+          )
+            throw error
+          this.log.info('R runtime access preflight requires administrator authorization', {
+            runtime: 'r',
+            executable: request.executable
+          })
+        }
+        if (preflightVerified)
+          return { cancelled: false, windowsRuntimeAccessRequired: access.registered }
+        if (request.signal?.aborted)
+          throw new NotebookRuntimeAccessCancelledError('R access preparation was cancelled.')
+        if (!this.options.allowRuntimeAccessPrompt)
+          throw new Error(
+            'R access requires administrator authorization on the local Open-Science desktop.'
+          )
+        diagnostic.phase('authorize')
+        return {
+          ...(await this.applyWindowsRuntimeAccess(
+            request.executable,
+            true,
+            request.signal,
+            operationId
+          )),
+          windowsRuntimeAccessRequired: true
+        }
+      })
+      if (result.cancelled) this.cancelledRuntimeAccess.add(key)
+      if (result.cancelled) throw new NotebookRuntimeAccessCancelledError()
+      if (request.signal?.aborted)
+        throw new NotebookRuntimeAccessCancelledError('R access preparation was cancelled.')
+      return {
+        windowsProtectionRequired: true,
+        windowsRuntimeAccessRequired: result.windowsRuntimeAccessRequired
+      }
+    })
+    this.runtimeAccessQueue = operation.then(
+      () => undefined,
+      () => undefined
+    )
+    const trackedOperation = operation.then(
+      (admission) => {
+        diagnostic.complete()
+        return admission
+      },
+      (error) => {
+        if (error instanceof NotebookRuntimeAccessCancelledError) diagnostic.cancel()
+        else diagnostic.fail(error)
+        throw error
+      }
+    )
+    const signal = request.signal
+    if (!signal) return trackedOperation
+    // A waiting session can stop immediately. Once elevation starts, keep the native owner and
+    // writer lease until its journal is settled; cancellation must not abandon persistent grants.
+    return new Promise<NotebookRuntimeAccessAdmission>((resolve, reject) => {
+      const onAbort = (): void => {
+        if (!started) {
+          diagnostic.cancel()
+          reject(new NotebookRuntimeAccessCancelledError('R access preparation was cancelled.'))
+        }
+      }
+      signal.addEventListener('abort', onAbort, { once: true })
+      void trackedOperation
+        .then(resolve, reject)
+        .finally(() => signal.removeEventListener('abort', onAbort))
+    })
+  }
+
+  async setWindowsRuntimeAccess(
+    executable: string,
+    authorized: boolean
+  ): Promise<{ cancelled: boolean }> {
+    // Invalidate prepared launches at enqueue time, before a preceding UAC operation settles.
+    this.runtimeAccessRevision += 1
+    this.pendingRuntimeAccessChanges += 1
+    const operationId = randomUUID()
+    const diagnostic = startDiagnosticOperation(this.log, {
+      operation: 'r-runtime-access',
+      operationId,
+      fields: { source: 'settings', runtime: 'r', authorized }
+    })
+    diagnostic.phase('queued')
+    const operation = this.runtimeAccessQueue.then(async () => {
+      diagnostic.phase(authorized ? 'authorize' : 'revoke')
+      const result = await this.applyWindowsRuntimeAccess(
+        executable,
+        authorized,
+        undefined,
+        operationId
+      )
+      if (!result.cancelled) {
+        for (const key of this.cancelledRuntimeAccess) {
+          if (key.endsWith('\0' + executable.toLowerCase())) this.cancelledRuntimeAccess.delete(key)
+        }
+      }
+      return result
+    })
+    this.runtimeAccessQueue = operation.then(
+      () => undefined,
+      () => undefined
+    )
+    return operation
+      .finally(() => {
+        this.pendingRuntimeAccessChanges -= 1
+      })
+      .then(
+        (result) => {
+          if (result.cancelled) diagnostic.cancel()
+          else diagnostic.complete()
+          return result
+        },
+        (error) => {
+          diagnostic.fail(error)
+          throw error
+        }
+      )
+  }
+
+  private async applyWindowsRuntimeAccess(
+    executable: string,
+    authorized: boolean,
+    signal?: AbortSignal,
+    parentOperationId?: string
+  ): Promise<{ cancelled: boolean }> {
+    if (!authorized) return this.getOrCreateSandbox().setWindowsRuntimeAccess(executable, false)
+    try {
+      await this.verifyWindowsRuntimeAccess(executable, false, { signal }, parentOperationId)
+      return { cancelled: false }
+    } catch (error) {
+      if (error instanceof NotebookRuntimeAccessCancelledError) return { cancelled: true }
+      throw error
+    }
+  }
+
+  private async verifyWindowsRuntimeAccess(
+    executable: string,
+    pathsOnly = false,
+    authorization?: { signal?: AbortSignal },
+    parentOperationId?: string
+  ): Promise<boolean> {
+    const operationId = randomUUID()
+    const fields = {
+      operationId,
+      parentOperationId,
+      pathsOnly,
+      authorizationRequested: Boolean(authorization)
+    }
+    const diagnostic = startDiagnosticOperation(this.log, {
+      operation: 'r-runtime-verification',
+      operationId,
+      fields
+    })
+    let phase = 'protection-status'
+    const logFailure = (message: string, error: unknown): void => {
+      try {
+        this.log.warn(message, { ...fields, phase, ...runtimeChildProcessErrorFields(error) })
+      } catch {
+        // Diagnostics must not replace the probe error or prevent process and ACL cleanup.
+      }
+    }
+    try {
+      diagnostic.phase(phase)
+      const status = await this.status()
+      if (status.kind !== 'ready')
+        throw new Error('Enable protected mode before verifying R access.')
+      const prefix = windowsCondaPrefixForR(executable, this.platform)
+      const env = {
+        ...normalizeRProcessLocale(buildNotebookKernelEnvironment(this.platform), this.platform),
+        ...(prefix ? { PATH: condaActivatedPath(prefix, process.env.PATH, this.platform) } : {})
+      }
+      const cwd = await mkdtemp(join(tmpdir(), 'open-science-r-access-'))
+      let invocation: NotebookSandboxedSpawn | undefined
+      let endExecution: (() => void) | undefined
+      let probeMayHaveStarted = false
+      let verificationError: unknown
+      let verificationFailurePhase: string | undefined
+      let verified = false
+      try {
+        phase = 'sandbox-prepare'
+        diagnostic.phase(phase, { condaPrefixDetected: Boolean(prefix) })
+        invocation = await this.wrapInvocation(
+          {
+            executable,
+            args: [
+              '--vanilla',
+              '-e',
+              pathsOnly
+                ? 'paths <- c(.Library, file.path(.Library, "compiler")); failed <- vapply(paths, function(p) inherits(try(normalizePath(p, mustWork=TRUE), silent=TRUE), "try-error"), logical(1)); if (any(failed)) { cat(paste(paths[failed], collapse="\\n")); quit(status=77) }; cat("OPEN_SCIENCE_R_ACCESS_OK")'
+                : 'stopifnot(requireNamespace("jsonlite", quietly=TRUE)); normalizePath(.libPaths(), mustWork=TRUE); cat("OPEN_SCIENCE_R_ACCESS_OK")'
+            ],
+            cwd,
+            // Only the contained path probe suppresses startup packages. Host readiness and full
+            // post-authorization verification must exercise ordinary R startup and dependencies.
+            env: {
+              ...env,
+              ...(pathsOnly ? { R_DEFAULT_PACKAGES: 'NULL', R_ENABLE_JIT: '0' } : {})
+            },
+            commandText: 'Verify selected R runtime',
+            runtime: 'r',
+            sessionId: 'runtime-access-check',
+            projectId: 'runtime-access-check',
+            filesystem: {
+              readOnlyRoots: [kernelExecutableReadRoot(executable, 'r', this.platform)],
+              readWriteRoots: [cwd],
+              deniedReadRoots: [],
+              deniedWriteRoots: []
+            }
+          },
+          false
+        )
+        endExecution = invocation.beginExecution?.()
+        phase = authorization ? 'authorize' : 'path-probe'
+        diagnostic.phase(phase)
+        if (authorization) {
+          probeMayHaveStarted = true
+          const result = await this.getOrCreateSandbox().setWindowsRuntimeAccess(executable, true, {
+            argv: [invocation.executable, ...invocation.args],
+            env: invocation.env,
+            ...(authorization.signal ? { signal: authorization.signal } : {})
+          })
+          if (result.cancelled) {
+            // The adapter reports cancellation only before the contained probe starts. Once the
+            // elevated transaction starts, a failed/aborted verifier is an error requiring cleanup.
+            probeMayHaveStarted = false
+            throw new NotebookRuntimeAccessCancelledError()
+          }
+        } else {
+          probeMayHaveStarted = true
+          const { stdout } = await runRAccessProbe(invocation, cwd)
+          if (!stdout.includes('OPEN_SCIENCE_R_ACCESS_OK'))
+            throw new Error('R runtime verification did not complete.')
+        }
+        verified = true
+      } catch (error) {
+        logFailure('R runtime verification probe failed', error)
+        verificationError = error
+        if (error instanceof Error) {
+          const message = annotateRTemporaryDirectoryError(error.message)
+          if (message !== error.message) verificationError = new Error(message, { cause: error })
+        }
+        verificationFailurePhase = phase
+        const failure = error as { code?: number; stdout?: string }
+        if (pathsOnly && failure.code === 77 && failure.stdout?.trim()) {
+          const paths = failure.stdout.trim().split(/\r?\n/)
+          if (paths.length <= 2) {
+            try {
+              phase = 'host-probe'
+              diagnostic.phase(phase)
+              // Host readability and protocol readiness distinguish denied access from a broken R.
+              await Promise.all(paths.map((path) => realpath(path)))
+              const runnable = await rKernelProtocolProbe({
+                exec: (args) =>
+                  promisify(execFile)(executable, ['--vanilla', ...args], {
+                    cwd,
+                    env,
+                    timeout: 20_000,
+                    windowsHide: true,
+                    maxBuffer: 1024 * 1024
+                  }).catch((error) => {
+                    // The protocol probe intentionally converts execution errors to false.
+                    logFailure('R runtime verification host process failed', error)
+                    throw error
+                  })
+              })
+              if (!runnable) throw new Error('The R kernel protocol dependencies failed to load.')
+              verificationError = undefined
+              verificationFailurePhase = undefined
+            } catch (hostError) {
+              logFailure('R runtime verification host probe failed', hostError)
+              verificationError = hostError
+              verificationFailurePhase = phase
+            }
+          }
+        }
+      } finally {
+        endExecution?.()
+      }
+      phase = 'process-termination'
+      diagnostic.phase(phase)
+      const confirmTermination = invocation?.confirmProcessTreeTermination
+      const processesTerminated =
+        !probeMayHaveStarted || (await confirmTermination?.().catch(() => false)) === true
+      phase = 'sandbox-cleanup'
+      diagnostic.phase(phase, { processesTerminated })
+      const cleanup = await invocation?.cleanup('exit', {
+        processesTerminated,
+        ...(confirmTermination ? { confirmTermination } : {})
+      })
+      if (cleanup && !cleanupComplete(cleanup)) {
+        throw new Error('R runtime verification cleanup could not be confirmed.', {
+          cause: verificationError
+        })
+      }
+      // Windows can retain directory handles briefly after the probe's process tree has exited.
+      // Retry only after termination and sandbox cleanup are confirmed; persistent locks still fail.
+      // Node's fs.rm retries omit EACCES, which hosted Windows runners can surface for a live cwd.
+      phase = 'temporary-directory-cleanup'
+      diagnostic.phase(phase)
+      await removeDirectoryAfterWindowsProbeLock(cwd)
+      if (verificationError !== undefined) {
+        phase = verificationFailurePhase ?? phase
+        throw verificationError
+      }
+      diagnostic.complete({ verified })
+      return verified
+    } catch (error) {
+      if (error instanceof NotebookRuntimeAccessCancelledError) diagnostic.cancel()
+      else diagnostic.fail(error, { failurePhase: phase })
+      throw error
+    }
+  }
+
+  // The caller has stopped the affected kernels and holds repair/migration admission. Revoke while
+  // the exact old directories still exist so the native owner can remove every recorded ACL.
+  async revokeManagedRAccess(runtimeRoot: string): Promise<void> {
+    if (!this.supportsWindowsRuntimeAccess) return
+    // A damaged legacy interpreter can make discovery fall back to the short layout. Keep the
+    // original exact path addressable; the native owner removes only its recorded permissions.
+    const prefixes = new Set([
+      envPrefix(runtimeRoot, DEFAULT_R_ENV, this.platform),
+      legacyDefaultEnvPrefix(runtimeRoot, DEFAULT_R_ENV)
+    ])
+    for (const prefix of prefixes) {
+      // Receipts retain exact executable paths even after a binary disappears or its layout changes.
+      // Ask the native owner about both known layouts; it removes only matching owned records.
+      for (const architecture of ['', 'x64']) {
+        const executable = join(prefix, 'Lib', 'R', 'bin', architecture, 'Rscript.exe')
+        const result = await this.setWindowsRuntimeAccess(executable, false)
+        if (result.cancelled) {
+          throw new Error(
+            'R permission removal was cancelled; the existing runtime must be preserved.'
+          )
+        }
+      }
+    }
+  }
+
+  get supportsWindowsRuntimeAccess(): boolean {
+    return this.platform === 'win32'
+  }
+
+  async dispose(): Promise<void> {
+    await this.runtimeAccessQueue
+    this.cancelledRuntimeAccess.clear()
+    await this.initializePromise?.catch(() => undefined)
+    try {
+      await this.sandbox?.dispose()
+      for (const [root, receipt] of this.pendingTemporaryRoots) {
+        await this.removeCommandTemporaryRoot(root, receipt)
+        this.pendingTemporaryRoots.delete(root)
+      }
+      this.pendingCommandCleanups.clear()
+    } catch (error) {
+      this.log.error('sandbox disposal failed', diagnosticErrorFields(error))
+      throw error
+    }
+    this.log.info('sandbox disposed')
+    this.initialized = false
+    this.releaseWindowsRuntime?.()
+    this.sandbox = undefined
+    this.nextExecutionGrants.clear()
+    this.blockedDestinationCommands.clear()
+  }
+
+  private async initializeInternal(): Promise<void> {
+    const operation = startDiagnosticOperation(this.log, {
+      operation: 'notebook-network-sandbox-initialize',
+      fields: { platform: this.platform }
+    })
+    try {
+      const storedSettings = await this.options.getSettings()
+      this.settings ??= normalizeNotebookNetworkSettings(storedSettings)
+      const parentProxy = await this.options.getParentProxy?.()
+      this.trustBundle = await resolveNotebookTrustBundle(await this.options.getCaBundlePath?.())
+      const initialSettings = this.settings
+      this.sandbox = this.createSandbox(initialSettings, parentProxy)
+      await this.sandbox.initialize()
+      if (this.settings !== initialSettings)
+        this.sandbox.updatePolicy(buildNotebookNetworkPolicy(this.settings))
+      this.initialized = true
+      operation.complete({
+        customDomainCount: this.settings.allowedDomains.length,
+        parentProxyConfigured: Boolean(parentProxy),
+        trustBundleConfigured: Boolean(this.trustBundle)
+      })
+    } catch (error) {
+      operation.fail(error)
+      throw error
+    }
+  }
+
+  private recordStatus(
+    status: NotebookNetworkStatus,
+    extraFields: Record<string, unknown> = {}
+  ): NotebookNetworkStatus {
+    if (this.windowsRuntime)
+      status = {
+        ...status,
+        windowsRuntimeSetup: {
+          downloadBytes: this.windowsRuntime.downloadBytes,
+          canCancel:
+            this.preparingWindowsRuntime &&
+            Boolean(this.windowsSetupController && !this.windowsSetupController.signal.aborted),
+          cancelled: this.windowsSetupCancelled,
+          ...(this.windowsSetupFailure ? { failure: this.windowsSetupFailure } : {})
+        }
+      }
+    const signature = JSON.stringify(status)
+    if (signature === this.lastStatusSignature) return status
+    this.lastStatusSignature = signature
+    const level = statusLogLevel(status)
+    this.log[level]('sandbox status changed', { ...statusLogFields(status), ...extraFields })
+    return status
+  }
+
+  private async reconcilePendingCommandCleanups(target: NotebookSandboxTarget): Promise<void> {
+    const pending = [...this.pendingCommandCleanups].filter((cleanup) =>
+      sameCleanupDomain(cleanup.target, target)
+    )
+    const results = await Promise.all(pending.map((cleanup) => cleanup.retry()))
+    if (this.platform === 'darwin' && target.kind === 'native') {
+      for (const [root, retained] of this.retainedCommandRoots) {
+        if (retained.recovered || !retained.debt) continue
+        if (retained.preparationCleanupReady) {
+          await this.removeCommandTemporaryRoot(root, `${root}.receipt`).then(
+            () => this.pendingTemporaryRoots.delete(root),
+            () => undefined
+          )
+        }
+        if (!this.retainedCommandRoots.has(root)) continue
+        await this.validateRetainedCommandRoot(root, `${root}.receipt`, retained)
+        if (retained.blocked) {
+          throw new Error('SHELL_CLEANUP_INCOMPLETE: Retained command cleanup is unverified.')
+        }
+      }
+    }
+    if (
+      results.some(
+        (result) =>
+          !cleanupComplete(result) &&
+          !(
+            this.platform === 'darwin' &&
+            target.kind === 'native' &&
+            result.admission === 'independent-command-allowed'
+          )
+      )
+    ) {
+      throw new Error('SHELL_CLEANUP_INCOMPLETE: Previous shell cleanup could not be reconciled.')
+    }
+  }
+
+  private commandTemporaryRoot(): string {
+    return this.options.temporaryRoot ?? join(tmpdir(), 'open-science-notebook')
+  }
+
+  private async createCommandTemporaryRoot(
+    target: NonNullable<NotebookSandboxInvocation['target']>,
+    runtime: NotebookSandboxInvocation['runtime']
+  ): Promise<{
+    commandTempRoot: string
+    receipt: string
+    retained?: RetainedCommandRoot
+  }> {
+    if (this.platform === 'darwin' && target.kind === 'native') {
+      // The short creation queue keeps successors from observing partially registered receipts.
+      // Execution itself is never serialized by this registration queue.
+      const creation = this.commandCreationQueue.then(() =>
+        this.createTrackedCommandTemporaryRoot()
+      )
+      this.commandCreationQueue = creation.then(
+        () => undefined,
+        () => undefined
+      )
+      return creation
+    }
+    const ownerRoot = this.commandTemporaryRoot()
+    if (
+      this.platform === 'win32' &&
+      target.kind === 'native' &&
+      runtime === 'r' &&
+      /\s/u.test(ownerRoot)
+    ) {
+      // Follow R's host temp-directory order without exposing the shared parent to the child.
+      // Leave whitespace handling to R: it can use Windows short names during startup.
+      for (const parent of new Set([process.env.TMPDIR, process.env.TMP, process.env.TEMP])) {
+        if (!parent || !isAbsolute(parent)) continue
+        try {
+          // Do not create command files through a pre-existing junction or symlink.
+          // These checks reject existing links; they do not lock paths against later replacement.
+          if (!(await lstat(parent)).isDirectory()) continue
+          const fallbackRoot = join(parent, 'open-science-notebook')
+          await mkdir(fallbackRoot, { recursive: true, mode: 0o700 })
+          if (!(await lstat(fallbackRoot)).isDirectory()) continue
+          return await this.createCommandTemporaryRootAt(fallbackRoot, target)
+        } catch (error) {
+          if (
+            !['EACCES', 'EPERM', 'ENOENT', 'ENOTDIR', 'EROFS'].includes(
+              (error as NodeJS.ErrnoException).code ?? ''
+            )
+          )
+            throw error
+        }
+      }
+      // Preserve R's own short-path support when no alternative is available. Only an actual
+      // R_TempDir failure receives configuration guidance; spaces alone do not prove failure.
+    }
+    return this.createCommandTemporaryRootAt(ownerRoot, target)
+  }
+
+  private async createCommandTemporaryRootAt(
+    ownerRoot: string,
+    target: NonNullable<NotebookSandboxInvocation['target']>
+  ): Promise<{ commandTempRoot: string; receipt: string }> {
+    const id = randomUUID()
+    const commandTempRoot = join(ownerRoot, `command-${id}`)
+    const receipt = join(ownerRoot, `command-${id}.receipt`)
+    await mkdir(ownerRoot, { recursive: true, mode: 0o700 })
+    const ownership =
+      target.kind === 'wsl2'
+        ? `wsl2 ${encodeURIComponent(target.profileId)} ${encodeURIComponent(target.distro)} ${encodeURIComponent(target.user)}`
+        : 'native'
+    await writeFile(receipt, `v1 command-${id} ${ownership}\n`, { flag: 'wx', mode: 0o600 })
+    try {
+      await mkdir(commandTempRoot, { mode: 0o700 })
+    } catch (error) {
+      try {
+        await rm(receipt, { force: true })
+      } catch (cleanupError) {
+        throw new AggregateError([error, cleanupError], 'Command temporary receipt cleanup failed.')
+      }
+      throw error
+    }
+    return { commandTempRoot, receipt }
+  }
+
+  private async removeCommandTemporaryRoot(
+    root: string,
+    receipt: string,
+    retained = this.retainedCommandRoots.get(root)
+  ): Promise<void> {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        if (retained) await this.validateRetainedCommandRoot(root, receipt, retained)
+        await rm(root, { recursive: true, force: true })
+        if (retained) await this.validateRetainedCommandRoot(root, receipt, retained)
+        await rm(receipt, { force: true })
+        this.retainedCommandRoots.delete(root)
+        return
+      } catch (error) {
+        // Windows readers can briefly deny deletion even after the workload's Job is empty.
+        // Share one bounded retry budget across the directory and its receipt. Only retry
+        // fs.rm's transient error codes; process/network cleanup must already have succeeded.
+        // EACCES joins the list because Node's fs.rm retries omit it, which hosted Windows
+        // runners can surface for a recently exited probe cwd.
+        if (
+          this.platform !== 'win32' ||
+          attempt >= 5 ||
+          !['EBUSY', 'EMFILE', 'ENFILE', 'ENOTEMPTY', 'EPERM', 'EACCES'].includes(
+            (error as NodeJS.ErrnoException)?.code ?? ''
+          )
+        )
+          throw error
+        await delay(200 * (attempt + 1))
+      }
+    }
+  }
+
+  private async validateRetainedCommandRoot(
+    root: string,
+    receipt: string,
+    retained: RetainedCommandRoot
+  ): Promise<void> {
+    const fail = (): never => {
+      retained.blocked = true
+      throw new Error('SHELL_CLEANUP_INCOMPLETE: Command temporary identity changed.')
+    }
+    const parent = await lstat(this.commandTemporaryRoot()).catch(() => undefined)
+    if (!parent?.isDirectory() || !sameFileIdentity(parent, retained.parent)) fail()
+    for (const [path, identity, directory] of [
+      [root, retained.root, true],
+      [receipt, retained.receipt, false]
+    ] as const) {
+      const current = await lstat(path).catch((error: NodeJS.ErrnoException) => {
+        if (error.code === 'ENOENT') return undefined
+        throw error
+      })
+      if (!current) continue
+      if (
+        !identity ||
+        !sameFileIdentity(current, identity) ||
+        (directory ? !current.isDirectory() : !current.isFile())
+      )
+        fail()
+      if (!directory && retained.content !== undefined) {
+        const content = await readFile(path, 'utf8').catch((error: NodeJS.ErrnoException) => {
+          // Another completed cleanup may remove the receipt after lstat observed it.
+          if (error.code === 'ENOENT') return undefined
+          throw error
+        })
+        if (content !== undefined && content !== retained.content) fail()
+      }
+    }
+    // Reject accidental replacement; this is not an atomic defense against a malicious
+    // same-UID process racing these observations with rm.
+  }
+
+  private async createTrackedCommandTemporaryRoot(): Promise<{
+    commandTempRoot: string
+    receipt: string
+    retained?: RetainedCommandRoot
+  }> {
+    const ownerRoot = this.commandTemporaryRoot()
+    await mkdir(ownerRoot, { recursive: true, mode: 0o700 })
+    const parent = await lstat(ownerRoot)
+    if (!parent.isDirectory()) {
+      throw new Error('SHELL_CLEANUP_INCOMPLETE: Command temporary parent is not a directory.')
+    }
+    if (this.commandParentIdentity && !sameFileIdentity(parent, this.commandParentIdentity)) {
+      throw new Error('SHELL_CLEANUP_INCOMPLETE: Command temporary parent changed.')
+    }
+    this.commandParentIdentity ??= parent
+    if (!this.commandRootsScanned) {
+      const entries = await readdir(ownerRoot, { withFileTypes: true })
+      for (const entry of entries) {
+        const match = /^command-(.+)\.receipt$/u.exec(entry.name)
+        if (!match) continue
+        if (!entry.isFile() || !COMMAND_TEMP_ID.test(match[1]!)) {
+          throw new Error('SHELL_CLEANUP_INCOMPLETE: Command temporary receipt is invalid.')
+        }
+        const receipt = join(ownerRoot, entry.name)
+        const content = await readFile(receipt, 'utf8')
+        if (content !== `v1 command-${match[1]} native\n`) {
+          if (/^v1 command-[0-9a-f-]{36} wsl2 /u.test(content)) continue
+          throw new Error('SHELL_CLEANUP_INCOMPLETE: Command temporary receipt is invalid.')
+        }
+        const root = join(ownerRoot, `command-${match[1]}`)
+        this.retainedCommandRoots.set(root, {
+          parent,
+          receipt: await lstat(receipt),
+          root: await lstat(root).catch((error: NodeJS.ErrnoException) => {
+            if (error.code === 'ENOENT') return undefined
+            throw error
+          }),
+          content,
+          debt: true,
+          blocked: false,
+          preparationCleanupReady: false,
+          recovered: true
+        })
+      }
+      for (const entry of entries) {
+        const match = /^command-(.+)$/u.exec(entry.name)
+        if (!match || entry.name.endsWith('.receipt')) continue
+        if (!entry.isDirectory() || !COMMAND_TEMP_ID.test(match[1]!)) {
+          throw new Error('SHELL_CLEANUP_INCOMPLETE: Command temporary ownership is incomplete.')
+        }
+        if (!entries.some((candidate) => candidate.name === `${entry.name}.receipt`)) {
+          const root = join(ownerRoot, entry.name)
+          const identity = await lstat(root).catch((error: NodeJS.ErrnoException) => {
+            if (error.code === 'ENOENT') return undefined
+            throw error
+          })
+          if (!identity) continue
+          // Older versions created UUID directories without receipts. Retain this unproven
+          // residue, but never adopt its cleanup authority or manufacture a receipt for it.
+          this.retainedCommandRoots.set(root, {
+            parent,
+            root: identity,
+            debt: true,
+            blocked: false,
+            preparationCleanupReady: false,
+            recovered: true
+          })
+        }
+      }
+      this.commandRootsScanned = true
+    }
+    for (const [root, retained] of this.retainedCommandRoots) {
+      if (!sameFileIdentity(parent, retained.parent)) {
+        throw new Error('SHELL_CLEANUP_INCOMPLETE: Command temporary parent changed.')
+      }
+      await this.validateRetainedCommandRoot(root, `${root}.receipt`, retained)
+    }
+    // Receipt count does not establish process liveness or resource pressure. Admission depends
+    // on cleanup's independent-command permission and the identity checks above, never a global
+    // count that lets one failed session exhaust every other session's ability to execute.
+    const id = randomUUID()
+    const commandTempRoot = join(ownerRoot, `command-${id}`)
+    const receipt = `${commandTempRoot}.receipt`
+    const retained: RetainedCommandRoot = {
+      parent,
+      debt: false,
+      blocked: false,
+      preparationCleanupReady: false,
+      recovered: false
+    }
+    try {
+      const handle = await open(receipt, 'wx', 0o600)
+      this.retainedCommandRoots.set(commandTempRoot, retained)
+      this.pendingTemporaryRoots.set(commandTempRoot, receipt)
+      try {
+        retained.receipt = await handle.stat()
+        await handle.writeFile(`v1 command-${id} native\n`)
+        retained.content = `v1 command-${id} native\n`
+      } finally {
+        await handle.close()
+      }
+      await mkdir(commandTempRoot, { mode: 0o700 })
+      retained.root = await lstat(commandTempRoot)
+      return { commandTempRoot, receipt, retained }
+    } catch (error) {
+      if (this.retainedCommandRoots.has(commandTempRoot)) {
+        retained.debt = true
+        retained.preparationCleanupReady = true
+        await this.removeCommandTemporaryRoot(commandTempRoot, receipt).then(
+          () => this.pendingTemporaryRoots.delete(commandTempRoot),
+          () => undefined
+        )
+      }
+      throw error
+    }
+  }
+
+  private async reconcileCommandTemporaryRoots(
+    target: Extract<NonNullable<NotebookSandboxInvocation['target']>, { kind: 'wsl2' }>
+  ): Promise<void> {
+    const ownerRoot = this.commandTemporaryRoot()
+    await mkdir(ownerRoot, { recursive: true, mode: 0o700 })
+    const entries = await readdir(ownerRoot, { withFileTypes: true })
+    const receipts = new Map<string, { receipt: string; matchesTarget: boolean }>()
+    for (const entry of entries) {
+      const match = /^command-(.+)\.receipt$/u.exec(entry.name)
+      if (!match) continue
+      const id = match[1]!
+      if (!entry.isFile() || !COMMAND_TEMP_ID.test(id)) {
+        throw new Error('SHELL_CLEANUP_INCOMPLETE: Command temporary receipt is invalid.')
+      }
+      const receipt = join(ownerRoot, entry.name)
+      const fields = (await readFile(receipt, 'utf8')).match(
+        /^v1 command-([0-9a-f-]{36}) (native|wsl2 ([^ ]+) ([^ ]+) ([^ \r\n]+))\n$/u
+      )
+      if (!fields || fields[1] !== id) {
+        throw new Error('SHELL_CLEANUP_INCOMPLETE: Command temporary receipt is invalid.')
+      }
+      let matchesTarget = false
+      if (fields[2] !== 'native') {
+        try {
+          const profileId = decodeURIComponent(fields[3]!)
+          const distro = decodeURIComponent(fields[4]!)
+          const user = decodeURIComponent(fields[5]!)
+          if (
+            encodeURIComponent(profileId) !== fields[3] ||
+            encodeURIComponent(distro) !== fields[4] ||
+            encodeURIComponent(user) !== fields[5]
+          ) {
+            throw new Error('non-canonical ownership')
+          }
+          matchesTarget =
+            profileId === target.profileId && distro === target.distro && user === target.user
+        } catch {
+          throw new Error('SHELL_CLEANUP_INCOMPLETE: Command temporary receipt is invalid.')
+        }
+      }
+      receipts.set(id, { receipt, matchesTarget })
+    }
+    for (const entry of entries) {
+      const match = /^command-(.+)$/u.exec(entry.name)
+      if (!match || entry.name.endsWith('.receipt')) continue
+      const id = match[1]!
+      if (!entry.isDirectory() || !COMMAND_TEMP_ID.test(id) || !receipts.has(id)) {
+        throw new Error('SHELL_CLEANUP_INCOMPLETE: Command temporary ownership is incomplete.')
+      }
+    }
+    for (const [id, ownership] of receipts) {
+      const root = join(ownerRoot, `command-${id}`)
+      // Native children can outlive the Electron parent, so a restart does not prove they stopped.
+      // Their roots stay retained; only same-process verified cleanup may remove them.
+      if (!ownership.matchesTarget || this.pendingTemporaryRoots.has(root)) continue
+      await this.removeCommandTemporaryRoot(root, ownership.receipt)
+    }
+  }
+
+  private networkAccessResult(
+    hostname: string,
+    status: NotebookNetworkAccessDecisionResult['status'],
+    runtime: NotebookCommandRuntime | undefined,
+    fields: Pick<NotebookNetworkAccessDecisionResult, 'decisionSource' | 'message'> & {
+      port?: number
+      protocol?: 'http' | 'https'
+      scope?: 'once' | 'project' | 'global'
+      validationReason?: string
+    } = {}
+  ): NotebookNetworkAccessDecisionResult {
+    const level = status === 'allowedOnce' || status === 'alwaysAllowed' ? 'info' : 'warn'
+    this.log[level]('network access request resolved', {
+      status,
+      runtime: runtime ?? 'unknown',
+      ...fields
+    })
+    return {
+      hostname,
+      ...(fields.port === undefined ? {} : { port: fields.port }),
+      ...(fields.protocol === undefined ? {} : { protocol: fields.protocol }),
+      ...(fields.scope === undefined ? {} : { scope: fields.scope }),
+      status,
+      ...(fields.decisionSource ? { decisionSource: fields.decisionSource } : {}),
+      ...(fields.message ? { message: fields.message } : {})
+    }
+  }
+
+  private getOrCreateSandbox(): NotebookNetworkSandbox {
+    if (!this.sandbox) {
+      this.sandbox = this.createSandbox(normalizeNotebookNetworkSettings(this.settings), undefined)
+    }
+    return this.sandbox
+  }
+
+  private createSandbox(
+    settings: NotebookNetworkSettings,
+    parentProxy: Readonly<{ http?: string; https?: string; noProxy?: string }> | undefined
+  ): NotebookNetworkSandbox {
+    return new NotebookNetworkSandbox({
+      packaged: this.options.packaged,
+      policy: buildNotebookNetworkPolicy(settings),
+      resources: { root: this.options.resourceRoot },
+      ...(parentProxy ? { parentProxy } : {}),
+      ...(this.trustBundle
+        ? {
+            trustBundle: {
+              path: this.trustBundle.path,
+              certificates: this.trustBundle.certificates
+            }
+          }
+        : {})
+    })
+  }
+
+  private isCommandGrantAllowed(
+    sessionId: string,
+    runtime: NotebookCommandRuntime,
+    commandText: string,
+    executionActive: boolean,
+    commandGrants: ReadonlySet<string>,
+    allowedNetworkHosts: ReadonlySet<string>,
+    request: {
+      host: string
+      port?: number
+      protocol?: 'http' | 'https'
+      signal: AbortSignal
+      purpose?: 'probe' | 'block'
+    }
+  ): Promise<boolean> {
+    if (request.signal.aborted || this.settings?.mode === 'strict') return Promise.resolve(false)
+    const normalized = validateCustomAllowedDomain(request.host)
+    if (!normalized.ok || !executionActive) return Promise.resolve(false)
+    // Read live authority on every connection/probe so another session or a later downgrade
+    // cannot inherit access.
+    if (this.options.hasFullAccess?.(sessionId)) return Promise.resolve(true)
+    if (allowedNetworkHosts.has(normalized.hostname)) return Promise.resolve(true)
+    const destinationKey = `${request.protocol ?? 'https'}://${formatNetworkHostname(normalized.hostname)}:${request.port ?? 443}`
+    if (commandGrants.has(destinationKey)) return Promise.resolve(true)
+    if (request.purpose === 'probe') return Promise.resolve(false)
+    const key = blockedDestinationKey(
+      sessionId,
+      normalized.hostname,
+      request.port,
+      request.protocol
+    )
+    const runtimes = this.blockedDestinationCommands.get(key) ?? new Map()
+    const commands = runtimes.get(runtime) ?? new Set<string>()
+    commands.add(commandText)
+    runtimes.set(runtime, commands)
+    this.blockedDestinationCommands.set(key, runtimes)
+    return Promise.resolve(false)
+  }
+}
+
+export { NotebookNetworkSandboxOwner, commandLine }

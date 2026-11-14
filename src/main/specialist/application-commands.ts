@@ -1,0 +1,568 @@
+import { createLogger } from '@aipoch/diagnostics/node'
+import {
+  createSpecialistDesktopCommands,
+  specialistDesktopCommandGroup,
+  type SpecialistDesktopDependencies,
+  type SpecialistDesktopCommands
+} from './desktop-commands'
+import { readFile, stat } from 'node:fs/promises'
+import { z } from 'zod'
+import { ApplicationCommandError } from '../../shared/application-command-contract'
+import {
+  SPECIALIST_PACKAGE_ARCHIVE_LIMITS,
+  type SpecialistPackageInstallRequest,
+  type SpecialistPackageCandidatePreview,
+  type SpecialistPackageInstallResult,
+  type SpecialistDeleteRequest,
+  type SpecialistDeletePreview,
+  type SpecialistDeleteResult
+} from '@aipoch/specialists'
+import {
+  type BeginUploadTransferRequest,
+  type UploadTransferRequest,
+  type UploadTransferStatus
+} from '../../shared/uploads'
+import type {
+  UpdateSpecialistRequest,
+  SetSpecialistEnabledRequest,
+  SetSessionSpecialistRequest,
+  SetSessionSpecialistResponse
+} from '../../shared/specialist'
+import type {
+  GetMarketplaceReleaseRequest,
+  ListMarketplaceRequest,
+  MarketplaceSnapshot,
+  MarketplaceSpecialistRelease,
+  PrepareMarketplaceInstallRequest,
+  MarketplaceInstallPreview,
+  MarketplaceInstallRequest,
+  MarketplaceInstallResult
+} from '../../shared/specialist-marketplace'
+import {
+  defineApplicationCommand,
+  defineApplicationCommandGroup,
+  type ApplicationCallerLease,
+  type ApplicationInvocation,
+  type ApplicationCommandRegistrar,
+  type ApplicationCommand,
+  type ApplicationCommandInstallation
+} from '../application-command-router'
+import type { UploadCommandOwner } from '../uploads/command-owner'
+import type { SpecialistService } from './service'
+import type { SpecialistPackageService } from '@aipoch/specialists/node'
+import type { MarketplaceService } from './marketplace/service'
+import type { SessionSpecialistReconfiguration } from './session-reconfiguration'
+
+type Dependencies = {
+  service: Pick<SpecialistService, 'listForSettingsSnapshot' | 'update' | 'setEnabled'>
+  packages: Pick<
+    SpecialistPackageService,
+    | 'preview'
+    | 'install'
+    | 'cancel'
+    | 'dispose'
+    | 'report'
+    | 'previewSpecialistDelete'
+    | 'deleteSpecialist'
+  >
+  uploads: UploadCommandOwner
+  marketplace: Pick<
+    MarketplaceService,
+    'list' | 'getRelease' | 'prepareInstall' | 'install' | 'cancel'
+  > &
+    Partial<Pick<MarketplaceService, 'installedSpecialistProvenance'>>
+  sessionReconfiguration: Pick<SessionSpecialistReconfiguration, 'requestSwitch'>
+  onProfilesChanged: () => void
+  desktop: SpecialistDesktopDependencies
+  disposeMarketplace: (ownerId: number) => void
+}
+
+const beginRequest = z
+  .object({
+    transferId: z.string().min(1),
+    name: z.string().min(1),
+    mimeType: z.string().optional(),
+    size: z.number().int().nonnegative().max(SPECIALIST_PACKAGE_ARCHIVE_LIMITS.compressedBytes)
+  })
+  .strict()
+const transferRequest = z.object({ transferId: z.string().min(1) }).strict()
+const candidateRequest = z.object({ candidateToken: z.string().min(1) }).strict()
+const enabledRequest = z.object({ id: z.string().min(1), enabled: z.boolean() }).strict()
+// Parity with the Electron IPC parseListMarketplaceRequest: undefined passes through, otherwise
+// exactly { forceRefresh: boolean } — anything else is rejected as renderer data.
+const parseListMarketplaceRequest = (request: unknown): { forceRefresh?: boolean } | undefined => {
+  if (request === undefined) return undefined
+  if (
+    typeof request !== 'object' ||
+    request === null ||
+    Object.keys(request).length !== 1 ||
+    typeof (request as { forceRefresh?: unknown }).forceRefresh !== 'boolean'
+  ) {
+    throw new Error('Marketplace list does not accept renderer data.')
+  }
+  return { forceRefresh: (request as { forceRefresh: boolean }).forceRefresh }
+}
+
+// Transport callers receive negative, process-local IDs, disjoint from legacy WebContents IDs.
+// Candidate identity stays in the existing package service, never in browser-supplied data.
+let nextOwnerId = -1
+const LIFETIME_MS = 10 * 60 * 1000
+
+export type SpecialistApplicationOwner = {
+  list: Dependencies['service']['listForSettingsSnapshot']
+  update: Dependencies['service']['update']
+  setEnabled: (
+    request: SetSpecialistEnabledRequest
+  ) => ReturnType<Dependencies['service']['setEnabled']>
+  setSessionSpecialist: (
+    request: SetSessionSpecialistRequest
+  ) => Promise<SetSessionSpecialistResponse>
+  listMarketplace: (request?: ListMarketplaceRequest) => Promise<MarketplaceSnapshot>
+  getMarketplaceRelease: (
+    request: GetMarketplaceReleaseRequest
+  ) => Promise<MarketplaceSpecialistRelease>
+  beginUpload: (
+    invocation: ApplicationInvocation<readonly [BeginUploadTransferRequest]>
+  ) => Promise<UploadTransferStatus>
+  previewUpload: (
+    invocation: ApplicationInvocation<readonly [UploadTransferRequest]>
+  ) => Promise<SpecialistPackageCandidatePreview>
+  abortUpload: (
+    invocation: ApplicationInvocation<readonly [UploadTransferRequest]>
+  ) => Promise<void>
+  install: (
+    invocation: ApplicationInvocation<readonly [SpecialistPackageInstallRequest]>
+  ) => Promise<SpecialistPackageInstallResult>
+  cancel: (invocation: ApplicationInvocation<readonly [SpecialistPackageInstallRequest]>) => void
+  prepareMarketplaceInstall: (
+    invocation: ApplicationInvocation<readonly [PrepareMarketplaceInstallRequest]>
+  ) => Promise<MarketplaceInstallPreview>
+  installMarketplace: (
+    invocation: ApplicationInvocation<readonly [MarketplaceInstallRequest]>
+  ) => Promise<MarketplaceInstallResult>
+  cancelMarketplaceCandidate: (
+    invocation: ApplicationInvocation<readonly [{ candidateToken: string }]>
+  ) => Promise<void>
+  previewDelete: (
+    invocation: ApplicationInvocation<readonly [{ id: string }]>
+  ) => Promise<SpecialistDeletePreview>
+  delete: (
+    invocation: ApplicationInvocation<readonly [SpecialistDeleteRequest]>
+  ) => Promise<SpecialistDeleteResult>
+  desktop: SpecialistDesktopCommands
+  dispose: () => void
+}
+
+export const createSpecialistApplicationOwner = ({
+  service,
+  packages,
+  uploads,
+  marketplace,
+  sessionReconfiguration,
+  onProfilesChanged,
+  desktop,
+  disposeMarketplace
+}: Dependencies): SpecialistApplicationOwner => {
+  type Caller = {
+    ownerId: number
+    transferId?: string
+    candidateToken?: string
+    busy: boolean
+    disposed: boolean
+    timer?: ReturnType<typeof setTimeout>
+    release: () => void
+  }
+  const callers = new Map<ApplicationCallerLease, Caller>()
+  // Reserve before staging, and retain the slot through preview and installation. A disconnected
+  // operation still owns its slot until it settles, because its archive may remain in memory.
+  const webImports = new Set<Caller>()
+  const finishOperation = (caller: Caller): void => {
+    caller.busy = false
+    if (caller.disposed || (!caller.transferId && !caller.candidateToken)) webImports.delete(caller)
+  }
+  const callerFor = (invocation: ApplicationInvocation<readonly unknown[]>): Caller => {
+    const { callerLease } = invocation
+    if (callerLease.signal.aborted || !callerLease.isCurrent())
+      throw new Error('Specialist import caller expired.')
+    let caller = callers.get(callerLease)
+    if (!caller) {
+      const nativeId = Number(invocation.callerContext.clientId)
+      const current: Caller = {
+        ownerId:
+          invocation.callerContext.surface === 'electron' &&
+          Number.isSafeInteger(nativeId) &&
+          nativeId > 0
+            ? nativeId
+            : nextOwnerId--,
+        busy: false,
+        disposed: false,
+        release: () => {
+          current.disposed = true
+          clearTimeout(current.timer)
+          callers.delete(callerLease)
+          callerLease.signal.removeEventListener('abort', current.release)
+          packages.dispose(current.ownerId)
+          disposeMarketplace(current.ownerId)
+          if (!current.busy) webImports.delete(current)
+          if (current.transferId && !current.busy) {
+            void uploads
+              .abortTransfer({ ...invocation, args: [{ transferId: current.transferId }] })
+              .catch(() => undefined)
+          }
+        }
+      }
+      callers.set(callerLease, current)
+      callerLease.signal.addEventListener('abort', current.release, { once: true })
+      caller = current
+    }
+    return caller
+  }
+  const refreshExpiry = (caller: Caller): void => {
+    clearTimeout(caller.timer)
+    caller.timer = setTimeout(caller.release, LIFETIME_MS)
+    caller.timer.unref?.()
+  }
+  const assertActive = (caller: Caller): void => {
+    if (caller.disposed) throw new Error('Specialist import caller expired.')
+  }
+
+  // Candidate ownership is identical on Electron and Web. A result arriving after the
+  // caller expires must not leave a usable package behind.
+  const owned = async <T>(
+    invocation: ApplicationInvocation<readonly unknown[]>,
+    work: (id: number) => Promise<T>
+  ): Promise<T> => {
+    const caller = callerFor(invocation)
+    refreshExpiry(caller)
+    try {
+      const result = await work(caller.ownerId)
+      invocation.callerLease.signal.throwIfAborted()
+      if (!invocation.callerLease.isCurrent())
+        throw new Error('Specialist caller is no longer current.')
+      assertActive(caller)
+      return result
+    } finally {
+      if (
+        caller.disposed ||
+        !invocation.callerLease.isCurrent() ||
+        invocation.callerLease.signal.aborted
+      ) {
+        disposeMarketplace(caller.ownerId)
+        packages.dispose(caller.ownerId)
+      }
+    }
+  }
+
+  return {
+    prepareMarketplaceInstall: (invocation) =>
+      owned(invocation, (id) =>
+        marketplace.prepareInstall(invocation.args[0], id, (progress) => {
+          if (
+            invocation.callerContext.surface === 'electron' &&
+            invocation.callerLease.isCurrent() &&
+            !invocation.callerLease.signal.aborted
+          )
+            desktop.reportProgress(invocation.callerContext.clientId, progress)
+        })
+      ),
+    installMarketplace: (invocation) =>
+      owned(invocation, (id) => marketplace.install(invocation.args[0], id)),
+    cancelMarketplaceCandidate: (invocation) =>
+      owned(invocation, async (id) => {
+        marketplace.cancel(candidateRequest.parse(invocation.args[0]).candidateToken, id)
+      }),
+    previewDelete: (invocation) =>
+      owned(invocation, () =>
+        packages.previewSpecialistDelete(
+          z.object({ id: z.string() }).strict().parse(invocation.args[0])
+        )
+      ),
+    delete: (invocation) => owned(invocation, () => packages.deleteSpecialist(invocation.args[0])),
+    desktop: createSpecialistDesktopCommands(desktop, (invocation) => {
+      const caller = callerFor(invocation)
+      refreshExpiry(caller)
+      return caller.ownerId
+    }),
+    list: async () => {
+      const snapshot = await service.listForSettingsSnapshot()
+      if (!marketplace.installedSpecialistProvenance) return snapshot
+      try {
+        const installed = snapshot.items.flatMap((item) =>
+          item.kind === 'custom'
+            ? [
+                {
+                  id: item.id,
+                  revision: item.revision,
+                  ...(item.origin ? { origin: item.origin } : {}),
+                  ...(item.importBaseline?.archiveDigest
+                    ? { archiveDigest: item.importBaseline.archiveDigest }
+                    : {})
+                }
+              ]
+            : []
+        )
+        const provenance = await marketplace.installedSpecialistProvenance(installed)
+        return {
+          ...snapshot,
+          items: snapshot.items.map((item) =>
+            item.kind === 'custom' && provenance.has(item.id)
+              ? { ...item, marketplaceProvenance: provenance.get(item.id) }
+              : item
+          )
+        }
+      } catch (error) {
+        createLogger('specialist').error('Marketplace provenance failed', { error })
+        return snapshot
+      }
+    },
+    update: async (request: UpdateSpecialistRequest) => {
+      const result = await service.update(request)
+      if (
+        Object.keys(request).some((key) => !['id', 'revision', 'iconKey', 'colorKey'].includes(key))
+      )
+        onProfilesChanged()
+      return result
+    },
+    setEnabled: async (request: SetSpecialistEnabledRequest) => {
+      const { id, enabled } = enabledRequest.parse(request)
+      const result = await service.setEnabled(id, enabled)
+      onProfilesChanged()
+      return result
+    },
+    // Parity with the Electron IPC parse in ipc.ts: sessionId must be a string, specialistId
+    // must be a string or undefined — anything else is rejected as renderer data.
+    setSessionSpecialist: async (request: SetSessionSpecialistRequest) => {
+      if (!request || typeof request.sessionId !== 'string') {
+        throw new Error('SET_SESSION_SPECIALIST: sessionId must be a string.')
+      }
+      if (request.specialistId !== undefined && typeof request.specialistId !== 'string') {
+        throw new Error('SET_SESSION_SPECIALIST: specialistId must be a string or undefined.')
+      }
+      return sessionReconfiguration.requestSwitch(request.sessionId, request.specialistId)
+    },
+    listMarketplace: async (request?: ListMarketplaceRequest) =>
+      marketplace.list(parseListMarketplaceRequest(request)),
+    getMarketplaceRelease: (request: GetMarketplaceReleaseRequest) =>
+      marketplace.getRelease(request),
+    beginUpload: async (
+      invocation: ApplicationInvocation<readonly [BeginUploadTransferRequest]>
+    ) => {
+      beginRequest.parse(invocation.args[0])
+      const [request] = invocation.args
+      if (request.size > SPECIALIST_PACKAGE_ARCHIVE_LIMITS.compressedBytes)
+        throw new Error('Specialist ZIP exceeds the 50 MB compressed limit.')
+      const caller = callerFor(invocation)
+      if (caller.busy) throw new Error('Specialist package preview is in progress.')
+      if (caller.transferId && caller.transferId !== request.transferId)
+        throw new Error('Cancel the previous Specialist upload first.')
+      if (invocation.callerContext.surface !== 'electron' && !webImports.has(caller)) {
+        if (webImports.size >= 2)
+          throw new ApplicationCommandError(
+            'command-failed',
+            'Two Web Specialist imports are already active. Finish or cancel one, then try again.'
+          )
+        webImports.add(caller)
+      }
+      caller.busy = true
+      refreshExpiry(caller)
+      try {
+        const result = await uploads.beginTransfer(invocation)
+        caller.transferId = request.transferId
+        assertActive(caller)
+        packages.dispose(caller.ownerId)
+        caller.candidateToken = undefined
+        refreshExpiry(caller)
+        return result
+      } catch (error) {
+        await uploads.abortTransfer(invocation).catch(() => undefined)
+        caller.transferId = undefined
+        throw error
+      } finally {
+        finishOperation(caller)
+      }
+    },
+    previewUpload: async (invocation: ApplicationInvocation<readonly [UploadTransferRequest]>) => {
+      const request = transferRequest.parse(invocation.args[0])
+      const caller = callerFor(invocation)
+      if (caller.busy || caller.transferId !== request.transferId)
+        throw new Error('Specialist upload does not belong to this caller.')
+      caller.busy = true
+      let path: string | undefined
+      try {
+        // The server resolves the completed transfer. Never accept a renderer filesystem path.
+        const attachment = await uploads.finishTransfer(invocation)
+        path = attachment.path
+        assertActive(caller)
+        const info = await stat(path)
+        if (info.size > SPECIALIST_PACKAGE_ARCHIVE_LIMITS.compressedBytes)
+          throw new Error('Specialist ZIP exceeds the 50 MB compressed limit.')
+        const preview = await packages.preview(new Uint8Array(await readFile(path)), caller.ownerId)
+        if (caller.disposed) packages.dispose(caller.ownerId)
+        assertActive(caller)
+        caller.candidateToken = preview.candidateToken
+        refreshExpiry(caller)
+        return preview
+      } finally {
+        caller.transferId = undefined
+        try {
+          if (path) await uploads.deleteUpload({ ...invocation, args: [{ path }] })
+          else await uploads.abortTransfer(invocation).catch(() => undefined)
+        } finally {
+          finishOperation(caller)
+        }
+      }
+    },
+    abortUpload: async (invocation: ApplicationInvocation<readonly [UploadTransferRequest]>) => {
+      const request = transferRequest.parse(invocation.args[0])
+      const caller = callerFor(invocation)
+      if (caller.transferId !== request.transferId) return
+      if (caller.busy) throw new Error('Specialist package preview is in progress.')
+      caller.busy = true
+      try {
+        await uploads.abortTransfer(invocation)
+        caller.transferId = undefined
+      } finally {
+        finishOperation(caller)
+      }
+    },
+    install: async (
+      invocation: ApplicationInvocation<readonly [SpecialistPackageInstallRequest]>
+    ) => {
+      const caller = callerFor(invocation)
+      if (caller.busy) throw new Error('Specialist package preview is in progress.')
+      caller.busy = true
+      try {
+        return await packages.install(invocation.args[0], caller.ownerId)
+      } finally {
+        // Confirmation failures keep their candidate; terminal outcomes consume it.
+        if (!packages.report(caller.candidateToken, caller.ownerId))
+          caller.candidateToken = undefined
+        finishOperation(caller)
+      }
+    },
+    cancel: (invocation: ApplicationInvocation<readonly [SpecialistPackageInstallRequest]>) => {
+      const request = candidateRequest.parse(invocation.args[0])
+      const caller = callerFor(invocation)
+      packages.cancel(request.candidateToken, caller.ownerId)
+      if (caller.candidateToken === request.candidateToken) {
+        caller.candidateToken = undefined
+        if (!caller.busy) finishOperation(caller)
+      }
+    },
+    dispose: () => {
+      for (const caller of callers.values()) caller.release()
+    }
+  }
+}
+
+const command = <const Name extends string, Args extends readonly unknown[], Result>(
+  name: Name
+): ApplicationCommand<Name, Args, Result> => defineApplicationCommand<Name, Args, Result>(name)
+const commands = [
+  command<
+    'specialist:marketplace-install-prepare',
+    readonly [PrepareMarketplaceInstallRequest],
+    MarketplaceInstallPreview
+  >('specialist:marketplace-install-prepare'),
+  command<
+    'specialist:marketplace-install',
+    readonly [MarketplaceInstallRequest],
+    MarketplaceInstallResult
+  >('specialist:marketplace-install'),
+  command<'specialist:marketplace-candidate-cancel', readonly [{ candidateToken: string }], void>(
+    'specialist:marketplace-candidate-cancel'
+  ),
+  command<'specialist:delete-preview', readonly [{ id: string }], SpecialistDeletePreview>(
+    'specialist:delete-preview'
+  ),
+  command<'specialist:delete', readonly [SpecialistDeleteRequest], SpecialistDeleteResult>(
+    'specialist:delete'
+  ),
+  command<'specialist:list', readonly [], Awaited<ReturnType<SpecialistApplicationOwner['list']>>>(
+    'specialist:list'
+  ),
+  command<
+    'specialist:update',
+    readonly [UpdateSpecialistRequest],
+    Awaited<ReturnType<SpecialistApplicationOwner['update']>>
+  >('specialist:update'),
+  command<
+    'specialist:set-enabled',
+    readonly [SetSpecialistEnabledRequest],
+    Awaited<ReturnType<SpecialistApplicationOwner['setEnabled']>>
+  >('specialist:set-enabled'),
+  command<
+    'specialist:set-session-specialist',
+    readonly [SetSessionSpecialistRequest],
+    Awaited<ReturnType<SpecialistApplicationOwner['setSessionSpecialist']>>
+  >('specialist:set-session-specialist'),
+  command<
+    'specialist:package-upload-begin',
+    readonly [BeginUploadTransferRequest],
+    Awaited<ReturnType<SpecialistApplicationOwner['beginUpload']>>
+  >('specialist:package-upload-begin'),
+  command<
+    'specialist:package-upload-preview',
+    readonly [UploadTransferRequest],
+    Awaited<ReturnType<SpecialistApplicationOwner['previewUpload']>>
+  >('specialist:package-upload-preview'),
+  command<'specialist:package-upload-abort', readonly [UploadTransferRequest], void>(
+    'specialist:package-upload-abort'
+  ),
+  command<
+    'specialist:package-install',
+    readonly [SpecialistPackageInstallRequest],
+    Awaited<ReturnType<SpecialistApplicationOwner['install']>>
+  >('specialist:package-install'),
+  command<'specialist:package-cancel', readonly [SpecialistPackageInstallRequest], void>(
+    'specialist:package-cancel'
+  ),
+  command<
+    'specialist:marketplace-list',
+    readonly [request?: ListMarketplaceRequest],
+    MarketplaceSnapshot
+  >('specialist:marketplace-list'),
+  command<
+    'specialist:marketplace-release-get',
+    readonly [GetMarketplaceReleaseRequest],
+    MarketplaceSpecialistRelease
+  >('specialist:marketplace-release-get')
+] as const
+
+export const specialistApplicationCommandGroup = defineApplicationCommandGroup(
+  'specialist',
+  commands
+)
+export const registerSpecialistApplicationCommands = (
+  registrar: ApplicationCommandRegistrar,
+  owner: SpecialistApplicationOwner
+): ApplicationCommandInstallation => {
+  const scope = registrar.createScope()
+  try {
+    scope.registerGroup(specialistApplicationCommandGroup, {
+      'specialist:marketplace-install-prepare': (invocation) =>
+        owner.prepareMarketplaceInstall(invocation),
+      'specialist:marketplace-install': (invocation) => owner.installMarketplace(invocation),
+      'specialist:marketplace-candidate-cancel': (invocation) =>
+        owner.cancelMarketplaceCandidate(invocation),
+      'specialist:delete-preview': (invocation) => owner.previewDelete(invocation),
+      'specialist:delete': (invocation) => owner.delete(invocation),
+      'specialist:list': () => owner.list(),
+      'specialist:update': ({ args }) => owner.update(args[0]),
+      'specialist:set-enabled': ({ args }) => owner.setEnabled(args[0]),
+      'specialist:set-session-specialist': ({ args }) => owner.setSessionSpecialist(args[0]),
+      'specialist:package-upload-begin': (invocation) => owner.beginUpload(invocation),
+      'specialist:package-upload-preview': (invocation) => owner.previewUpload(invocation),
+      'specialist:package-upload-abort': (invocation) => owner.abortUpload(invocation),
+      'specialist:package-install': (invocation) => owner.install(invocation),
+      'specialist:package-cancel': (invocation) => owner.cancel(invocation),
+      'specialist:marketplace-list': ({ args }) => owner.listMarketplace(args[0]),
+      'specialist:marketplace-release-get': ({ args }) => owner.getMarketplaceRelease(args[0])
+    })
+    scope.registerGroup(specialistDesktopCommandGroup, owner.desktop)
+    return scope.complete(() => owner.dispose())
+  } catch (error) {
+    scope.rollback()
+    throw error
+  }
+}

@@ -1,0 +1,65 @@
+// 'local' streams a file from an arbitrary absolute filesystem path (the "This computer" browser).
+// Unlike artifact/upload it is not confined to a storage root; the resolver validates + realpaths it.
+export type ManagedPreviewSource =
+  'artifact' | 'upload' | 'compute-output' | 'notebook-input' | 'literature' | 'local'
+
+export const MANAGED_PREVIEW_LOAD_ERROR = 'open-science-preview-load-error'
+
+type ManagedPreviewPresentation = {
+  mimeType?: string
+  maxBytes?: number
+  // Opt into bounded display bytes; raw resource consumers keep original-byte semantics.
+  imagePreview?: boolean
+}
+
+type AcquireManagedVersionPreviewRequest = ManagedPreviewPresentation & {
+  projectId: string
+  fileId: string
+  versionId?: string
+} & ({ source: 'artifact' } | { source: 'upload' })
+
+type AcquirePathPreviewRequest = ManagedPreviewPresentation & {
+  path: string
+  projectId?: string
+  sessionId?: string
+} & (
+    | { source: 'compute-output' }
+    | { source: 'notebook-input' }
+    | { source: 'literature' }
+    | { source: 'local' }
+  )
+
+export type AcquireManagedPreviewRequest =
+  AcquireManagedVersionPreviewRequest | AcquirePathPreviewRequest
+
+export type ManagedPreviewResource = {
+  id: string
+  url: string
+  size: number
+  mimeType: string
+  version: number
+  // Optional SHA-256 from the main-owned immutable content lease, never a PDF.js fingerprint.
+  // Transient evidence for this acquired resource; older responses may omit it.
+  sourceChecksum?: string
+  // Original, oriented pixel dimensions, even when display bytes are downsampled.
+  // Absent for non-images and for images whose header could not be parsed.
+  width?: number
+  height?: number
+}
+
+export type ReadManagedPreviewRangeRequest = {
+  resourceId: string
+  begin: number
+  end: number
+}
+
+export type ManagedPreviewRangeResult = {
+  begin: number
+  end: number
+  total: number
+  data: Uint8Array
+}
+
+export type ReleaseManagedPreviewRequest = {
+  resourceId: string
+}
